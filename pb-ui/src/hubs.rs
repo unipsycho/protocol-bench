@@ -494,23 +494,49 @@ fn stack_ports(
     }
 }
 
-/// Draw the diagram and the editor. True when the configuration changed.
-pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> bool {
-    let mut dirty = false;
-    ui.horizontal(|ui| {
-        if text_button(ui, "New hub", true, p).clicked() {
-            model.add_hub();
-            dirty = true;
+/// What the hub panel changed this frame.
+pub struct HubChange {
+    pub dirty: bool,
+    pub open: Option<DockPane>,
+}
+
+impl HubChange {
+    fn quiet() -> Self {
+        Self {
+            dirty: false,
+            open: None,
         }
-        ui.add_space(6.0);
+    }
+
+    fn join(self, other: Self) -> Self {
+        Self {
+            dirty: self.dirty || other.dirty,
+            open: self.open.or(other.open),
+        }
+    }
+}
+
+/// Draw the diagram and the editor.
+pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
+    let mut change = HubChange::quiet();
+    ui.horizontal(|ui| {
+        if text_button(ui, "New hub", false, p).clicked() {
+            model.add_hub();
+            change.dirty = true;
+        }
+        if text_button(ui, "Arrange", false, p).clicked() {
+            model.clear_arrangement();
+            change.dirty = true;
+        }
+        ui.add_space(8.0);
         ui.label(
-            egui::RichText::new(
-                "Sources enter a hub. Outputs leave. A dashed line is that protocol continuing into another hub.",
-            )
-            .font(font_ui(12.0))
-            .color(p.muted),
+            egui::RichText::new("Drag a node to place it. Click it for details.")
+                .font(font_ui(12.0))
+                .color(p.muted),
         );
     });
+    ui.add_space(4.0);
+    legend(ui, p);
     ui.add_space(8.0);
     let wide = ui.available_width() > 760.0;
     if wide {
@@ -520,22 +546,43 @@ pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> bool {
         let height = ui.available_height().max(160.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
-            dirty |= diagram_view(ui, model, diagram_w, height, p);
-            dirty |= inspector(ui, model, inspect_w, height, p);
+            change = change.join(diagram_view(ui, model, diagram_w, height, p));
+            change = change.join(inspector(ui, model, inspect_w, height, p));
         });
     } else {
         let height = (ui.available_height() * 0.58).clamp(180.0, 420.0);
-        dirty |= diagram_view(ui, model, ui.available_width(), height, p);
+        change = change.join(diagram_view(ui, model, ui.available_width(), height, p));
         ui.add_space(8.0);
-        dirty |= inspector(
+        change = change.join(inspector(
             ui,
             model,
             ui.available_width(),
             ui.available_height().max(120.0),
             p,
-        );
+        ));
     }
-    dirty
+    change
+}
+
+fn legend(ui: &mut Ui, p: &ThemePalette) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 14.0;
+        legend_swatch(ui, p.accent, false, "Through this hub", p);
+        legend_swatch(ui, p.live, true, "Continues into another hub", p);
+    });
+}
+
+fn legend_swatch(ui: &mut Ui, color: Color32, dashed: bool, label: &str, p: &ThemePalette) {
+    let (rect, _) = ui.allocate_exact_size(vec2(28.0, 14.0), Sense::hover());
+    let y = rect.center().y;
+    let stroke = Stroke::new(1.6, color);
+    if dashed {
+        ui.painter().line_segment([pos2(rect.min.x, y), pos2(rect.min.x + 8.0, y)], stroke);
+        ui.painter().line_segment([pos2(rect.min.x + 12.0, y), pos2(rect.max.x, y)], stroke);
+    } else {
+        ui.painter().line_segment([pos2(rect.min.x, y), pos2(rect.max.x, y)], stroke);
+    }
+    ui.label(egui::RichText::new(label).font(font_ui(11.0)).color(p.muted));
 }
 
 fn diagram_view(
