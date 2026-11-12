@@ -959,7 +959,17 @@ impl ProtocolBenchApp {
                     .layout(Layout::top_down(egui::Align::Min)),
             );
             body_ui.set_clip_rect(body.expand(2.0).intersect(clip));
-            if panels::paint(&mut body_ui, active, host, p, &mut self.ui_state.hubs) {
+            let hub_change = panels::paint(&mut body_ui, active, host, p, &mut self.ui_state.hubs);
+            if hub_change.dirty {
+                self.mark_dirty();
+            }
+            if let Some(pane) = hub_change.open {
+                self.ui_state.reveal_pane(pane);
+                self.ui_state.tree.set_active(pane);
+                if self.ui_state.maximized.is_some() {
+                    self.ui_state.maximized = Some(pane);
+                }
+                self.status = format!("Opened {}", pane.title());
                 self.mark_dirty();
             }
         }

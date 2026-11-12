@@ -7,23 +7,23 @@ use crate::art;
 use crate::dock::DockPane;
 use crate::theme::{font_mono, font_semi, font_ui, scope, tint, ThemePalette};
 
-/// Fill the pane body for one dock leaf. True when the hub diagram changed.
+/// Fill the pane body for one dock leaf.
 pub fn paint(
     ui: &mut egui::Ui,
     pane: DockPane,
     host: &HostSnapshot,
     p: &ThemePalette,
     hubs: &mut crate::hubs::HubModel,
-) -> bool {
+) -> crate::hubs::HubChange {
     match pane {
         DockPane::Project => {
             project_panel(ui, host, p);
-            false
+            crate::hubs::HubChange::quiet()
         }
         DockPane::Hubs => crate::hubs::paint(ui, hubs, p),
         _ => {
             scaffold_panel(ui, pane, host, p);
-            false
+            crate::hubs::HubChange::quiet()
         }
     }
 }

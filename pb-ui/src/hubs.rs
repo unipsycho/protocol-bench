@@ -59,7 +59,7 @@ impl HubProto {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HubPort {
     pub id: u64,
     pub protocol: HubProto,
@@ -69,7 +69,7 @@ pub struct HubPort {
     pub at: Option<[f32; 2]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Hub {
     pub id: u64,
     pub name: String,
@@ -98,7 +98,7 @@ pub struct Across {
     pub proto: HubProto,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HubModel {
     pub hubs: Vec<Hub>,
     /// Hub whose details are open. A port selection also sets this.
@@ -538,13 +538,14 @@ fn content_size(nodes: &[Placed], min: Vec2) -> Vec2 {
 }
 
 /// What the hub panel changed this frame.
+#[derive(Clone, Copy)]
 pub struct HubChange {
     pub dirty: bool,
     pub open: Option<DockPane>,
 }
 
 impl HubChange {
-    fn quiet() -> Self {
+    pub fn quiet() -> Self {
         Self {
             dirty: false,
             open: None,
@@ -1389,15 +1390,79 @@ mod tests {
     #[test]
     fn diagram_places_a_node_for_every_port_and_hub() {
         let model = HubModel::sample();
-        let (_height, nodes) = place_hubs(&model.hubs, 800.0);
+        let nodes = layout_nodes(&model.hubs);
         let ports: usize = model
             .hubs
             .iter()
             .map(|hub| hub.sources.len() + hub.outputs.len())
             .sum();
         assert_eq!(nodes.len(), ports + model.hubs.len());
-        assert!(nodes
+        let plant = nodes
             .iter()
-            .any(|node| node.role == Role::Hub && node.hub_id == 1));
+            .find(|node| node.role == Role::Hub && node.hub_id == 1)
+            .unwrap();
+        let source = nodes.iter().find(|node| node.port_id == Some(2)).unwrap();
+        assert!(source.rect.right() < plant.rect.left());
+        assert!(plant.rect.center().x < 420.0);
+    }
+
+    #[test]
+    fn dragging_a_hub_moves_its_undragged_ports() {
+        let mut model = HubModel::sample();
+        let before = layout_nodes(&model.hubs);
+        let plant = before
+            .iter()
+            .find(|node| node.role == Role::Hub && node.hub_id == 1)
+            .unwrap()
+            .rect
+            .center();
+        let source = before
+            .iter()
+            .find(|node| node.port_id == Some(2))
+            .unwrap()
+            .rect
+            .center();
+        model.set_center(1, None, [plant.x + 80.0, plant.y + 24.0]);
+        let after = layout_nodes(&model.hubs);
+        let plant2 = after
+            .iter()
+            .find(|node| node.role == Role::Hub && node.hub_id == 1)
+            .unwrap()
+            .rect
+            .center();
+        let source2 = after
+            .iter()
+            .find(|node| node.port_id == Some(2))
+            .unwrap()
+            .rect
+            .center();
+        assert!((plant2.x - plant.x - 80.0).abs() < 0.1);
+        assert!((source2.x - source.x - 80.0).abs() < 0.1);
+        model.set_center(1, Some(2), [12.0, 18.0]);
+        model.set_center(1, None, [plant2.x + 40.0, plant2.y]);
+        let pinned = layout_nodes(&model.hubs)
+            .into_iter()
+            .find(|node| node.port_id == Some(2))
+            .unwrap();
+        assert!((pinned.rect.center().x - 12.0).abs() < 0.1);
+        assert!((pinned.rect.center().y - 18.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn a_port_node_opens_its_protocol_panel() {
+        let model = HubModel::sample();
+        let nodes = layout_nodes(&model.hubs);
+        let rtu = nodes.iter().find(|node| node.port_id == Some(2)).unwrap();
+        assert_eq!(open_target(&model, rtu), Some(DockPane::Modbus));
+        let plant = nodes
+            .iter()
+            .find(|node| node.role == Role::Hub && node.hub_id == 1)
+            .unwrap();
+        assert!(open_target(&model, plant).is_none());
+        let edge = nodes
+            .iter()
+            .find(|node| node.role == Role::Hub && node.hub_id == 6)
+            .unwrap();
+        assert_eq!(open_target(&model, edge), Some(DockPane::Mqtt));
     }
 }
