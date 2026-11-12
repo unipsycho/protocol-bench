@@ -1,0 +1,20 @@
+[package]
+name = "pb-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Protocol Bench egui desktop shell"
+
+[[bin]]
+name = "protocol-bench"
+path = "src/main.rs"
+
+[dependencies]
+pb-engine = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+directories = { workspace = true }

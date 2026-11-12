@@ -1,0 +1,10 @@
+[package]
+name = "pb-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Protocol Bench engine thread. The UI never performs protocol I/O."
+
+[dependencies]
