@@ -18,9 +18,25 @@ const MARGIN: f32 = 40.0;
 const INSPECT_DEFAULT: f32 = 276.0;
 const INSPECT_MIN: f32 = 180.0;
 const DIAGRAM_MIN: f32 = 280.0;
+/// Current default view is maximum zoom. Wheel zooms out from here.
+const ZOOM_MAX: f32 = 1.0;
+const ZOOM_MIN: f32 = 0.25;
+/// Same feel as egui's ctrl-scroll zoom (`Options::scroll_zoom_speed`).
+const ZOOM_WHEEL: f32 = 1.0 / 200.0;
 
 fn default_inspector_width() -> f32 {
     INSPECT_DEFAULT
+}
+
+fn default_zoom() -> f32 {
+    ZOOM_MAX
+}
+
+fn clamp_zoom(zoom: f32) -> f32 {
+    if !zoom.is_finite() {
+        return ZOOM_MAX;
+    }
+    zoom.clamp(ZOOM_MIN, ZOOM_MAX)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -144,6 +160,9 @@ pub struct HubModel {
     /// Width of the right-hand configure panel when the hubs view is wide enough.
     #[serde(default = "default_inspector_width")]
     pub inspector_width: f32,
+    /// Diagram scale. `1.0` is the default (maximum); wheel zooms out toward `ZOOM_MIN`.
+    #[serde(default = "default_zoom")]
+    pub zoom: f32,
     #[serde(default)]
     next_id: u64,
 }
@@ -162,6 +181,7 @@ impl HubModel {
             selected: Some(1),
             selected_port: None,
             inspector_width: INSPECT_DEFAULT,
+            zoom: ZOOM_MAX,
             hubs: vec![
                 Hub {
                     id: 1,
@@ -253,6 +273,7 @@ impl HubModel {
         if !self.inspector_width.is_finite() || self.inspector_width < INSPECT_MIN {
             self.inspector_width = INSPECT_DEFAULT;
         }
+        self.zoom = clamp_zoom(self.zoom);
         self.keep_focus();
     }
 
@@ -781,6 +802,57 @@ fn pinned_scroll(current: Vec2, pan: Option<Vec2>, allow: [bool; 2]) -> Option<V
     }
 }
 
+/// Scale layout rects about the diagram origin for the current zoom.
+fn scale_nodes(nodes: &[Placed], zoom: f32) -> Vec<Placed> {
+    nodes
+        .iter()
+        .map(|node| Placed {
+            rect: Rect::from_min_max(
+                pos2(node.rect.min.x * zoom, node.rect.min.y * zoom),
+                pos2(node.rect.max.x * zoom, node.rect.max.y * zoom),
+            ),
+            ..*node
+        })
+        .collect()
+}
+
+/// Keep the world point under the cursor fixed while zoom changes.
+fn zoom_toward(
+    offset: Vec2,
+    view_pos: Vec2,
+    old_shift: Vec2,
+    new_shift: Vec2,
+    old_zoom: f32,
+    new_zoom: f32,
+) -> Vec2 {
+    let old_z = old_zoom.max(0.0001);
+    let world = (offset + view_pos - old_shift) / old_z;
+    let next = world * new_zoom + new_shift - view_pos;
+    Vec2::new(next.x.max(0.0), next.y.max(0.0))
+}
+
+/// Wheel (and pinch) over the canvas. Clears scroll so parent panes do not also move.
+fn canvas_zoom_factor(ui: &Ui, rect: Rect) -> Option<(f32, Pos2)> {
+    ui.ctx().input_mut(|i| {
+        let pointer = i.pointer.hover_pos().filter(|pos| rect.contains(*pos))?;
+        let scroll = i.smooth_scroll_delta;
+        let pinch = i.zoom_delta();
+        let mut factor = 1.0;
+        if (pinch - 1.0).abs() > 0.0001 {
+            factor *= pinch;
+        }
+        if scroll != Vec2::ZERO {
+            // Plain wheel zooms: scrollbars are overflow-only; pan is middle/space drag.
+            factor *= (ZOOM_WHEEL * scroll.y).exp();
+            i.smooth_scroll_delta = Vec2::ZERO;
+        }
+        if (factor - 1.0).abs() < 0.0001 {
+            return None;
+        }
+        Some((factor, pointer))
+    })
+}
+
 /// What the hub panel changed this frame.
 #[derive(Clone, Copy)]
 pub struct HubChange {
@@ -826,7 +898,7 @@ pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
-                    "Drag a node to place it. Click for details. Right-click to add. Middle-drag or Space-drag pans.",
+                    "Drag a node to place it. Click for details. Right-click to add. Wheel zooms. Middle-drag or Space-drag pans.",
                 )
                 .font(font_ui(12.0))
                 .color(p.muted),
@@ -960,20 +1032,46 @@ fn diagram_view(
     let mut change = HubChange::quiet();
     let scroll_id = child.make_persistent_id(Id::new("pb_hub_diagram"));
     let pan = canvas_pan(&child, rect, scroll_id);
-    let fit = scroll_fit(&layout_nodes(&model.hubs), grid.size());
+    let stored = egui::scroll_area::State::load(child.ctx(), scroll_id)
+        .map(|state| state.offset)
+        .unwrap_or(Vec2::ZERO);
+    let mut zoom = clamp_zoom(model.zoom);
+    let mut zoom_pan = None;
+    if let Some((factor, pointer)) = canvas_zoom_factor(&child, rect) {
+        let next = clamp_zoom(zoom * factor);
+        if (next - zoom).abs() > 0.0005 {
+            let world = layout_nodes(&model.hubs);
+            let old_fit = scroll_fit(&scale_nodes(&world, zoom), grid.size());
+            let new_fit = scroll_fit(&scale_nodes(&world, next), grid.size());
+            let view_pos = pointer - grid.min;
+            zoom_pan = Some(zoom_toward(
+                pan.unwrap_or(stored),
+                view_pos,
+                old_fit.shift,
+                new_fit.shift,
+                zoom,
+                next,
+            ));
+            zoom = next;
+            if (model.zoom - zoom).abs() > 0.0005 {
+                model.zoom = zoom;
+                change.dirty = true;
+            }
+        }
+    }
+    let fit = scroll_fit(&scale_nodes(&layout_nodes(&model.hubs), zoom), grid.size());
     let allow = fit.allow;
+    // Wheel is zoom; pan stays middle-drag / Space-drag via scroll_offset.
     let mut scroll = ScrollArea::both()
         .id_salt("pb_hub_diagram")
         .auto_shrink([false, false])
         .drag_to_scroll(false)
+        .enable_scrolling(false)
         .scroll(allow);
     if !allow[0] && !allow[1] {
         scroll = scroll.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
     }
-    let stored = egui::scroll_area::State::load(child.ctx(), scroll_id)
-        .map(|state| state.offset)
-        .unwrap_or(Vec2::ZERO);
-    if let Some(offset) = pinned_scroll(stored, pan, allow) {
+    if let Some(offset) = pinned_scroll(stored, zoom_pan.or(pan), allow) {
         scroll = scroll.scroll_offset(offset);
     }
     let content_shift = fit.shift;
@@ -993,7 +1091,7 @@ fn diagram_view(
             }
             return;
         }
-        let nodes = layout_nodes(&model.hubs);
+        let nodes = scale_nodes(&layout_nodes(&model.hubs), zoom);
         let shift = area.min.to_vec2() + content_shift;
         let screen: Vec<Placed> = nodes
             .iter()
@@ -1007,9 +1105,13 @@ fn diagram_view(
             let center = screen
                 .iter()
                 .find(|node| node.hub_id == hub_id && node.port_id == port_id)
-                .map(|node| node.rect.center() - shift + delta);
+                .map(|node| {
+                    // Screen delta → world space under the current zoom.
+                    let world = (node.rect.center() - shift + delta) / zoom.max(0.0001);
+                    pos2(world.x.max(24.0), world.y.max(24.0))
+                });
             if let Some(center) = center {
-                model.set_center(hub_id, port_id, [center.x.max(24.0), center.y.max(24.0)]);
+                model.set_center(hub_id, port_id, [center.x, center.y]);
                 change.dirty = true;
             }
         }
@@ -1030,7 +1132,7 @@ fn diagram_view(
         if let Some(cmd) = menu {
             apply_menu(model, cmd, &mut change);
         }
-        let nodes = layout_nodes(&model.hubs);
+        let nodes = scale_nodes(&layout_nodes(&model.hubs), zoom);
         let screen: Vec<Placed> = nodes
             .iter()
             .map(|node| Placed {
@@ -1038,7 +1140,7 @@ fn diagram_view(
                 ..*node
             })
             .collect();
-        paint_flow(ui.painter(), &screen, model, gesture.hover, p);
+        paint_flow(ui.painter(), &screen, model, gesture.hover, zoom, p);
     });
     if pan.is_some() {
         child.ctx().set_cursor_icon(egui::CursorIcon::AllScroll);
@@ -1256,6 +1358,7 @@ fn paint_flow(
     nodes: &[Placed],
     model: &HubModel,
     hover: Option<(u64, Option<u64>)>,
+    zoom: f32,
     p: &ThemePalette,
 ) {
     for node in nodes {
@@ -1307,10 +1410,10 @@ fn paint_flow(
         let hot = hovered(node, hover);
         let on = selected_node(model, node);
         match node.role {
-            Role::Hub => paint_hub_node(painter, node, model, on, hot, p),
-            Role::Source | Role::Output => paint_port_node(painter, node, model, on, hot, p),
+            Role::Hub => paint_hub_node(painter, node, model, on, hot, zoom, p),
+            Role::Source | Role::Output => paint_port_node(painter, node, model, on, hot, zoom, p),
             Role::Aggregator | Role::Calculation => {
-                paint_step_node(painter, node, model, on, hot, p)
+                paint_step_node(painter, node, model, on, hot, zoom, p)
             }
         }
     }
@@ -1342,11 +1445,13 @@ fn paint_hub_node(
     model: &HubModel,
     on: bool,
     hot: bool,
+    zoom: f32,
     p: &ThemePalette,
 ) {
     let Some(hub) = model.hub(node.hub_id) else {
         return;
     };
+    let z = zoom.max(0.35);
     let ink = hub
         .protocol
         .map(|proto| proto.ink(p.is_light))
@@ -1354,22 +1459,22 @@ fn paint_hub_node(
     paint_card(painter, node.rect, ink, on, hot, p);
     paint_grip(painter, node.rect, if hot || on { ink } else { p.muted });
     let clip = Rect::from_min_max(
-        pos2(node.rect.min.x + 18.0, node.rect.min.y + 4.0),
-        pos2(node.rect.max.x - 8.0, node.rect.max.y - 4.0),
+        pos2(node.rect.min.x + 18.0 * z, node.rect.min.y + 4.0 * z),
+        pos2(node.rect.max.x - 8.0 * z, node.rect.max.y - 4.0 * z),
     );
     painter.with_clip_rect(clip).text(
-        pos2(clip.min.x, node.rect.center().y - 9.0),
+        pos2(clip.min.x, node.rect.center().y - 9.0 * z),
         Align2::LEFT_CENTER,
         &hub.name,
-        font_semi(14.0),
+        font_semi(14.0 * z),
         p.text,
     );
     let mode = hub.protocol.map(HubProto::label).unwrap_or("Split");
     painter.with_clip_rect(clip).text(
-        pos2(clip.min.x, node.rect.center().y + 10.0),
+        pos2(clip.min.x, node.rect.center().y + 10.0 * z),
         Align2::LEFT_CENTER,
         mode,
-        font_ui(11.0),
+        font_ui(11.0 * z),
         if on { ink } else { p.muted },
     );
 }
@@ -1380,27 +1485,32 @@ fn paint_port_node(
     model: &HubModel,
     on: bool,
     hot: bool,
+    zoom: f32,
     p: &ThemePalette,
 ) {
     let Some(port) = find_port(model, node.hub_id, node.port_id) else {
         return;
     };
+    let z = zoom.max(0.35);
     let ink = port.protocol.ink(p.is_light);
     paint_card(painter, node.rect, ink, on, hot, p);
-    let bar = Rect::from_min_max(node.rect.min, pos2(node.rect.min.x + 4.0, node.rect.max.y));
+    let bar = Rect::from_min_max(
+        node.rect.min,
+        pos2(node.rect.min.x + 4.0 * z, node.rect.max.y),
+    );
     painter.rect_filled(
         bar,
         Rounding {
-            nw: 7.0,
+            nw: 7.0 * z,
             ne: 0.0,
-            sw: 7.0,
+            sw: 7.0 * z,
             se: 0.0,
         },
         ink,
     );
     let clip = Rect::from_min_max(
-        pos2(node.rect.min.x + 12.0, node.rect.min.y),
-        pos2(node.rect.max.x - 8.0, node.rect.max.y),
+        pos2(node.rect.min.x + 12.0 * z, node.rect.min.y),
+        pos2(node.rect.max.x - 8.0 * z, node.rect.max.y),
     );
     let role = if node.role == Role::Source {
         "IN"
@@ -1408,17 +1518,17 @@ fn paint_port_node(
         "OUT"
     };
     painter.with_clip_rect(clip).text(
-        pos2(clip.min.x, node.rect.center().y - 8.0),
+        pos2(clip.min.x, node.rect.center().y - 8.0 * z),
         Align2::LEFT_CENTER,
         format!("{role}  {}", port.protocol.label()),
-        font_ui(10.0),
+        font_ui(10.0 * z),
         ink,
     );
     painter.with_clip_rect(clip).text(
-        pos2(clip.min.x, node.rect.center().y + 8.0),
+        pos2(clip.min.x, node.rect.center().y + 8.0 * z),
         Align2::LEFT_CENTER,
         &port.label,
-        font_ui(13.0),
+        font_ui(13.0 * z),
         p.text,
     );
 }
@@ -1429,27 +1539,32 @@ fn paint_step_node(
     model: &HubModel,
     on: bool,
     hot: bool,
+    zoom: f32,
     p: &ThemePalette,
 ) {
     let Some(step) = find_step(model, node.hub_id, node.port_id) else {
         return;
     };
+    let z = zoom.max(0.35);
     let ink = p.accent;
     paint_card(painter, node.rect, ink, on, hot, p);
-    let bar = Rect::from_min_max(node.rect.min, pos2(node.rect.min.x + 4.0, node.rect.max.y));
+    let bar = Rect::from_min_max(
+        node.rect.min,
+        pos2(node.rect.min.x + 4.0 * z, node.rect.max.y),
+    );
     painter.rect_filled(
         bar,
         Rounding {
-            nw: 7.0,
+            nw: 7.0 * z,
             ne: 0.0,
-            sw: 7.0,
+            sw: 7.0 * z,
             se: 0.0,
         },
         ink,
     );
     let clip = Rect::from_min_max(
-        pos2(node.rect.min.x + 12.0, node.rect.min.y),
-        pos2(node.rect.max.x - 8.0, node.rect.max.y),
+        pos2(node.rect.min.x + 12.0 * z, node.rect.min.y),
+        pos2(node.rect.max.x - 8.0 * z, node.rect.max.y),
     );
     let role = if node.role == Role::Aggregator {
         "AGG"
@@ -1457,17 +1572,17 @@ fn paint_step_node(
         "CALC"
     };
     painter.with_clip_rect(clip).text(
-        pos2(clip.min.x, node.rect.center().y - 8.0),
+        pos2(clip.min.x, node.rect.center().y - 8.0 * z),
         Align2::LEFT_CENTER,
         role,
-        font_ui(10.0),
+        font_ui(10.0 * z),
         ink,
     );
     painter.with_clip_rect(clip).text(
-        pos2(clip.min.x, node.rect.center().y + 8.0),
+        pos2(clip.min.x, node.rect.center().y + 8.0 * z),
         Align2::LEFT_CENTER,
         &step.label,
-        font_ui(13.0),
+        font_ui(13.0 * z),
         p.text,
     );
 }
@@ -2242,5 +2357,43 @@ mod tests {
         assert!((next.y - 14.0).abs() < 0.01);
         let clamped = pan_scroll(vec2(4.0, 0.0), vec2(20.0, 8.0));
         assert_eq!(clamped, Vec2::ZERO);
+    }
+
+    #[test]
+    fn zoom_defaults_to_maximum_and_only_zooms_out() {
+        assert_eq!(clamp_zoom(1.0), ZOOM_MAX);
+        assert_eq!(clamp_zoom(1.5), ZOOM_MAX);
+        assert_eq!(clamp_zoom(0.1), ZOOM_MIN);
+        assert_eq!(clamp_zoom(f32::NAN), ZOOM_MAX);
+        let model = HubModel::sample();
+        assert!((model.zoom - ZOOM_MAX).abs() < 0.0001);
+    }
+
+    #[test]
+    fn zoom_toward_keeps_the_world_point_under_the_cursor() {
+        // Values chosen so the new offset stays non-negative (no clamp).
+        let offset = vec2(200.0, 180.0);
+        let view = vec2(100.0, 80.0);
+        let old_shift = vec2(12.0, 6.0);
+        let new_shift = vec2(4.0, 2.0);
+        let old_z = 1.0;
+        let new_z = 0.5;
+        let next = zoom_toward(offset, view, old_shift, new_shift, old_z, new_z);
+        assert!(next.x >= 0.0 && next.y >= 0.0);
+        let world_before = (offset + view - old_shift) / old_z;
+        let world_after = (next + view - new_shift) / new_z;
+        assert!((world_before.x - world_after.x).abs() < 0.05);
+        assert!((world_before.y - world_after.y).abs() < 0.05);
+    }
+
+    #[test]
+    fn scale_nodes_shrinks_layout_with_zoom() {
+        let nodes = layout_nodes(&HubModel::sample().hubs);
+        let half = scale_nodes(&nodes, 0.5);
+        assert_eq!(half.len(), nodes.len());
+        let a = nodes[0].rect;
+        let b = half[0].rect;
+        assert!((b.width() - a.width() * 0.5).abs() < 0.01);
+        assert!((b.center().x - a.center().x * 0.5).abs() < 0.01);
     }
 }
