@@ -17,7 +17,7 @@ Entitlements are license-driven: **no fixed free protocol list** — the license
 | `pb-abi` | C ABI: `pb_pack_abi_version`, `pb_pack_register`, opaque handles, host callbacks (point upsert + log); host refuses load on ABI skew |
 | `pb-points` | Host-owned typed point store; packs upsert only through ABI callbacks |
 | `pb-engine` | `libloading` modules-dir loader, verify stub (signature later), wrap pack as `ProtocolEngine`; commands: configure / connect / disconnect / subscribe / publish / write_point |
-| `pb-mqtt` | Connect / disconnect / reconnect; last error + quality; subscribe → points (`mqtt/<topic>`); point write / publish → broker; TLS / WSS; password in JSON config (no keyring) |
+| `pb-mqtt` | Connect / disconnect / reconnect; last error + quality; subscribe → points (`mqtt/<topic>`); JSON object parse paths → field points (`mqtt/<topic>::<path>`); point write / publish → broker; TLS / WSS; password in JSON config (no keyring) |
 | `pb-service` | Headless binary: load `modules/`, run host |
 | UI MQTT panel | Live snapshot (connected, topics, last error) + fields to connect one client |
 

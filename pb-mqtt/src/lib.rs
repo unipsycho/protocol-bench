@@ -3,7 +3,12 @@
 //! Worker + EventLoop pattern ported from TopicBench `mqtt/live.rs` (no UI/tree).
 //! Client roles only — embedded broker / hub is deferred.
 
+mod json_path;
 mod session;
+
+pub use json_path::{
+    extract_path_value, point_id_for_field, point_id_for_topic, split_point_id, topic_matches,
+};
 
 use pb_abi::{
     write_cstr, PbHostApi, PbPackApi, PB_ABI_VERSION, PB_LOG_ERROR, PB_LOG_INFO, PB_QUALITY_BAD,
@@ -17,6 +22,19 @@ use std::sync::mpsc::TryRecvError;
 
 const PACK_ID: &[u8] = b"mqtt\0";
 const PACK_TITLE: &[u8] = b"MQTT\0";
+
+/// One JSON field → point rule (topic filter + dotted path).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParseRule {
+    /// MQTT topic filter (`+` / `#` allowed). Empty = match all topics.
+    #[serde(default)]
+    pub topic: String,
+    /// Dotted / `$.a.b` / `arr[0].x` path into a JSON object payload.
+    pub path: String,
+    /// Optional override point id; default `mqtt/<topic>::<path>`.
+    #[serde(default)]
+    pub point: String,
+}
 
 /// JSON config accepted by [`configure`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +55,9 @@ pub struct MqttConfig {
     pub transport: String,
     #[serde(default = "default_keep_alive")]
     pub keep_alive_secs: u64,
+    /// JSON object field paths → host points (applied on every matching inbound).
+    #[serde(default)]
+    pub parse_rules: Vec<ParseRule>,
 }
 
 fn default_host() -> String {
@@ -65,6 +86,7 @@ impl Default for MqttConfig {
             password: String::new(),
             transport: default_transport(),
             keep_alive_secs: default_keep_alive(),
+            parse_rules: Vec::new(),
         }
     }
 }
@@ -200,10 +222,20 @@ impl PackState {
                 self.log(PB_LOG_INFO, &detail);
             }
             SessionEvent::Message { topic, payload } => {
-                let point_name = format!("mqtt/{topic}");
-                match std::str::from_utf8(&payload) {
-                    Ok(text) => self.upsert_string(&point_name, text, !self.quality_bad),
-                    Err(_) => self.upsert_bytes(&point_name, &payload, !self.quality_bad),
+                // Whole-topic point on the host bus (channel + concrete topic).
+                let point_name = point_id_for_topic(&topic);
+                let text = match std::str::from_utf8(&payload) {
+                    Ok(text) => {
+                        self.upsert_string(&point_name, text, !self.quality_bad);
+                        Some(text.to_string())
+                    }
+                    Err(_) => {
+                        self.upsert_bytes(&point_name, &payload, !self.quality_bad);
+                        None
+                    }
+                };
+                if let Some(text) = text.as_deref() {
+                    self.apply_parse_rules(&topic, text);
                 }
             }
             SessionEvent::Error { detail } => {
@@ -213,6 +245,28 @@ impl PackState {
                 self.state = "disconnected".into();
                 self.log(PB_LOG_ERROR, &detail);
             }
+        }
+    }
+
+    fn apply_parse_rules(&self, topic: &str, payload: &str) {
+        let good = !self.quality_bad;
+        for rule in &self.config.parse_rules {
+            let path = rule.path.trim();
+            if path.is_empty() {
+                continue;
+            }
+            if !topic_matches(&rule.topic, topic) {
+                continue;
+            }
+            let Some(value) = extract_path_value(payload, path) else {
+                continue;
+            };
+            let name = if rule.point.trim().is_empty() {
+                point_id_for_field(topic, path)
+            } else {
+                rule.point.trim().to_string()
+            };
+            self.upsert_string(&name, &value, good);
         }
     }
 
@@ -451,7 +505,7 @@ unsafe extern "C" fn write_point(
         Ok(t) => t,
         Err(_) => return -1,
     };
-    let topic = name.strip_prefix("mqtt/").unwrap_or(name);
+    let (topic, _) = split_point_id(name);
     let payload: Vec<u8> = match value_kind {
         PB_VALUE_STRING | PB_VALUE_BYTES => {
             if value.is_null() {

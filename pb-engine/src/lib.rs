@@ -199,6 +199,16 @@ impl SlotSnapshot {
     }
 }
 
+/// One host point, copied for the UI (packs upsert into the live store).
+#[derive(Debug, Clone)]
+pub struct PointSnapshot {
+    pub name: String,
+    pub value: String,
+    pub quality: String,
+    pub source: String,
+    pub updated_ms: u64,
+}
+
 /// What the UI is allowed to know about the host.
 #[derive(Debug, Clone)]
 pub struct HostSnapshot {
@@ -210,11 +220,20 @@ pub struct HostSnapshot {
     pub modules_dir: String,
     pub packs_loaded: Vec<String>,
     pub point_count: usize,
+    pub points: Vec<PointSnapshot>,
 }
 
 impl HostSnapshot {
     pub fn slot(&self, id: EngineId) -> Option<&SlotSnapshot> {
         self.slots.iter().find(|slot| slot.id == id)
+    }
+
+    /// Points owned by one protocol channel (e.g. `"mqtt"`).
+    pub fn points_for_source<'a>(
+        &'a self,
+        source: &'a str,
+    ) -> impl Iterator<Item = &'a PointSnapshot> + 'a {
+        self.points.iter().filter(move |p| p.source == source)
     }
 }
 
@@ -317,6 +336,7 @@ fn initial_snapshot(modules_dir: &Path) -> HostSnapshot {
         modules_dir: modules_dir.display().to_string(),
         packs_loaded: Vec::new(),
         point_count: 0,
+        points: Vec::new(),
     }
 }
 
@@ -410,10 +430,20 @@ fn snapshot_of(
 ) -> HostSnapshot {
     let slots: Vec<SlotSnapshot> = engines.iter().map(|engine| engine.snapshot()).collect();
     let ticks = slots.iter().map(|slot| slot.ticks).max().unwrap_or(0);
-    let point_count = points
+    let point_rows = points
         .lock()
-        .map(|s| s.len())
-        .unwrap_or_else(|e| e.into_inner().len());
+        .unwrap_or_else(|e| e.into_inner())
+        .snapshot()
+        .into_iter()
+        .map(|p| PointSnapshot {
+            name: p.name,
+            value: p.value.as_display(),
+            quality: p.quality.label().into(),
+            source: p.source,
+            updated_ms: p.updated_ms,
+        })
+        .collect::<Vec<_>>();
+    let point_count = point_rows.len();
     HostSnapshot {
         thread_name: thread_name.to_string(),
         alive,
@@ -423,6 +453,7 @@ fn snapshot_of(
         modules_dir: modules_dir.display().to_string(),
         packs_loaded: pack_ids.to_vec(),
         point_count,
+        points: point_rows,
     }
 }
 

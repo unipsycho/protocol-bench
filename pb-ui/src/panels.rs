@@ -9,7 +9,15 @@ use crate::dock::DockPane;
 use crate::hubs::HubModel;
 use crate::theme::{font_semi, font_ui, scope, tint, ThemePalette};
 
-/// Connect fields for one MQTT client (UI-only; pack gets JSON on Connect).
+/// One JSON field path → point rule (edited on the MQTT panel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MqttParseRule {
+    pub topic: String,
+    pub path: String,
+    pub point: String,
+}
+
+/// Connect fields for one MQTT client (UI-only; pack gets JSON on Connect / Apply paths).
 #[derive(Debug, Clone)]
 pub struct MqttForm {
     pub host: String,
@@ -22,6 +30,11 @@ pub struct MqttForm {
     pub subscribe_topic: String,
     pub publish_topic: String,
     pub publish_payload: String,
+    /// Topic selected from live values for JSON path editing.
+    pub inspect_topic: String,
+    pub parse_path: String,
+    pub parse_point: String,
+    pub parse_rules: Vec<MqttParseRule>,
 }
 
 impl Default for MqttForm {
@@ -36,6 +49,10 @@ impl Default for MqttForm {
             subscribe_topic: "pb/#".into(),
             publish_topic: "pb/out".into(),
             publish_payload: "hello".into(),
+            inspect_topic: String::new(),
+            parse_path: String::new(),
+            parse_point: String::new(),
+            parse_rules: Vec::new(),
         }
     }
 }
@@ -57,6 +74,10 @@ pub fn paint(
             mqtt_panel(ui, host, p, engine, mqtt);
             crate::hubs::HubChange::quiet()
         }
+        DockPane::Points => {
+            points_panel(ui, host, p);
+            crate::hubs::HubChange::quiet()
+        }
         _ => {
             scaffold_panel(ui, pane, host, p);
             crate::hubs::HubChange::quiet()
@@ -65,6 +86,31 @@ pub fn paint(
 }
 
 fn mqtt_panel(
+    ui: &mut egui::Ui,
+    host: &HostSnapshot,
+    p: &ThemePalette,
+    engine: &EngineHandle,
+    form: &mut MqttForm,
+) {
+    egui::ScrollArea::vertical()
+        .id_salt("pb_mqtt_panel")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Keep labels/controls off the pane edge.
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    mqtt_panel_body(ui, host, p, engine, form);
+                });
+                ui.add_space(8.0);
+            });
+            ui.add_space(8.0);
+        });
+}
+
+fn mqtt_panel_body(
     ui: &mut egui::Ui,
     host: &HostSnapshot,
     p: &ThemePalette,
@@ -89,7 +135,6 @@ fn mqtt_panel(
     );
     ui.add_space(8.0);
 
-    // Live snapshot strip.
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(format!("State: {state}"))
@@ -112,55 +157,33 @@ fn mqtt_panel(
     }
     if !topics.is_empty() {
         ui.label(
-            egui::RichText::new(format!("Topics: {}", topics.join(", ")))
+            egui::RichText::new(format!("Subscribed: {}", topics.join(", ")))
                 .font(font_ui(12.0))
                 .color(p.muted),
         );
     }
-    ui.add_space(10.0);
+    ui.add_space(8.0);
+    mqtt_live_values(ui, host, &topics, form, p);
+    ui.add_space(12.0);
 
+    section_label(ui, "CONNECTION", p);
     field_row(ui, "Host", &mut form.host, p);
     field_row(ui, "Port", &mut form.port, p);
     field_row(ui, "Client ID", &mut form.client_id, p);
     field_row(ui, "Username", &mut form.username, p);
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Password")
-                .font(font_ui(12.0))
-                .color(p.muted),
-        );
-        ui.add(
-            egui::TextEdit::singleline(&mut form.password)
-                .password(true)
-                .desired_width(180.0),
-        );
-    });
+    field_row_password(ui, "Password", &mut form.password, p);
     field_row(ui, "Transport", &mut form.transport, p);
+    ui.add_space(2.0);
     ui.label(
         egui::RichText::new("tcp · tls · ws · wss (password in config; no keyring yet)")
             .font(font_ui(11.0))
             .color(p.muted),
     );
-    ui.add_space(8.0);
+    ui.add_space(10.0);
 
     ui.horizontal(|ui| {
         if text_btn(ui, "Connect", true, p).clicked() {
-            let port: u16 = form.port.parse().unwrap_or(1883);
-            let json = serde_json::json!({
-                "host": form.host,
-                "port": port,
-                "client_id": form.client_id,
-                "username": form.username,
-                "password": form.password,
-                "transport": form.transport,
-                "keep_alive_secs": 30,
-            });
-            engine.submit(
-                EngineId::Mqtt,
-                EngineCommand::Configure {
-                    json: json.to_string(),
-                },
-            );
+            push_mqtt_config(engine, form);
             engine.submit(EngineId::Mqtt, EngineCommand::Connect);
             if !form.subscribe_topic.trim().is_empty() {
                 engine.submit(
@@ -172,12 +195,14 @@ fn mqtt_panel(
                 );
             }
         }
+        ui.add_space(12.0);
         if text_btn(ui, "Disconnect", false, p).clicked() {
             engine.submit(EngineId::Mqtt, EngineCommand::Disconnect);
         }
     });
-    ui.add_space(10.0);
+    ui.add_space(12.0);
     field_row(ui, "Subscribe", &mut form.subscribe_topic, p);
+    ui.add_space(4.0);
     if text_btn(ui, "Subscribe now", false, p).clicked() {
         engine.submit(
             EngineId::Mqtt,
@@ -187,9 +212,10 @@ fn mqtt_panel(
             },
         );
     }
-    ui.add_space(6.0);
+    ui.add_space(10.0);
     field_row(ui, "Publish topic", &mut form.publish_topic, p);
     field_row(ui, "Payload", &mut form.publish_payload, p);
+    ui.add_space(4.0);
     if text_btn(ui, "Publish", false, p).clicked() {
         engine.submit(
             EngineId::Mqtt,
@@ -201,17 +227,399 @@ fn mqtt_panel(
             },
         );
     }
+
+    ui.add_space(14.0);
+    mqtt_json_paths(ui, host, form, engine, p);
 }
 
-fn field_row(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
+fn push_mqtt_config(engine: &EngineHandle, form: &MqttForm) {
+    let port: u16 = form.port.parse().unwrap_or(1883);
+    let parse_rules: Vec<serde_json::Value> = form
+        .parse_rules
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "topic": r.topic,
+                "path": r.path,
+                "point": r.point,
+            })
+        })
+        .collect();
+    let json = serde_json::json!({
+        "host": form.host,
+        "port": port,
+        "client_id": form.client_id,
+        "username": form.username,
+        "password": form.password,
+        "transport": form.transport,
+        "keep_alive_secs": 30,
+        "parse_rules": parse_rules,
+    });
+    engine.submit(
+        EngineId::Mqtt,
+        EngineCommand::Configure {
+            json: json.to_string(),
+        },
+    );
+}
+
+fn section_label(ui: &mut egui::Ui, label: &str, p: &ThemePalette) {
+    ui.label(
+        egui::RichText::new(label)
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(6.0);
+}
+
+fn mqtt_json_paths(
+    ui: &mut egui::Ui,
+    host: &HostSnapshot,
+    form: &mut MqttForm,
+    engine: &EngineHandle,
+    p: &ThemePalette,
+) {
+    section_label(ui, "JSON PATHS → POINTS", p);
+    ui.label(
+        egui::RichText::new(
+            "Click a live topic to inspect its payload, then add dotted paths (e.g. temp or $.room.temp). Matching fields become host points.",
+        )
+        .font(font_ui(12.0))
+        .color(p.muted),
+    );
+    ui.add_space(8.0);
+
+    field_row(ui, "Topic", &mut form.inspect_topic, p);
+    let inspect = form.inspect_topic.trim().to_string();
+    let latest = if inspect.is_empty() {
+        None
+    } else {
+        host.points
+            .iter()
+            .find(|pt| {
+                pt.source == "mqtt"
+                    && !pt.name.contains("::")
+                    && pt.name.strip_prefix("mqtt/").unwrap_or(pt.name.as_str()) == inspect
+            })
+            .map(|pt| pt.value.clone())
+    };
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("Message")
+            .font(font_ui(12.0))
+            .color(p.muted),
+    );
+    ui.add_space(2.0);
+    let mut message = latest.unwrap_or_else(|| {
+        if inspect.is_empty() {
+            "(select a live topic above)".into()
+        } else {
+            "(no payload yet for this topic)".into()
+        }
+    });
+    ui.add(
+        egui::TextEdit::multiline(&mut message)
+            .desired_width(ui.available_width())
+            .desired_rows(4)
+            .interactive(false),
+    );
+    ui.add_space(8.0);
+    field_row(ui, "Path", &mut form.parse_path, p);
+    field_row(ui, "Point id", &mut form.parse_point, p);
+    ui.label(
+        egui::RichText::new("Point id optional — default mqtt/<topic>::<path>")
+            .font(font_ui(11.0))
+            .color(p.muted),
+    );
+    ui.add_space(6.0);
     ui.horizontal(|ui| {
+        if text_btn(ui, "Add path", true, p).clicked() {
+            let topic = form.inspect_topic.trim().to_string();
+            let path = form.parse_path.trim().to_string();
+            if !path.is_empty() {
+                let point = form.parse_point.trim().to_string();
+                let rule = MqttParseRule {
+                    topic: if topic.is_empty() {
+                        form.subscribe_topic.trim().to_string()
+                    } else {
+                        topic
+                    },
+                    path,
+                    point,
+                };
+                if !form.parse_rules.iter().any(|r| r == &rule) {
+                    form.parse_rules.push(rule);
+                }
+                form.parse_path.clear();
+                form.parse_point.clear();
+                push_mqtt_config(engine, form);
+            }
+        }
+        ui.add_space(12.0);
+        if text_btn(ui, "Apply paths", false, p).clicked() {
+            push_mqtt_config(engine, form);
+        }
+    });
+
+    if form.parse_rules.is_empty() {
+        ui.add_space(6.0);
         ui.label(
-            egui::RichText::new(label)
+            egui::RichText::new("No parse paths yet.")
                 .font(font_ui(12.0))
                 .color(p.muted),
         );
-        ui.add(egui::TextEdit::singleline(value).desired_width(180.0));
+        return;
+    }
+    ui.add_space(8.0);
+    let mut remove: Option<usize> = None;
+    for (i, rule) in form.parse_rules.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let label = if rule.point.is_empty() {
+                format!("{}  ·  {}", rule.topic, rule.path)
+            } else {
+                format!("{}  ·  {}  →  {}", rule.topic, rule.path, rule.point)
+            };
+            ui.label(
+                egui::RichText::new(label)
+                    .font(font_ui(12.0))
+                    .color(p.text),
+            );
+            ui.add_space(8.0);
+            if text_btn(ui, "Remove", false, p).clicked() {
+                remove = Some(i);
+            }
+        });
+        ui.add_space(2.0);
+    }
+    if let Some(i) = remove {
+        form.parse_rules.remove(i);
+        push_mqtt_config(engine, form);
+    }
+}
+
+/// Live values for subscribed MQTT topics (from the host points bus).
+fn mqtt_live_values(
+    ui: &mut egui::Ui,
+    host: &HostSnapshot,
+    subscriptions: &[String],
+    form: &mut MqttForm,
+    p: &ThemePalette,
+) {
+    section_label(ui, "LIVE VALUES", p);
+    // Whole-topic payloads first; field points (…::path) listed after.
+    let mqtt_points: Vec<_> = host.points_for_source("mqtt").collect();
+    if mqtt_points.is_empty() {
+        let hint = if subscriptions.is_empty() {
+            "Subscribe to a topic — inbound messages become points here."
+        } else {
+            "Waiting for inbound messages on the subscribed topics…"
+        };
+        ui.label(
+            egui::RichText::new(hint)
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        return;
+    }
+    let height = ((mqtt_points.len() as f32) * 22.0 + 28.0)
+        .clamp(72.0, ui.available_height().min(220.0).max(72.0));
+    egui::ScrollArea::vertical()
+        .id_salt("pb_mqtt_live")
+        .max_height(height)
+        .show(ui, |ui| {
+            egui::Grid::new("pb_mqtt_live_grid")
+                .num_columns(3)
+                .spacing([12.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("TOPIC / POINT")
+                            .font(font_ui(10.5))
+                            .color(p.muted),
+                    );
+                    ui.label(
+                        egui::RichText::new("VALUE")
+                            .font(font_ui(10.5))
+                            .color(p.muted),
+                    );
+                    ui.label(
+                        egui::RichText::new("QUALITY")
+                            .font(font_ui(10.5))
+                            .color(p.muted),
+                    );
+                    ui.end_row();
+                    for point in mqtt_points {
+                        let display = point
+                            .name
+                            .strip_prefix("mqtt/")
+                            .unwrap_or(point.name.as_str());
+                        let is_field = display.contains("::");
+                        let topic_only = display.split("::").next().unwrap_or(display);
+                        let selected = form.inspect_topic == topic_only;
+                        let topic_resp = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(display)
+                                    .font(font_ui(12.0))
+                                    .color(if selected { p.accent } else { p.text }),
+                            )
+                            .sense(Sense::click()),
+                        );
+                        if topic_resp.clicked() && !is_field {
+                            form.inspect_topic = topic_only.to_string();
+                        } else if topic_resp.clicked() {
+                            form.inspect_topic = topic_only.to_string();
+                            if let Some((_, path)) = display.split_once("::") {
+                                form.parse_path = path.to_string();
+                            }
+                        }
+                        topic_resp.on_hover_text("Click to inspect for JSON paths");
+                        ui.label(
+                            egui::RichText::new(truncate_value(&point.value, 64))
+                                .font(font_ui(12.0))
+                                .color(p.text),
+                        );
+                        ui.label(
+                            egui::RichText::new(&point.quality)
+                                .font(font_ui(12.0))
+                                .color(p.muted),
+                        );
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn truncate_value(value: &str, max: usize) -> String {
+    let flat = value.replace('\n', " ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn points_panel(ui: &mut egui::Ui, host: &HostSnapshot, p: &ThemePalette) {
+    ui.label(
+        egui::RichText::new(
+            "Host points bus — MQTT subscriptions (and later other inputs) land here for mapping/hub conversion.",
+        )
+        .font(font_ui(12.5))
+        .color(p.muted),
+    );
+    ui.add_space(8.0);
+    if host.points.is_empty() {
+        ui.label(
+            egui::RichText::new("No points yet. Connect MQTT and subscribe to populate the bus.")
+                .font(font_ui(12.5))
+                .color(p.muted),
+        );
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .id_salt("pb_points_live")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("pb_points_grid")
+                .num_columns(5)
+                .spacing([10.0, 4.0])
+                .striped(true)
+                .min_col_width(40.0)
+                .show(ui, |ui| {
+                    for (label, _) in [
+                        ("NAME", 0),
+                        ("VALUE", 0),
+                        ("QUALITY", 0),
+                        ("SOURCE", 0),
+                        ("UPDATED", 0),
+                    ] {
+                        ui.label(
+                            egui::RichText::new(label)
+                                .font(font_ui(10.5))
+                                .color(p.muted),
+                        );
+                    }
+                    ui.end_row();
+                    for point in &host.points {
+                        ui.label(
+                            egui::RichText::new(&point.name)
+                                .font(font_ui(12.0))
+                                .color(p.text),
+                        );
+                        ui.label(
+                            egui::RichText::new(&point.value)
+                                .font(font_ui(12.0))
+                                .color(p.text),
+                        );
+                        ui.label(
+                            egui::RichText::new(&point.quality)
+                                .font(font_ui(12.0))
+                                .color(p.muted),
+                        );
+                        ui.label(
+                            egui::RichText::new(&point.source)
+                                .font(font_ui(12.0))
+                                .color(p.muted),
+                        );
+                        ui.label(
+                            egui::RichText::new(format_updated(point.updated_ms))
+                                .font(font_ui(12.0))
+                                .color(p.muted),
+                        );
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn format_updated(updated_ms: u64) -> String {
+    if updated_ms == 0 {
+        return "—".into();
+    }
+    // Epoch ms → compact local-ish display (seconds since epoch is enough for live bench).
+    let secs = updated_ms / 1000;
+    format!("{secs}")
+}
+
+const FIELD_LABEL_W: f32 = 100.0;
+
+fn field_row(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.add_sized(
+            [FIELD_LABEL_W, 20.0],
+            egui::Label::new(
+                egui::RichText::new(label)
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            ),
+        );
+        let edit_w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
+        ui.add(egui::TextEdit::singleline(value).desired_width(edit_w));
     });
+    ui.add_space(4.0);
+}
+
+fn field_row_password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.add_sized(
+            [FIELD_LABEL_W, 20.0],
+            egui::Label::new(
+                egui::RichText::new(label)
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            ),
+        );
+        let edit_w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .password(true)
+                .desired_width(edit_w),
+        );
+    });
+    ui.add_space(4.0);
 }
 
 fn text_btn(ui: &mut egui::Ui, label: &str, accent: bool, p: &ThemePalette) -> egui::Response {
@@ -224,7 +632,8 @@ fn text_btn(ui: &mut egui::Ui, label: &str, accent: bool, p: &ThemePalette) -> e
     ui.add(
         egui::Button::new(egui::RichText::new(label).font(font_ui(12.5)).color(text))
             .fill(fill)
-            .stroke(Stroke::new(1.0, p.line)),
+            .stroke(Stroke::new(1.0, p.line))
+            .min_size(Vec2::new(96.0, 28.0)),
     )
 }
 
