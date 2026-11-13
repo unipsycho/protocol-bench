@@ -413,12 +413,45 @@ fn stat_tile(
 }
 
 fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, p: &ThemePalette) {
-    ui.label(
-        egui::RichText::new(title)
-            .font(font_ui(10.5))
-            .color(p.muted),
+    // Expand/collapse so long hub / transform lists stay manageable.
+    let id = ui.make_persistent_id(("pb_project_list", title));
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    let open = state.is_open();
+    let header = format!("{title}  ·  {}", names.len());
+    let (bar, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width().max(1.0), 22.0),
+        Sense::click(),
     );
-    ui.add_space(4.0);
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(bar, Rounding::same(4.0), tint(p.accent, 16));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // Chevron: ▶ collapsed, ▼ open.
+    let chevron = if open { "▼" } else { "▶" };
+    ui.painter().text(
+        Pos2::new(bar.min.x + 4.0, bar.center().y),
+        Align2::LEFT_CENTER,
+        chevron,
+        font_ui(9.0),
+        p.muted,
+    );
+    ui.painter().text(
+        Pos2::new(bar.min.x + 18.0, bar.center().y),
+        Align2::LEFT_CENTER,
+        header,
+        font_ui(10.5),
+        p.muted,
+    );
+    if resp.clicked() {
+        state.toggle(ui);
+    }
+    state.store(ui.ctx());
+    if !state.is_open() {
+        return;
+    }
+    ui.add_space(2.0);
     if names.is_empty() {
         ui.label(
             egui::RichText::new("None yet")
