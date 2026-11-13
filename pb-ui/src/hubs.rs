@@ -22,8 +22,8 @@ const DIAGRAM_MIN: f32 = 280.0;
 /// Current default view is maximum zoom. Wheel zooms out from here.
 const ZOOM_MAX: f32 = 1.0;
 const ZOOM_MIN: f32 = 0.25;
-/// Same feel as egui's ctrl-scroll zoom (`Options::scroll_zoom_speed`).
-const ZOOM_WHEEL: f32 = 1.0 / 200.0;
+/// Wheel zoom gain. Smaller than egui's default `1/200` so each notch steps gently.
+const ZOOM_WHEEL: f32 = 1.0 / 520.0;
 
 fn default_inspector_width() -> f32 {
     INSPECT_DEFAULT
@@ -184,6 +184,10 @@ pub struct HubModel {
     /// Selected connection (source/output port id) for edge transforms.
     #[serde(default)]
     pub selected_link: Option<u64>,
+    /// Canvas multi-select: `(hub_id, port_id)` with `None` for the hub node itself.
+    /// Ephemeral UI state — not saved with the project.
+    #[serde(skip)]
+    pub selection: Vec<(u64, Option<u64>)>,
     /// Width of the right-hand configure panel when the hubs view is wide enough.
     #[serde(default = "default_inspector_width")]
     pub inspector_width: f32,
@@ -208,6 +212,7 @@ impl HubModel {
             selected: Some(1),
             selected_port: None,
             selected_link: None,
+            selection: vec![(1, None)],
             inspector_width: INSPECT_DEFAULT,
             zoom: ZOOM_MAX,
             hubs: vec![
@@ -328,8 +333,21 @@ impl HubModel {
         self.keep_focus();
     }
 
-    /// Drop a port, step, or link selection that no longer belongs to the open hub.
+    /// Drop a port, step, link, or multi-select entry that no longer exists.
     fn keep_focus(&mut self) {
+        let keys = self.selection.clone();
+        self.selection = keys
+            .into_iter()
+            .filter(|(hub_id, port_id)| {
+                let Some(hub) = self.hub(*hub_id) else {
+                    return false;
+                };
+                match port_id {
+                    None => true,
+                    Some(id) => hub.has_node(*id),
+                }
+            })
+            .collect();
         let Some(hub_id) = self.selected else {
             self.selected_port = None;
             self.selected_link = None;
@@ -349,32 +367,72 @@ impl HubModel {
         }
     }
 
-    pub fn focus_hub(&mut self, id: u64) {
-        self.selected = Some(id);
-        self.selected_port = None;
-        self.selected_link = None;
+    /// True when more than one canvas node is selected (no item properties).
+    pub fn multi_selected(&self) -> bool {
+        self.selection.len() > 1
     }
 
-    pub fn focus_port(&mut self, hub_id: u64, port_id: u64) {
-        self.selected = Some(hub_id);
-        self.selected_port = Some(port_id);
-        // Port click selects its edge; step click keeps the step's edge selected.
-        if let Some(hub) = self.hub(hub_id) {
-            if hub.has_port(port_id) {
-                self.selected_link = Some(port_id);
-            } else if let Some(step) = hub
-                .aggregators
-                .iter()
-                .chain(hub.calculations.iter())
-                .find(|step| step.id == port_id)
-            {
-                self.selected_link = Some(step.edge_port);
+    fn selection_contains(&self, hub_id: u64, port_id: Option<u64>) -> bool {
+        self.selection
+            .iter()
+            .any(|(h, p)| *h == hub_id && *p == port_id)
+    }
+
+    /// Replace canvas selection (box select / clear). Syncs single-item focus when len == 1.
+    pub fn set_selection(&mut self, keys: Vec<(u64, Option<u64>)>) {
+        self.selection = keys;
+        self.selected_link = None;
+        match self.selection.as_slice() {
+            [] => {
+                self.selected_port = None;
+            }
+            [(hub_id, None)] => {
+                self.selected = Some(*hub_id);
+                self.selected_port = None;
+            }
+            [(hub_id, Some(port_id))] => {
+                self.apply_single_focus(*hub_id, Some(*port_id));
+            }
+            rest => {
+                self.selected = rest.first().map(|(hub_id, _)| *hub_id);
+                self.selected_port = None;
             }
         }
     }
 
+    fn apply_single_focus(&mut self, hub_id: u64, port_id: Option<u64>) {
+        self.selected = Some(hub_id);
+        self.selected_port = port_id;
+        self.selected_link = None;
+        if let Some(port_id) = port_id {
+            if let Some(hub) = self.hub(hub_id) {
+                if hub.has_port(port_id) {
+                    self.selected_link = Some(port_id);
+                } else if let Some(step) = hub
+                    .aggregators
+                    .iter()
+                    .chain(hub.calculations.iter())
+                    .find(|step| step.id == port_id)
+                {
+                    self.selected_link = Some(step.edge_port);
+                }
+            }
+        }
+    }
+
+    pub fn focus_hub(&mut self, id: u64) {
+        self.selection = vec![(id, None)];
+        self.apply_single_focus(id, None);
+    }
+
+    pub fn focus_port(&mut self, hub_id: u64, port_id: u64) {
+        self.selection = vec![(hub_id, Some(port_id))];
+        self.apply_single_focus(hub_id, Some(port_id));
+    }
+
     /// Select the connection between a port and its hub (for edge transforms).
     pub fn focus_link(&mut self, hub_id: u64, port_id: u64) {
+        self.selection.clear();
         self.selected = Some(hub_id);
         self.selected_port = None;
         self.selected_link = Some(port_id);
@@ -486,17 +544,22 @@ impl HubModel {
             calculations: vec![],
             at: None,
         });
-        self.selected = Some(id);
-        self.selected_port = None;
-        self.selected_link = None;
+        self.focus_hub(id);
     }
 
     pub fn remove_hub(&mut self, id: u64) {
         self.hubs.retain(|hub| hub.id != id);
+        self.selection.retain(|(hub_id, _)| *hub_id != id);
         if self.selected == Some(id) {
-            self.selected = self.hubs.first().map(|hub| hub.id);
-            self.selected_port = None;
-            self.selected_link = None;
+            if let Some((hub_id, port_id)) = self.selection.first().copied() {
+                self.apply_single_focus(hub_id, port_id);
+            } else if let Some(hub) = self.hubs.first() {
+                self.focus_hub(hub.id);
+            } else {
+                self.selected = None;
+                self.selected_port = None;
+                self.selected_link = None;
+            }
         }
         self.keep_focus();
     }
@@ -930,7 +993,7 @@ fn scale_nodes(nodes: &[Placed], zoom: f32) -> Vec<Placed> {
         .collect()
 }
 
-/// Keep the world point under the cursor fixed while zoom changes.
+/// Keep the world point under the cursor fixed while zoom changes (cursor-anchored zoom).
 fn zoom_toward(
     offset: Vec2,
     view_pos: Vec2,
@@ -942,10 +1005,11 @@ fn zoom_toward(
     let old_z = old_zoom.max(0.0001);
     let world = (offset + view_pos - old_shift) / old_z;
     let next = world * new_zoom + new_shift - view_pos;
+    // ScrollArea offsets cannot go negative; clamp only that floor.
     Vec2::new(next.x.max(0.0), next.y.max(0.0))
 }
 
-/// Wheel (and pinch) over the canvas. Clears scroll so parent panes do not also move.
+/// Wheel (and pinch) over the canvas, anchored at the pointer. Clears scroll so parents do not move.
 fn canvas_zoom_factor(ui: &Ui, rect: Rect) -> Option<(f32, Pos2)> {
     ui.ctx().input_mut(|i| {
         let pointer = i.pointer.hover_pos().filter(|pos| rect.contains(*pos))?;
@@ -956,7 +1020,7 @@ fn canvas_zoom_factor(ui: &Ui, rect: Rect) -> Option<(f32, Pos2)> {
             factor *= pinch;
         }
         if scroll != Vec2::ZERO {
-            // Plain wheel zooms: scrollbars are overflow-only; pan is middle/space drag.
+            // Plain wheel zooms toward `pointer`; pan stays middle/space drag.
             factor *= (ZOOM_WHEEL * scroll.y).exp();
             i.smooth_scroll_delta = Vec2::ZERO;
         }
@@ -1012,7 +1076,7 @@ pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
-                    "Drag a node to place it. Click a link or node for details. Right-click a connection to add aggregator/calculation. Wheel zooms. Middle-drag or Space-drag pans.",
+                    "Drag empty canvas to box-select. Drag a selection to move as a group. Click a link or node for details. Right-click a connection to add aggregator/calculation. Wheel zooms toward cursor. Middle-drag or Space-drag pans.",
                 )
                 .font(font_ui(12.0))
                 .color(p.muted),
@@ -1174,8 +1238,12 @@ fn diagram_view(
         }
     }
     let fit = scroll_fit(&scale_nodes(&layout_nodes(&model.hubs), zoom), grid.size());
-    let allow = fit.allow;
-    // Wheel is zoom; pan stays middle-drag / Space-drag via scroll_offset.
+    // Cursor-anchored zoom must be allowed to set scroll even when content would otherwise center.
+    let mut allow = fit.allow;
+    if zoom_pan.is_some() {
+        allow = [true, true];
+    }
+    // Wheel is cursor-anchored zoom; pan stays middle-drag / Space-drag via scroll_offset.
     let mut scroll = ScrollArea::both()
         .id_salt("pb_hub_diagram")
         .auto_shrink([false, false])
@@ -1184,14 +1252,24 @@ fn diagram_view(
         .scroll(allow);
     if !allow[0] && !allow[1] {
         scroll = scroll.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+    } else if zoom_pan.is_some() && !fit.allow[0] && !fit.allow[1] {
+        // Zooming inside a fitting view: keep bars hidden while still applying the pan.
+        scroll = scroll.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
     }
-    if let Some(offset) = pinned_scroll(stored, zoom_pan.or(pan), allow) {
+    let scroll_to = if let Some(offset) = zoom_pan {
+        // Do not pin/zero cursor-anchored zoom offsets.
+        Some(offset)
+    } else {
+        pinned_scroll(stored, pan, fit.allow)
+    };
+    if let Some(offset) = scroll_to {
         scroll = scroll.scroll_offset(offset);
     }
     let content_shift = fit.shift;
     let content_size = fit.size;
     scroll.show(&mut child, |ui| {
-        let (area, canvas) = ui.allocate_exact_size(content_size, Sense::click());
+        // click_and_drag: empty-canvas drag draws a marquee; nodes on top still win hits.
+        let (area, canvas) = ui.allocate_exact_size(content_size, Sense::click_and_drag());
         if model.hubs.is_empty() {
             ui.painter().text(
                 area.center(),
@@ -1214,12 +1292,13 @@ fn diagram_view(
                 ..*node
             })
             .collect();
-        let mut gesture = gesture_nodes(ui, model, &screen, pan.is_some());
+        let panning = pan.is_some();
+        let mut gesture = gesture_nodes(ui, model, &screen, panning);
         // Links only when no node took the pointer (nodes sit on top of edges).
         if gesture.hover.is_none()
             && gesture.pick.is_none()
             && gesture.menu.is_none()
-            && !pan.is_some()
+            && !panning
         {
             if let Some((hub_id, port_id)) = hit_link(ui, model, &screen, zoom) {
                 gesture.hot_link = Some((hub_id, port_id));
@@ -1231,19 +1310,85 @@ fn diagram_view(
                 }
             }
         }
-        if let Some((hub_id, port_id, delta)) = gesture.drag {
-            let center = screen
-                .iter()
-                .find(|node| node.hub_id == hub_id && node.port_id == port_id)
-                .map(|node| {
-                    // Screen delta → world space under the current zoom.
-                    let world = (node.rect.center() - shift + delta) / zoom.max(0.0001);
-                    pos2(world.x.max(24.0), world.y.max(24.0))
+        // Bounding-box select on empty canvas (not while panning, on a node, or on a link).
+        let marquee_id = Id::new("pb_hub_marquee");
+        let mut marquee_paint = None;
+        let on_empty = gesture.hover.is_none()
+            && gesture.drag.is_none()
+            && gesture.hot_link.is_none()
+            && !panning;
+        if on_empty && canvas.drag_started() {
+            if let Some(pos) = canvas.interact_pointer_pos() {
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(
+                        marquee_id,
+                        Marquee {
+                            origin: pos,
+                            tip: pos,
+                        },
+                    );
                 });
-            if let Some(center) = center {
-                model.set_center(hub_id, port_id, [center.x, center.y]);
-                change.dirty = true;
             }
+        }
+        if canvas.dragged() {
+            if let Some(mut box_drag) = ui.ctx().data(|d| d.get_temp::<Marquee>(marquee_id)) {
+                if let Some(pos) = canvas.interact_pointer_pos() {
+                    box_drag.tip = pos;
+                    ui.ctx().data_mut(|d| d.insert_temp(marquee_id, box_drag));
+                    marquee_paint = Some(box_drag);
+                }
+            }
+        }
+        let mut finished_marquee = false;
+        if canvas.drag_stopped() {
+            if let Some(box_drag) = ui.ctx().data_mut(|d| d.remove_temp::<Marquee>(marquee_id)) {
+                finished_marquee = true;
+                let rect = box_drag.rect();
+                if rect.width() > 4.0 || rect.height() > 4.0 {
+                    let keys = nodes_in_marquee(&screen, rect);
+                    model.set_selection(keys);
+                    change.dirty = true;
+                }
+            }
+        } else if let Some(box_drag) = ui.ctx().data(|d| d.get_temp::<Marquee>(marquee_id)) {
+            marquee_paint = Some(box_drag);
+        }
+        // Empty click clears selection. Skip when a marquee just finished (release also clicks).
+        if on_empty
+            && canvas.clicked()
+            && !finished_marquee
+            && !gesture.link_pick
+            && gesture.pick.is_none()
+        {
+            model.set_selection(Vec::new());
+            change.dirty = true;
+        }
+        if let Some((hub_id, port_id, delta)) = gesture.drag {
+            // Group-move every selected node; if the dragged node was outside the
+            // selection, replace selection with that one node first.
+            if !model.selection_contains(hub_id, port_id) {
+                match port_id {
+                    Some(id) => model.focus_port(hub_id, id),
+                    None => model.focus_hub(hub_id),
+                }
+            }
+            let keys = model.selection.clone();
+            let z = zoom.max(0.0001);
+            for (move_hub, move_port) in keys {
+                let Some(node) = screen
+                    .iter()
+                    .find(|node| node.hub_id == move_hub && node.port_id == move_port)
+                else {
+                    continue;
+                };
+                let world = (node.rect.center() - shift + delta) / z;
+                model.set_center(
+                    move_hub,
+                    move_port,
+                    [world.x.max(24.0), world.y.max(24.0)],
+                );
+            }
+            change.dirty = true;
         }
         if let Some((hub_id, port_id)) = gesture.pick {
             if gesture.link_pick {
@@ -1295,6 +1440,9 @@ fn diagram_view(
             zoom,
             p,
         );
+        if let Some(box_drag) = marquee_paint {
+            paint_marquee(ui.painter(), box_drag.rect(), p);
+        }
     });
     if pan.is_some() {
         child.ctx().set_cursor_icon(egui::CursorIcon::AllScroll);
@@ -1697,15 +1845,33 @@ fn hovered(node: &Placed, hover: Option<(u64, Option<u64>)>) -> bool {
 }
 
 fn selected_node(model: &HubModel, node: &Placed) -> bool {
-    if model.selected != Some(node.hub_id) {
-        return false;
+    model.selection_contains(node.hub_id, node.port_id)
+}
+
+/// Drag-box on the empty canvas for multi-select.
+#[derive(Clone, Copy, Default)]
+struct Marquee {
+    origin: Pos2,
+    tip: Pos2,
+}
+
+impl Marquee {
+    fn rect(self) -> Rect {
+        Rect::from_two_pos(self.origin, self.tip)
     }
-    match node.role {
-        Role::Hub => model.selected_port.is_none(),
-        Role::Source | Role::Output | Role::Aggregator | Role::Calculation => {
-            model.selected_port == node.port_id
-        }
-    }
+}
+
+fn nodes_in_marquee(nodes: &[Placed], rect: Rect) -> Vec<(u64, Option<u64>)> {
+    nodes
+        .iter()
+        .filter(|node| rect.intersects(node.rect))
+        .map(|node| (node.hub_id, node.port_id))
+        .collect()
+}
+
+fn paint_marquee(painter: &egui::Painter, rect: Rect, p: &ThemePalette) {
+    painter.rect_filled(rect, Rounding::same(2.0), tint(p.accent, 28));
+    painter.rect_stroke(rect, Rounding::same(2.0), Stroke::new(1.2, p.accent));
 }
 
 fn link_hot(a: &Placed, b: &Placed, hover: Option<(u64, Option<u64>)>, model: &HubModel) -> bool {
@@ -1939,6 +2105,21 @@ fn inspector(
 }
 
 fn edit_selected(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
+    // Item-specific properties only when exactly one canvas node is selected.
+    if model.multi_selected() {
+        ui.label(
+            egui::RichText::new(format!("{} nodes selected", model.selection.len()))
+                .font(font_ui(12.5))
+                .color(p.muted),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("Select a single node to edit its properties.")
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        return HubChange::quiet();
+    }
     if model.selected_port.is_some() {
         let hub_id = model.selected;
         let port_id = model.selected_port;
@@ -2700,6 +2881,42 @@ mod tests {
         assert_eq!(clamp_zoom(f32::NAN), ZOOM_MAX);
         let model = HubModel::sample();
         assert!((model.zoom - ZOOM_MAX).abs() < 0.0001);
+    }
+
+    #[test]
+    fn wheel_zoom_steps_are_gentler_than_egui_default() {
+        // egui Options::scroll_zoom_speed is 1/200; hubs uses a smaller gain.
+        assert!(ZOOM_WHEEL < 1.0 / 200.0);
+        let notch = 50.0; // typical smooth_scroll_delta.y magnitude for one notch
+        let factor = (ZOOM_WHEEL * notch).exp();
+        assert!(factor > 1.0 && factor < 1.12);
+    }
+
+    #[test]
+    fn multi_selection_clears_item_properties_gate() {
+        let mut model = HubModel::sample();
+        model.set_selection(vec![(1, None), (1, Some(2))]);
+        assert!(model.multi_selected());
+        assert_eq!(model.selection.len(), 2);
+        assert!(model.selected_port.is_none());
+        model.set_selection(vec![(1, Some(2))]);
+        assert!(!model.multi_selected());
+        assert_eq!(model.selected_port, Some(2));
+    }
+
+    #[test]
+    fn marquee_picks_intersecting_nodes() {
+        let nodes = layout_nodes(&HubModel::sample().hubs);
+        let plant = nodes
+            .iter()
+            .find(|node| node.role == Role::Hub && node.hub_id == 1)
+            .unwrap();
+        let source = nodes.iter().find(|node| node.port_id == Some(2)).unwrap();
+        let box_rect = plant.rect.union(source.rect).expand(2.0);
+        let keys = nodes_in_marquee(&nodes, box_rect);
+        assert!(keys.contains(&(1, None)));
+        assert!(keys.contains(&(1, Some(2))));
+        assert!(keys.len() >= 2);
     }
 
     #[test]
