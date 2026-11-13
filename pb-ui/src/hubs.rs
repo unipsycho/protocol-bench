@@ -2258,6 +2258,16 @@ fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
         change.dirty = true;
     }
     let current = model.hub(id).unwrap().protocol;
+    if current == HubProto::Mqtt {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "MQTT hub/broker role is not active yet. MQTT ships as a client pack for source/output; embedded broker comes later.",
+            )
+            .font(font_ui(12.0))
+            .color(p.muted),
+        );
+    }
     ui.add_space(8.0);
     if text_button(ui, &format!("Open {} panel", current.label()), true, p).clicked() {
         change.open = Some(current.pane());

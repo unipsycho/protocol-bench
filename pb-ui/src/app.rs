@@ -39,6 +39,7 @@ pub struct ProtocolBenchApp {
     aa_logo: AaLogoCache,
     dirty: bool,
     last_save: Instant,
+    mqtt_form: panels::MqttForm,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -89,6 +90,7 @@ impl ProtocolBenchApp {
             aa_logo: AaLogoCache::default(),
             dirty: false,
             last_save: Instant::now(),
+            mqtt_form: panels::MqttForm::default(),
         }
     }
 
@@ -229,7 +231,8 @@ impl eframe::App for ProtocolBenchApp {
 
         self.handle_drop(ctx, &p);
         self.autosave();
-        ctx.request_repaint_after(Duration::from_secs(1));
+        // Keep MQTT / pack snapshots fresh without pinning the compositor.
+        ctx.request_repaint_after(Duration::from_millis(250));
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1023,7 +1026,15 @@ impl ProtocolBenchApp {
                     .layout(Layout::top_down(egui::Align::Min)),
             );
             body_ui.set_clip_rect(body.expand(2.0).intersect(clip));
-            let hub_change = panels::paint(&mut body_ui, active, host, p, &mut self.ui_state.hubs);
+            let hub_change = panels::paint(
+                &mut body_ui,
+                active,
+                host,
+                p,
+                &mut self.ui_state.hubs,
+                &self.engine,
+                &mut self.mqtt_form,
+            );
             if hub_change.dirty {
                 self.mark_dirty();
             }

@@ -1,12 +1,44 @@
 //! Pane bodies. Tables are empty on purpose: this build does not read or write a link.
+//! MQTT is the exception: a thin connect form drives the loaded client pack.
 
 use egui::{Align2, Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
-use pb_engine::HostSnapshot;
+use pb_engine::{EngineCommand, EngineHandle, EngineId, HostSnapshot};
 
 use crate::art;
 use crate::dock::DockPane;
 use crate::hubs::HubModel;
 use crate::theme::{font_semi, font_ui, scope, tint, ThemePalette};
+
+/// Connect fields for one MQTT client (UI-only; pack gets JSON on Connect).
+#[derive(Debug, Clone)]
+pub struct MqttForm {
+    pub host: String,
+    pub port: String,
+    pub client_id: String,
+    pub username: String,
+    pub password: String,
+    /// tcp | tls | ws | wss
+    pub transport: String,
+    pub subscribe_topic: String,
+    pub publish_topic: String,
+    pub publish_payload: String,
+}
+
+impl Default for MqttForm {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: "1883".into(),
+            client_id: "protocol-bench".into(),
+            username: String::new(),
+            password: String::new(),
+            transport: "tcp".into(),
+            subscribe_topic: "pb/#".into(),
+            publish_topic: "pb/out".into(),
+            publish_payload: "hello".into(),
+        }
+    }
+}
 
 /// Fill the pane body for one dock leaf.
 pub fn paint(
@@ -15,10 +47,16 @@ pub fn paint(
     host: &HostSnapshot,
     p: &ThemePalette,
     hubs: &mut HubModel,
+    engine: &EngineHandle,
+    mqtt: &mut MqttForm,
 ) -> crate::hubs::HubChange {
     match pane {
         DockPane::Project => project_panel(ui, hubs, p),
         DockPane::Hubs => crate::hubs::paint(ui, hubs, p),
+        DockPane::Mqtt => {
+            mqtt_panel(ui, host, p, engine, mqtt);
+            crate::hubs::HubChange::quiet()
+        }
         _ => {
             scaffold_panel(ui, pane, host, p);
             crate::hubs::HubChange::quiet()
@@ -26,13 +64,177 @@ pub fn paint(
     }
 }
 
+fn mqtt_panel(
+    ui: &mut egui::Ui,
+    host: &HostSnapshot,
+    p: &ThemePalette,
+    engine: &EngineHandle,
+    form: &mut MqttForm,
+) {
+    let slot = host.slot(EngineId::Mqtt);
+    let connected = slot.map(|s| s.connected).unwrap_or(false);
+    let state = slot.map(|s| s.state.as_str()).unwrap_or("idle");
+    let pack_loaded = slot.map(|s| s.pack_loaded).unwrap_or(false);
+    let last_error = slot.map(|s| s.last_error.as_str()).unwrap_or("");
+    let topics = slot.map(|s| s.topics.clone()).unwrap_or_default();
+
+    ui.label(
+        egui::RichText::new(if pack_loaded {
+            "MQTT client pack loaded. Broker / hub role is not active yet — use as source or output."
+        } else {
+            "MQTT client pack not loaded. Build pb-mqtt into modules/ (see docs/protocol-pack-loading.md)."
+        })
+        .font(font_ui(12.5))
+        .color(p.muted),
+    );
+    ui.add_space(8.0);
+
+    // Live snapshot strip.
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!("State: {state}"))
+                .font(font_semi(13.0))
+                .color(if connected { p.accent } else { p.text }),
+        );
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new(format!("Points: {}", host.point_count))
+                .font(font_ui(12.5))
+                .color(p.muted),
+        );
+    });
+    if !last_error.is_empty() {
+        ui.label(
+            egui::RichText::new(format!("Last error: {last_error}"))
+                .font(font_ui(12.0))
+                .color(Color32::from_rgb(0xc0, 0x4a, 0x3a)),
+        );
+    }
+    if !topics.is_empty() {
+        ui.label(
+            egui::RichText::new(format!("Topics: {}", topics.join(", ")))
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+    }
+    ui.add_space(10.0);
+
+    field_row(ui, "Host", &mut form.host, p);
+    field_row(ui, "Port", &mut form.port, p);
+    field_row(ui, "Client ID", &mut form.client_id, p);
+    field_row(ui, "Username", &mut form.username, p);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Password")
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut form.password)
+                .password(true)
+                .desired_width(180.0),
+        );
+    });
+    field_row(ui, "Transport", &mut form.transport, p);
+    ui.label(
+        egui::RichText::new("tcp · tls · ws · wss (password in config; no keyring yet)")
+            .font(font_ui(11.0))
+            .color(p.muted),
+    );
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        if text_btn(ui, "Connect", true, p).clicked() {
+            let port: u16 = form.port.parse().unwrap_or(1883);
+            let json = serde_json::json!({
+                "host": form.host,
+                "port": port,
+                "client_id": form.client_id,
+                "username": form.username,
+                "password": form.password,
+                "transport": form.transport,
+                "keep_alive_secs": 30,
+            });
+            engine.submit(
+                EngineId::Mqtt,
+                EngineCommand::Configure {
+                    json: json.to_string(),
+                },
+            );
+            engine.submit(EngineId::Mqtt, EngineCommand::Connect);
+            if !form.subscribe_topic.trim().is_empty() {
+                engine.submit(
+                    EngineId::Mqtt,
+                    EngineCommand::Subscribe {
+                        topic: form.subscribe_topic.trim().to_string(),
+                        qos: 0,
+                    },
+                );
+            }
+        }
+        if text_btn(ui, "Disconnect", false, p).clicked() {
+            engine.submit(EngineId::Mqtt, EngineCommand::Disconnect);
+        }
+    });
+    ui.add_space(10.0);
+    field_row(ui, "Subscribe", &mut form.subscribe_topic, p);
+    if text_btn(ui, "Subscribe now", false, p).clicked() {
+        engine.submit(
+            EngineId::Mqtt,
+            EngineCommand::Subscribe {
+                topic: form.subscribe_topic.trim().to_string(),
+                qos: 0,
+            },
+        );
+    }
+    ui.add_space(6.0);
+    field_row(ui, "Publish topic", &mut form.publish_topic, p);
+    field_row(ui, "Payload", &mut form.publish_payload, p);
+    if text_btn(ui, "Publish", false, p).clicked() {
+        engine.submit(
+            EngineId::Mqtt,
+            EngineCommand::Publish {
+                topic: form.publish_topic.trim().to_string(),
+                payload: form.publish_payload.as_bytes().to_vec(),
+                qos: 0,
+                retain: false,
+            },
+        );
+    }
+}
+
+fn field_row(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(label)
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        ui.add(egui::TextEdit::singleline(value).desired_width(180.0));
+    });
+}
+
+fn text_btn(ui: &mut egui::Ui, label: &str, accent: bool, p: &ThemePalette) -> egui::Response {
+    let fill = if accent { p.accent } else { p.control };
+    let text = if accent {
+        Color32::from_rgb(0x12, 0x14, 0x18)
+    } else {
+        p.text
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).font(font_ui(12.5)).color(text))
+            .fill(fill)
+            .stroke(Stroke::new(1.0, p.line)),
+    )
+}
+
 fn scaffold_panel(ui: &mut egui::Ui, pane: DockPane, host: &HostSnapshot, p: &ThemePalette) {
     let tall = ui.available_height() > 380.0;
     let text = blurb(pane, host);
     let resp = ui.add(
-        egui::Label::new(egui::RichText::new(text).font(font_ui(12.5)).color(p.muted)).truncate(),
+        egui::Label::new(egui::RichText::new(&text).font(font_ui(12.5)).color(p.muted)).truncate(),
     );
-    resp.on_hover_text(text);
+    resp.on_hover_text(&text);
     ui.add_space(8.0);
     if tall {
         hero_well(ui, pane, p);
@@ -41,18 +243,18 @@ fn scaffold_panel(ui: &mut egui::Ui, pane: DockPane, host: &HostSnapshot, p: &Th
     table_block(ui, pane, p);
 }
 
-fn blurb(pane: DockPane, host: &HostSnapshot) -> &'static str {
+fn blurb(pane: DockPane, host: &HostSnapshot) -> String {
     if let Some(id) = pane.engine() {
         if let Some(slot) = host.slot(id) {
-            return slot.note;
+            return slot.note.clone();
         }
     }
     match pane {
-        DockPane::Project => "Hubs, inputs, outputs, and edge transforms for this project.",
-        DockPane::Points => "One value, quality, and timestamp for every named point.",
-        DockPane::Mappings => "A point that arrives on one link can leave on another.",
-        DockPane::Traffic => "Bytes and frames from every link, when capture exists.",
-        _ => "",
+        DockPane::Project => "Hubs, inputs, outputs, and edge transforms for this project.".into(),
+        DockPane::Points => "One value, quality, and timestamp for every named point.".into(),
+        DockPane::Mappings => "A point that arrives on one link can leave on another.".into(),
+        DockPane::Traffic => "Bytes and frames from every link, when capture exists.".into(),
+        _ => String::new(),
     }
 }
 

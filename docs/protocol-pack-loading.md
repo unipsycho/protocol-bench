@@ -1,6 +1,6 @@
 # Protocol Bench — loading protocol packs into a free core
 
-Date: 2026-11-13. Status: **settled — Option A (plugin ABI)**. Complements [free-vs-paid-isolation.md](free-vs-paid-isolation.md) and PRD Settled #1 / #9 / #12 / #13.
+Date: 2026-11-13. Status: **settled — Option A (plugin ABI)**; **MQTT client pack landed first**. Complements [free-vs-paid-isolation.md](free-vs-paid-isolation.md) and PRD Settled #1 / #9 / #12 / #13.
 
 ## Verdict
 
@@ -8,9 +8,42 @@ Date: 2026-11-13. Status: **settled — Option A (plugin ABI)**. Complements [fr
 
 Entitlements are license-driven: **no fixed free protocol list** — the license defines which protocols/packs the customer gets. Offline grace ~**7 days** (phone-home to the license server; not a strict check on every operation).
 
+## MQTT client pack (first implementation)
+
+**Client-first.** `pb-mqtt` is a `cdylib` (+ `rlib` for unit tests) that speaks MQTT via **rumqttc 0.24** (`websocket` + `use-rustls`). It is a **source / output** client — **not** an embedded broker. Hub MQTT broker role is **deferred**.
+
+| Piece | Role |
+| --- | --- |
+| `pb-abi` | C ABI: `pb_pack_abi_version`, `pb_pack_register`, opaque handles, host callbacks (point upsert + log); host refuses load on ABI skew |
+| `pb-points` | Host-owned typed point store; packs upsert only through ABI callbacks |
+| `pb-engine` | `libloading` modules-dir loader, verify stub (signature later), wrap pack as `ProtocolEngine`; commands: configure / connect / disconnect / subscribe / publish / write_point |
+| `pb-mqtt` | Connect / disconnect / reconnect; last error + quality; subscribe → points (`mqtt/<topic>`); point write / publish → broker; TLS / WSS; password in JSON config (no keyring) |
+| `pb-service` | Headless binary: load `modules/`, run host |
+| UI MQTT panel | Live snapshot (connected, topics, last error) + fields to connect one client |
+
+### Load the pack
+
+```bash
+# From the repo root:
+cargo build -p pb-mqtt
+mkdir -p modules
+cp target/debug/libpb_mqtt.so modules/   # Windows: pb_mqtt.dll → modules/
+
+# Optional smoke (requires Mosquitto or any broker on 1883):
+./scripts/mqtt-smoke.sh
+
+# UI (loads ./modules or $PB_MODULES):
+PB_MODULES="$PWD/modules" DISPLAY=:0 cargo run -p pb-ui
+
+# Headless service:
+PB_MODULES="$PWD/modules" cargo run -p pb-service
+```
+
+If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use the MQTT panel (or smoke script) to subscribe and publish. Subscribe payloads land as host points named `mqtt/<topic>`.
+
 ## Option A — in-process `cdylib` + fixed C ABI — **settled**
 
-Pack ships as `pb_modbus.so` / `pb_modbus.dll` (etc.). Core uses `libloading`, calls a versioned entry (`pb_pack_abi_version`, `pb_pack_register`), and gets opaque handles that the host wraps as `pb-engine` trait objects.
+Pack ships as `libpb_mqtt.so` / `pb_mqtt.dll` (and later `pb_modbus.so`, etc.). Core uses `libloading`, calls a versioned entry (`pb_pack_abi_version`, `pb_pack_register`), and gets opaque handles that the host wraps as `pb-engine` trait objects.
 
 **Pros**
 
@@ -84,7 +117,7 @@ Hub canvas and points store never live in the pack. Packs speak into the service
 4. **Defer Option B** (pack sidecars) unless pack crashes or hostile third-party packs force process isolation.
 5. **Do not** implement Option C as the paid-IP path.
 
-No packaging or license-server code in this pass — design only. Windows MSI via WiX / `cargo-wix` is settled (PRD Settled #13). Remaining open: auto-updater poll / UX, Linux installer (later / TBD), and further license-server product details. Offline grace (~7 days) is settled.
+MQTT client pack + ABI/loader/service scaffold are implemented in-tree. License-server download, pack signing enforcement, and MSI remain follow-on. Windows MSI via WiX / `cargo-wix` is settled (PRD Settled #13). Remaining open: auto-updater poll / UX, Linux installer (later / TBD), embedded MQTT broker for hubs, and further license-server product details. Offline grace (~7 days) is settled.
 
 ## Open questions
 

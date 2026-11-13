@@ -4,7 +4,7 @@ Date: 2026-11-13. Status: living draft.
 
 Research: [competitive-landscape.md](competitive-landscape.md) (store). Free vs paid isolation: [free-vs-paid-isolation.md](free-vs-paid-isolation.md). Pack loading: [protocol-pack-loading.md](protocol-pack-loading.md). Protocol notes: [protocol-options.md](protocol-options.md).
 
-Checkout: `/home/mike/Documents/AAI-Projects/protocol bench` (workspace `pb-ui` + `pb-engine`, egui shell).
+Checkout: `/home/mike/Documents/AAI-Projects/protocol bench` (workspace: `pb-abi`, `pb-points`, `pb-engine`, `pb-mqtt`, `pb-service`, `pb-ui`).
 
 ## Product
 
@@ -45,7 +45,7 @@ Moving a value between a serial instrument, a Modbus device, a growing CSV, an M
 
 ## Engines
 
-Each protocol engine owns its work on a thread the UI does not block. `pb-engine` lives in the **service**; the UI takes a snapshot and submits commands (IPC details follow-on). The five slots that exist now (Streams, Modbus, MQTT, OPC UA, File follow) are idle — they do not open a serial port, a socket, or a file.
+Each protocol engine owns its work on a thread the UI does not block. `pb-engine` lives in the **service**; the UI takes a snapshot and submits commands (IPC details follow-on). Packs load via the C ABI (`pb-abi`) from a `modules/` directory. **MQTT client** is the first live pack (`pb-mqtt` / rumqttc): configure, connect, disconnect, subscribe, publish. Other slots (Streams, Modbus, OPC UA, File follow) remain idle scaffolds until their packs land.
 
 ## Hubs
 
@@ -58,9 +58,9 @@ A **hub** is the main protocol conversion / routing point. It is always **one pr
 
 ## What runs today, and what does not
 
-Today: the window, layout, themes, the hub diagram, and the engine thread boundary.
+Today: the window, layout, themes, the hub diagram, the engine thread boundary, host point store (`pb-points`), pack loader, headless `pb-service`, and the **MQTT client pack** (subscribe → points, publish / point-write → publish; TCP / TLS / WS / WSS).
 
-Not yet: opening a port, speaking a protocol, parsing a file, or writing a point. No file requester in this build. When one is added, it must not block the UI thread (blocking dialogs / vsync stalls on another Hyprland workspace trip “not responding”).
+Not yet: embedded MQTT broker (hub role), other protocol packs, Sparkplug, license signing enforcement, MSI, full UI↔service IPC / MCP. No file requester in this build. When one is added, it must not block the UI thread (blocking dialogs / vsync stalls on another Hyprland workspace trip “not responding”).
 
 ## Protocols
 
@@ -68,7 +68,7 @@ Already named in the shell:
 
 - Raw serial (Streams) — first build: **both** transparent byte pipe and delimited frames
 - Modbus — first build: **client and server**
-- MQTT — first build: **client** required; **embedded broker / in-process server** planned for hub scenarios (MQTT first; consider OPC UA for similar hub concepts)
+- MQTT — **client pack first** (live); **embedded broker / in-process server** deferred for hub scenarios (MQTT broker hub role not active yet; MQTT is source/output)
 - OPC UA — first build: **client and server**
 - File follow — first build parsers: **CSV and JSON lines**
 
