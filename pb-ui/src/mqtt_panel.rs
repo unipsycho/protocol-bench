@@ -361,7 +361,8 @@ fn clients_bar(
             apply_mqtt_session(engine, state);
         }
         ui.add_space(8.0);
-        if text_btn(ui, "+ Add", true, p).clicked() {
+        // Secondary fill — keep selected connection on accent yellow.
+        if secondary_btn(ui, "+ Add", p).clicked() {
             let id = state.unique_id("broker");
             let mut c = MqttClient::default_local();
             c.id = id.clone();
@@ -818,6 +819,20 @@ fn text_btn(ui: &mut egui::Ui, label: &str, accent: bool, p: &ThemePalette) -> e
             .fill(fill)
             .stroke(Stroke::new(1.0, p.line))
             .min_size(Vec2::new(72.0, 26.0)),
+    )
+}
+
+/// Theme secondary (`live`) — distinct from selection accent yellow.
+fn secondary_btn(ui: &mut egui::Ui, label: &str, p: &ThemePalette) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .font(font_ui(12.5))
+                .color(Color32::from_rgb(0x12, 0x14, 0x18)),
+        )
+        .fill(p.live)
+        .stroke(Stroke::new(1.0, p.line))
+        .min_size(Vec2::new(72.0, 26.0)),
     )
 }
 
