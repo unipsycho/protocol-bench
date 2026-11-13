@@ -9,15 +9,16 @@ Date: 2026-11-13. Status: **decision — plugin packs (B/D via ABI) + entitlemen
 - **No fixed free protocol list.** Licensing is **entitlement-driven**: the license defines which protocols/packs the customer gets.
 - **Offline grace ~7 days** — phone-home to the license server; not a strict check on every operation.
 - **Protocol packs** as signed `cdylib` files — **not** sidecar processes, **not** an all-in-one license-gated binary (Option C rejected for paid IP).
-- Architecture, entitlements, and offline grace are settled; remaining design work (docs only until decided):
-  - Proper **installer**
-  - **Auto-updater**
+- Architecture, entitlements, offline grace, and the **Windows installer** are settled; remaining design work (docs only until decided):
+  - **Auto-updater** poll / UX (updates still via license-server manifest + signed downloads)
+  - **Linux** installer / channel (later / TBD; not blocking)
   - Further **central license server** product details (PC transfers, enterprise accounts) beyond the PRD Runtime note (Rust / CF Workers viable)
-- See PRD Settled #1, #9, #12; Still open #9 is installer / updater residual only. Pack mechanics: [protocol-pack-loading.md](protocol-pack-loading.md).
+- **Windows install:** MSI via **WiX** / **`cargo-wix`** from the Rust repo (not Inno Setup) — IT-friendly (GPO / SCCM / silent, Add/Remove Programs); service + UI + module dir; preserve config / licenses / packs on upgrade (PRD Settled #13).
+- See PRD Settled #1, #9, #12, #13; Still open #9 is auto-updater / Linux / license-server residual only. Pack mechanics: [protocol-pack-loading.md](protocol-pack-loading.md).
 
 ## Why this note
 
-The shell already names Streams, Modbus, MQTT, OPC UA, and File follow, with a longer product list (ASCII lines, REST, WebSocket, Sparkplug B, DNP3, SNMP, CAN, LAS, WITS). Competitors often gate by driver, tag count, or northbound feature. Pack architecture and entitlement model are settled (PRD Settled #9); residual installer/updater details remain under Still open #9. This note records the options considered and the chosen isolation path.
+The shell already names Streams, Modbus, MQTT, OPC UA, and File follow, with a longer product list (ASCII lines, REST, WebSocket, Sparkplug B, DNP3, SNMP, CAN, LAS, WITS). Competitors often gate by driver, tag count, or northbound feature. Pack architecture, entitlement model, and Windows MSI installer are settled (PRD Settled #9, #13); residual auto-updater / Linux details remain under Still open #9. This note records the options considered and the chosen isolation path.
 
 ## Protocol shortlist (historical placement talk)
 
@@ -303,7 +304,7 @@ No packaging code is implied yet; the engine boundary must not assume “all fiv
 2. **One update train vs à la carte** — **Chose B:** sell protocols like driver packs; service/UI updates separately from packs.
 3. **Rust plugin ABI cost** — **Accepted:** stable C-style plugin ABI is the product path (see pack-loading note).
 4. **Access model** — **Entitlement-driven** (no fixed free protocol list); license defines packs (PRD Settled #9). Offline grace ~7 days.
-5. **Debian / apt** — B maps naturally to module packages; installer / channel details still open.
+5. **Debian / apt** — B maps naturally to module packages; **Linux** installer / channel still TBD (Windows MSI via WiX / `cargo-wix` settled — PRD Settled #13).
 6. **Process shape** — **Service always + separate UI**; packs load in the service (PRD Settled #1).
 
 ## Suggested decision inputs for Mike (checklist)
@@ -312,7 +313,8 @@ No packaging code is implied yet; the engine boundary must not assume “all fiv
 - [x] Sell all-or-nothing Pro, protocol packs, or single protocols? → **Decision: protocol packs** (signed `cdylib`s via plugin ABI; entitlement-driven).
 - [x] Accept paid code inside the free/core binary? (Legal + commercial) → **No** — paid source in packs only (Option C rejected for paid IP).
 - [x] Pack loading mechanism? → **Settled: in-process signed packs + stable C-style plugin ABI** in the **service** (not sidecar, not license-gated all-in-one).
-- [ ] Canonical Linux install: bare binary (TopicBench-like), Debian, or both? → Needs a **proper installer** + **auto-updater**; exact channel TBD.
+- [x] Windows installer? → **Settled: MSI via WiX / `cargo-wix`** (not Inno Setup); service + UI + module dir; preserve config / licenses / packs on upgrade; updates via license server (PRD Settled #13).
+- [ ] Canonical Linux install: bare binary (TopicBench-like), Debian, or both? → **Later / TBD** (not blocking); auto-updater poll / UX still open.
 - [x] Free protocol floor? → **Settled: no fixed free list**; license entitlements define which protocols/packs the customer gets.
 - [x] Relationship to Modbus Bench and TopicBench pricing stories? → Protocol Bench is a **new separate product** (can test with Modbus Bench). TopicBench scheme is comparable only, not copied by default.
 - [ ] Reuse TopicBench license machinery (keys, machine id, portal) for Protocol Bench? → Needs a **central license server** (PC transfers, enterprise accounts); Rust / CF Workers noted as viable in PRD Runtime; whether it reuses TopicBench machinery is TBD.
