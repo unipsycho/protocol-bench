@@ -1,7 +1,7 @@
 //! MQTT client protocol pack (cdylib) for Protocol Bench.
 //!
-//! Worker + EventLoop pattern ported from TopicBench `mqtt/live.rs` (no UI/tree).
-//! Client roles only — embedded broker / hub is deferred.
+//! Multi-client: one pack handle owns many broker connections. Worker + EventLoop
+//! pattern from TopicBench `mqtt/live.rs` (no UI/tree). Broker hub role deferred.
 
 mod json_path;
 mod session;
@@ -15,7 +15,9 @@ use pb_abi::{
     PB_QUALITY_GOOD, PB_VALUE_BYTES, PB_VALUE_STRING,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use session::{MqttSession, SessionEvent, TransportKind};
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::mpsc::TryRecvError;
@@ -26,19 +28,20 @@ const PACK_TITLE: &[u8] = b"MQTT\0";
 /// One JSON field → point rule (topic filter + dotted path).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParseRule {
-    /// MQTT topic filter (`+` / `#` allowed). Empty = match all topics.
     #[serde(default)]
     pub topic: String,
-    /// Dotted / `$.a.b` / `arr[0].x` path into a JSON object payload.
     pub path: String,
-    /// Optional override point id; default `mqtt/<topic>::<path>`.
     #[serde(default)]
     pub point: String,
 }
 
-/// JSON config accepted by [`configure`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MqttConfig {
+/// One broker connection inside the MQTT pack.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientConfig {
+    /// Stable connection id (UI / project / point namespace).
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
     #[serde(default = "default_host")]
     pub host: String,
     #[serde(default = "default_port")]
@@ -47,17 +50,33 @@ pub struct MqttConfig {
     pub client_id: String,
     #[serde(default)]
     pub username: String,
-    /// Password lives in config for this cut (no OS keyring).
     #[serde(default)]
     pub password: String,
-    /// `tcp` | `tls` | `ws` | `wss`
     #[serde(default = "default_transport")]
     pub transport: String,
     #[serde(default = "default_keep_alive")]
     pub keep_alive_secs: u64,
-    /// JSON object field paths → host points (applied on every matching inbound).
+    #[serde(default)]
+    pub subscriptions: Vec<String>,
     #[serde(default)]
     pub parse_rules: Vec<ParseRule>,
+    /// Point → publish topic bindings for this client (MQTT outputs only).
+    #[serde(default)]
+    pub outputs: Vec<OutputBinding>,
+    /// Desired session state after reconcile.
+    #[serde(default)]
+    pub auto_connect: bool,
+}
+
+/// Bind a host point to an MQTT publish topic on this client.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutputBinding {
+    pub point: String,
+    pub topic: String,
+    #[serde(default)]
+    pub qos: u8,
+    #[serde(default)]
+    pub retain: bool,
 }
 
 fn default_host() -> String {
@@ -76,9 +95,11 @@ fn default_keep_alive() -> u64 {
     30
 }
 
-impl Default for MqttConfig {
+impl Default for ClientConfig {
     fn default() -> Self {
         Self {
+            id: "default".into(),
+            label: "MQTT".into(),
             host: default_host(),
             port: default_port(),
             client_id: default_client_id(),
@@ -86,12 +107,15 @@ impl Default for MqttConfig {
             password: String::new(),
             transport: default_transport(),
             keep_alive_secs: default_keep_alive(),
+            subscriptions: vec!["pb/#".into()],
             parse_rules: Vec::new(),
+            outputs: Vec::new(),
+            auto_connect: false,
         }
     }
 }
 
-impl MqttConfig {
+impl ClientConfig {
     fn transport_kind(&self) -> Result<TransportKind, String> {
         match self.transport.to_ascii_lowercase().as_str() {
             "tcp" | "mqtt" => Ok(TransportKind::Tcp),
@@ -103,28 +127,50 @@ impl MqttConfig {
     }
 }
 
-struct PackState {
-    host: PbHostApi,
-    config: MqttConfig,
+/// Point id for a whole topic on one connection: `mqtt/<conn>/<topic>`.
+pub fn point_id_for_client_topic(conn_id: &str, topic: &str) -> String {
+    format!("mqtt/{conn_id}/{topic}")
+}
+
+/// Point id for a JSON field: `mqtt/<conn>/<topic>::<path>`.
+pub fn point_id_for_client_field(conn_id: &str, topic: &str, path: &str) -> String {
+    let base = point_id_for_client_topic(conn_id, topic);
+    let path = json_path::normalize_field_path(path);
+    format!("{base}::{path}")
+}
+
+struct ClientRuntime {
+    config: ClientConfig,
     session: Option<MqttSession>,
-    topics: Vec<String>,
     connected: bool,
     state: String,
     last_error: String,
     quality_bad: bool,
 }
 
-impl PackState {
-    fn new(host: PbHostApi) -> Self {
+impl ClientRuntime {
+    fn new(config: ClientConfig) -> Self {
         Self {
-            host,
-            config: MqttConfig::default(),
+            config,
             session: None,
-            topics: Vec::new(),
             connected: false,
             state: "disconnected".into(),
             last_error: String::new(),
             quality_bad: false,
+        }
+    }
+}
+
+struct PackState {
+    host: PbHostApi,
+    clients: BTreeMap<String, ClientRuntime>,
+}
+
+impl PackState {
+    fn new(host: PbHostApi) -> Self {
+        Self {
+            host,
+            clients: BTreeMap::new(),
         }
     }
 
@@ -191,11 +237,50 @@ impl PackState {
         }
     }
 
-    fn apply_event(&mut self, ev: SessionEvent) {
+    fn stop_client(rt: &mut ClientRuntime) {
+        if let Some(session) = rt.session.take() {
+            session.stop();
+        }
+        rt.connected = false;
+        rt.state = "disconnected".into();
+    }
+
+    fn start_client(rt: &mut ClientRuntime) -> Result<(), String> {
+        Self::stop_client(rt);
+        let transport = rt.config.transport_kind()?;
+        let session = MqttSession::spawn(
+            rt.config.host.clone(),
+            rt.config.port,
+            rt.config.client_id.clone(),
+            rt.config.username.clone(),
+            rt.config.password.clone(),
+            transport,
+            rt.config.keep_alive_secs,
+        )?;
+        rt.session = Some(session);
+        rt.state = "connecting".into();
+        rt.last_error.clear();
+        rt.connected = false;
+        Ok(())
+    }
+
+    fn sync_subscriptions(rt: &mut ClientRuntime) {
+        let Some(session) = rt.session.as_ref() else {
+            return;
+        };
+        for topic in &rt.config.subscriptions {
+            let _ = session.subscribe(topic, 0);
+        }
+    }
+
+    fn handle_client_event(&mut self, id: &str, ev: SessionEvent) {
+        let Some(rt) = self.clients.get_mut(id) else {
+            return;
+        };
         match ev {
             SessionEvent::State { connected, detail } => {
-                self.connected = connected;
-                self.state = if connected {
+                rt.connected = connected;
+                rt.state = if connected {
                     "connected".into()
                 } else if detail.to_ascii_lowercase().contains("connecting") {
                     "connecting".into()
@@ -203,90 +288,337 @@ impl PackState {
                     "disconnected".into()
                 };
                 if connected {
-                    self.quality_bad = false;
-                    self.last_error.clear();
-                    // Resubscribe after reconnect.
-                    let topics = self.topics.clone();
-                    if let Some(session) = self.session.as_ref() {
-                        for topic in &topics {
-                            let _ = session.subscribe(topic, 0);
-                        }
-                    }
+                    rt.quality_bad = false;
+                    rt.last_error.clear();
+                    Self::sync_subscriptions(rt);
                 } else if !detail.is_empty()
                     && !detail.to_ascii_lowercase().contains("connecting")
                     && !detail.to_ascii_lowercase().contains("disconnected by user")
                 {
-                    self.last_error = detail.clone();
-                    self.quality_bad = true;
+                    rt.last_error = detail.clone();
+                    rt.quality_bad = true;
                 }
-                self.log(PB_LOG_INFO, &detail);
+                self.log(PB_LOG_INFO, &format!("[{id}] {detail}"));
             }
             SessionEvent::Message { topic, payload } => {
-                // Whole-topic point on the host bus (channel + concrete topic).
-                let point_name = point_id_for_topic(&topic);
+                let point_name = point_id_for_client_topic(id, &topic);
+                let good = !rt.quality_bad;
                 let text = match std::str::from_utf8(&payload) {
                     Ok(text) => {
-                        self.upsert_string(&point_name, text, !self.quality_bad);
+                        self.upsert_string(&point_name, text, good);
                         Some(text.to_string())
                     }
                     Err(_) => {
-                        self.upsert_bytes(&point_name, &payload, !self.quality_bad);
+                        self.upsert_bytes(&point_name, &payload, good);
                         None
                     }
                 };
                 if let Some(text) = text.as_deref() {
-                    self.apply_parse_rules(&topic, text);
+                    let rt = self.clients.get(id).unwrap();
+                    let rules = rt.config.parse_rules.clone();
+                    let conn = rt.config.id.clone();
+                    let bad = rt.quality_bad;
+                    for rule in rules {
+                        let path = rule.path.trim();
+                        if path.is_empty() || !topic_matches(&rule.topic, &topic) {
+                            continue;
+                        }
+                        if let Some(value) = extract_path_value(text, path) {
+                            let name = if rule.point.trim().is_empty() {
+                                point_id_for_client_field(&conn, &topic, path)
+                            } else {
+                                rule.point.trim().to_string()
+                            };
+                            self.upsert_string(&name, &value, !bad);
+                        }
+                    }
                 }
             }
             SessionEvent::Error { detail } => {
-                self.last_error = detail.clone();
-                self.quality_bad = true;
-                self.connected = false;
-                self.state = "disconnected".into();
-                self.log(PB_LOG_ERROR, &detail);
+                rt.last_error = detail.clone();
+                rt.quality_bad = true;
+                rt.connected = false;
+                rt.state = "disconnected".into();
+                self.log(PB_LOG_ERROR, &format!("[{id}] {detail}"));
             }
-        }
-    }
-
-    fn apply_parse_rules(&self, topic: &str, payload: &str) {
-        let good = !self.quality_bad;
-        for rule in &self.config.parse_rules {
-            let path = rule.path.trim();
-            if path.is_empty() {
-                continue;
-            }
-            if !topic_matches(&rule.topic, topic) {
-                continue;
-            }
-            let Some(value) = extract_path_value(payload, path) else {
-                continue;
-            };
-            let name = if rule.point.trim().is_empty() {
-                point_id_for_field(topic, path)
-            } else {
-                rule.point.trim().to_string()
-            };
-            self.upsert_string(&name, &value, good);
         }
     }
 
     fn drain(&mut self) {
-        loop {
-            let ev = match self.session.as_ref() {
-                Some(s) => match s.try_recv() {
-                    Ok(ev) => ev,
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        self.session = None;
-                        self.connected = false;
-                        self.state = "disconnected".into();
+        let ids: Vec<String> = self.clients.keys().cloned().collect();
+        for id in ids {
+            loop {
+                let ev = {
+                    let Some(rt) = self.clients.get(&id) else {
                         break;
+                    };
+                    match rt.session.as_ref() {
+                        Some(s) => match s.try_recv() {
+                            Ok(ev) => ev,
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                if let Some(rt) = self.clients.get_mut(&id) {
+                                    rt.session = None;
+                                    rt.connected = false;
+                                    rt.state = "disconnected".into();
+                                }
+                                break;
+                            }
+                        },
+                        None => break,
                     }
-                },
-                None => break,
-            };
-            self.apply_event(ev);
+                };
+                self.handle_client_event(&id, ev);
+            }
         }
+    }
+
+    /// Full multi-client document or a single op.
+    fn configure_json(&mut self, text: &str) -> Result<(), String> {
+        let value: Value = serde_json::from_str(text).map_err(|e| format!("configure: {e}"))?;
+        if let Some(op) = value.get("op").and_then(|v| v.as_str()) {
+            return self.configure_op(op, &value);
+        }
+        // Legacy single-client document → one "default" client.
+        if value.get("clients").is_none() && value.get("host").is_some() {
+            let mut legacy: ClientConfig = serde_json::from_value(value)
+                .map_err(|e| format!("configure legacy: {e}"))?;
+            if legacy.id.trim().is_empty() {
+                legacy.id = "default".into();
+            }
+            return self.reconcile_clients(vec![legacy]);
+        }
+        let clients: Vec<ClientConfig> = value
+            .get("clients")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| format!("configure clients: {e}"))?
+            .unwrap_or_default();
+        self.reconcile_clients(clients)
+    }
+
+    fn reconcile_clients(&mut self, clients: Vec<ClientConfig>) -> Result<(), String> {
+        let mut wanted = BTreeMap::new();
+        for mut cfg in clients {
+            if cfg.id.trim().is_empty() {
+                return Err("client id required".into());
+            }
+            cfg.transport = normalize_transport(&cfg.transport);
+            if cfg.label.trim().is_empty() {
+                cfg.label = cfg.id.clone();
+            }
+            wanted.insert(cfg.id.clone(), cfg);
+        }
+        let existing: Vec<String> = self.clients.keys().cloned().collect();
+        for id in existing {
+            if !wanted.contains_key(&id) {
+                if let Some(mut rt) = self.clients.remove(&id) {
+                    Self::stop_client(&mut rt);
+                }
+            }
+        }
+        for (id, cfg) in wanted {
+            let auto = cfg.auto_connect;
+            let endpoint_changed = self
+                .clients
+                .get(&id)
+                .map(|rt| {
+                    rt.config.host != cfg.host
+                        || rt.config.port != cfg.port
+                        || rt.config.client_id != cfg.client_id
+                        || rt.config.transport != cfg.transport
+                        || rt.config.username != cfg.username
+                        || rt.config.password != cfg.password
+                })
+                .unwrap_or(true);
+            if let Some(rt) = self.clients.get_mut(&id) {
+                rt.config = cfg;
+            } else {
+                self.clients.insert(id.clone(), ClientRuntime::new(cfg));
+            }
+            let rt = self.clients.get_mut(&id).unwrap();
+            if auto {
+                if endpoint_changed || rt.session.is_none() {
+                    if let Err(e) = Self::start_client(rt) {
+                        rt.last_error = e.clone();
+                        rt.quality_bad = true;
+                        self.log(PB_LOG_ERROR, &format!("[{id}] {e}"));
+                    }
+                } else {
+                    Self::sync_subscriptions(rt);
+                }
+            } else if rt.session.is_some() {
+                Self::stop_client(rt);
+            }
+        }
+        Ok(())
+    }
+
+    fn configure_op(&mut self, op: &str, value: &Value) -> Result<(), String> {
+        let id = value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        match op {
+            "connect" => {
+                let rt = self
+                    .clients
+                    .get_mut(&id)
+                    .ok_or_else(|| format!("unknown client '{id}'"))?;
+                rt.config.auto_connect = true;
+                Self::start_client(rt)
+            }
+            "disconnect" => {
+                let rt = self
+                    .clients
+                    .get_mut(&id)
+                    .ok_or_else(|| format!("unknown client '{id}'"))?;
+                rt.config.auto_connect = false;
+                Self::stop_client(rt);
+                Ok(())
+            }
+            "subscribe" => {
+                let topic = value
+                    .get("topic")
+                    .and_then(|v| v.as_str())
+                    .ok_or("subscribe requires topic")?
+                    .to_string();
+                let qos = value.get("qos").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                let rt = self
+                    .clients
+                    .get_mut(&id)
+                    .ok_or_else(|| format!("unknown client '{id}'"))?;
+                if !rt.config.subscriptions.iter().any(|t| t == &topic) {
+                    rt.config.subscriptions.push(topic.clone());
+                }
+                if let Some(session) = rt.session.as_ref() {
+                    session.subscribe(&topic, qos)?;
+                }
+                Ok(())
+            }
+            "publish" => {
+                let topic = value
+                    .get("topic")
+                    .and_then(|v| v.as_str())
+                    .ok_or("publish requires topic")?;
+                let payload = value
+                    .get("payload")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .as_bytes();
+                let qos = value.get("qos").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                let retain = value.get("retain").and_then(|v| v.as_bool()).unwrap_or(false);
+                let rt = self
+                    .clients
+                    .get(&id)
+                    .ok_or_else(|| format!("unknown client '{id}'"))?;
+                let session = rt
+                    .session
+                    .as_ref()
+                    .ok_or_else(|| format!("publish: '{id}' not connected"))?;
+                session.publish(topic, payload, qos, retain)
+            }
+            "remove" => {
+                if let Some(mut rt) = self.clients.remove(&id) {
+                    Self::stop_client(&mut rt);
+                }
+                Ok(())
+            }
+            other => Err(format!("unknown op '{other}'")),
+        }
+    }
+
+    fn any_connected(&self) -> bool {
+        self.clients.values().any(|c| c.connected)
+    }
+
+    fn aggregate_state(&self) -> String {
+        if self.clients.is_empty() {
+            return "idle".into();
+        }
+        if self.clients.values().any(|c| c.connected) {
+            return "connected".into();
+        }
+        if self.clients.values().any(|c| c.state == "connecting") {
+            return "connecting".into();
+        }
+        "disconnected".into()
+    }
+
+    fn aggregate_error(&self) -> String {
+        self.clients
+            .values()
+            .filter(|c| !c.last_error.is_empty())
+            .map(|c| format!("{}: {}", c.config.id, c.last_error))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn clients_snapshot_json(&self) -> String {
+        let rows: Vec<Value> = self
+            .clients
+            .values()
+            .map(|rt| {
+                serde_json::json!({
+                    "id": rt.config.id,
+                    "label": rt.config.label,
+                    "state": rt.state,
+                    "connected": rt.connected,
+                    "last_error": rt.last_error,
+                    "topics": rt.config.subscriptions,
+                    "host": rt.config.host,
+                    "port": rt.config.port,
+                })
+            })
+            .collect();
+        serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// Publish via output binding if `point` matches; else derive topic from point id.
+    fn publish_for_point(&mut self, point: &str, payload: &[u8]) -> Result<(), String> {
+        for rt in self.clients.values() {
+            if let Some(out) = rt
+                .config
+                .outputs
+                .iter()
+                .find(|o| o.point == point)
+            {
+                let session = rt
+                    .session
+                    .as_ref()
+                    .ok_or_else(|| format!("output: '{}' not connected", rt.config.id))?;
+                return session.publish(&out.topic, payload, out.qos, out.retain);
+            }
+        }
+        // Fallback: mqtt/<conn>/<topic>[::path]
+        let rest = point.strip_prefix("mqtt/").unwrap_or(point);
+        let (conn_and_topic, _) = rest.split_once("::").unwrap_or((rest, ""));
+        let (conn, topic) = match conn_and_topic.split_once('/') {
+            Some((c, t)) if !t.is_empty() => (c.to_string(), t.to_string()),
+            _ => {
+                return Err("write_point: no output binding and cannot derive topic".into());
+            }
+        };
+        let value = serde_json::json!({
+            "op": "publish",
+            "id": conn,
+            "topic": topic,
+            "payload": String::from_utf8_lossy(payload),
+            "qos": 0,
+            "retain": false,
+        });
+        self.configure_op("publish", &value)
+    }
+}
+
+fn normalize_transport(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "tls" | "mqtts" => "tls".into(),
+        "ws" | "websocket" => "ws".into(),
+        "wss" => "wss".into(),
+        _ => "tcp".into(),
     }
 }
 
@@ -329,8 +661,7 @@ unsafe extern "C" fn create(host: *const PbHostApi) -> *mut c_void {
     if host.abi_version != PB_ABI_VERSION {
         return std::ptr::null_mut();
     }
-    let state = Box::new(PackState::new(host));
-    Box::into_raw(state) as *mut c_void
+    Box::into_raw(Box::new(PackState::new(host))) as *mut c_void
 }
 
 unsafe extern "C" fn destroy(handle: *mut c_void) {
@@ -338,8 +669,8 @@ unsafe extern "C" fn destroy(handle: *mut c_void) {
         return;
     }
     let mut state = Box::from_raw(handle as *mut PackState);
-    if let Some(session) = state.session.take() {
-        session.stop();
+    for rt in state.clients.values_mut() {
+        PackState::stop_client(rt);
     }
 }
 
@@ -351,63 +682,47 @@ unsafe extern "C" fn configure(handle: *mut c_void, json: *const c_char, len: us
     let slice = std::slice::from_raw_parts(json as *const u8, len);
     let text = match std::str::from_utf8(slice) {
         Ok(t) => t,
-        Err(_) => {
-            state.last_error = "configure: invalid utf-8".into();
-            return -1;
-        }
+        Err(_) => return -1,
     };
-    match serde_json::from_str::<MqttConfig>(text) {
-        Ok(cfg) => {
-            if let Err(e) = cfg.transport_kind() {
-                state.last_error = e;
-                return -1;
-            }
-            state.config = cfg;
-            0
-        }
+    match state.configure_json(text) {
+        Ok(()) => 0,
         Err(e) => {
-            state.last_error = format!("configure: {e}");
+            state.log(PB_LOG_ERROR, &e);
             -1
         }
     }
 }
 
+/// Connect all clients marked auto_connect (or every client if none flagged).
 unsafe extern "C" fn connect(handle: *mut c_void) -> c_int {
     if handle.is_null() {
         return -1;
     }
     let state = &mut *(handle as *mut PackState);
-    if let Some(prev) = state.session.take() {
-        prev.stop();
-    }
-    let transport = match state.config.transport_kind() {
-        Ok(t) => t,
-        Err(e) => {
-            state.last_error = e;
-            return -1;
-        }
+    let ids: Vec<String> = if state.clients.values().any(|c| c.config.auto_connect) {
+        state
+            .clients
+            .iter()
+            .filter(|(_, c)| c.config.auto_connect)
+            .map(|(id, _)| id.clone())
+            .collect()
+    } else {
+        state.clients.keys().cloned().collect()
     };
-    match MqttSession::spawn(
-        state.config.host.clone(),
-        state.config.port,
-        state.config.client_id.clone(),
-        state.config.username.clone(),
-        state.config.password.clone(),
-        transport,
-        state.config.keep_alive_secs,
-    ) {
-        Ok(session) => {
-            state.session = Some(session);
-            state.state = "connecting".into();
-            state.last_error.clear();
-            state.connected = false;
-            0
+    let mut ok = true;
+    for id in ids {
+        if let Some(rt) = state.clients.get_mut(&id) {
+            rt.config.auto_connect = true;
+            if let Err(e) = PackState::start_client(rt) {
+                rt.last_error = e;
+                ok = false;
+            }
         }
-        Err(e) => {
-            state.last_error = e;
-            state.quality_bad = true;
-            -1
-        }
+    }
+    if ok {
+        0
+    } else {
+        -1
     }
 }
 
@@ -416,11 +731,10 @@ unsafe extern "C" fn disconnect(handle: *mut c_void) -> c_int {
         return -1;
     }
     let state = &mut *(handle as *mut PackState);
-    if let Some(session) = state.session.take() {
-        session.stop();
+    for rt in state.clients.values_mut() {
+        rt.config.auto_connect = false;
+        PackState::stop_client(rt);
     }
-    state.connected = false;
-    state.state = "disconnected".into();
     0
 }
 
@@ -431,22 +745,31 @@ unsafe extern "C" fn subscribe(handle: *mut c_void, topic: *const c_char, qos: u
     let state = &mut *(handle as *mut PackState);
     let topic = match CStr::from_ptr(topic).to_str() {
         Ok(t) => t.to_string(),
-        Err(_) => {
-            state.last_error = "subscribe: bad topic".into();
-            return -1;
+        Err(_) => return -1,
+    };
+    // Optional "client_id\ttopic" encoding from the host.
+    let (client_id, topic) = match topic.split_once('\t') {
+        Some((id, t)) => (id.to_string(), t.to_string()),
+        None => {
+            let id = state
+                .clients
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "default".into());
+            (id, topic)
         }
     };
-    if !state.topics.iter().any(|t| t == &topic) {
-        state.topics.push(topic.clone());
-    }
-    let Some(session) = state.session.as_ref() else {
-        // Remember topic; applied on connect / reconnect.
-        return 0;
-    };
-    match session.subscribe(&topic, qos) {
+    let value = serde_json::json!({
+        "op": "subscribe",
+        "id": client_id,
+        "topic": topic,
+        "qos": qos,
+    });
+    match state.configure_op("subscribe", &value) {
         Ok(()) => 0,
         Err(e) => {
-            state.last_error = e;
+            state.log(PB_LOG_ERROR, &e);
             -1
         }
     }
@@ -465,31 +788,44 @@ unsafe extern "C" fn publish(
     }
     let state = &mut *(handle as *mut PackState);
     let topic = match CStr::from_ptr(topic).to_str() {
-        Ok(t) => t,
-        Err(_) => {
-            state.last_error = "publish: bad topic".into();
-            return -1;
+        Ok(t) => t.to_string(),
+        Err(_) => return -1,
+    };
+    let (client_id, topic) = match topic.split_once('\t') {
+        Some((id, t)) => (id.to_string(), t.to_string()),
+        None => {
+            let id = state
+                .clients
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "default".into());
+            (id, topic)
         }
     };
     let bytes = if payload.is_null() || len == 0 {
-        &[][..]
+        Vec::new()
     } else {
-        std::slice::from_raw_parts(payload, len)
+        std::slice::from_raw_parts(payload, len).to_vec()
     };
-    let Some(session) = state.session.as_ref() else {
-        state.last_error = "publish: not connected".into();
-        return -1;
-    };
-    match session.publish(topic, bytes, qos, retain != 0) {
+    let payload_str = String::from_utf8_lossy(&bytes).into_owned();
+    let value = serde_json::json!({
+        "op": "publish",
+        "id": client_id,
+        "topic": topic,
+        "payload": payload_str,
+        "qos": qos,
+        "retain": retain != 0,
+    });
+    match state.configure_op("publish", &value) {
         Ok(()) => 0,
         Err(e) => {
-            state.last_error = e;
+            state.log(PB_LOG_ERROR, &e);
             -1
         }
     }
 }
 
-/// Point write → publish. Point names `mqtt/<topic>` (or raw topic) publish UTF-8 payload.
 unsafe extern "C" fn write_point(
     handle: *mut c_void,
     name: *const c_char,
@@ -505,7 +841,6 @@ unsafe extern "C" fn write_point(
         Ok(t) => t,
         Err(_) => return -1,
     };
-    let (topic, _) = split_point_id(name);
     let payload: Vec<u8> = match value_kind {
         PB_VALUE_STRING | PB_VALUE_BYTES => {
             if value.is_null() {
@@ -514,19 +849,12 @@ unsafe extern "C" fn write_point(
                 std::slice::from_raw_parts(value as *const u8, value_len).to_vec()
             }
         }
-        _ => {
-            state.last_error = "write_point: unsupported value kind".into();
-            return -1;
-        }
+        _ => return -1,
     };
-    let Some(session) = state.session.as_ref() else {
-        state.last_error = "write_point: not connected".into();
-        return -1;
-    };
-    match session.publish(topic, &payload, 0, false) {
+    match state.publish_for_point(name, &payload) {
         Ok(()) => 0,
         Err(e) => {
-            state.last_error = e;
+            state.log(PB_LOG_ERROR, &e);
             -1
         }
     }
@@ -545,7 +873,7 @@ unsafe extern "C" fn state_label(handle: *mut c_void, out: *mut c_char, out_len:
         return -1;
     }
     let state = &*(handle as *mut PackState);
-    write_cstr(out, out_len, &state.state)
+    write_cstr(out, out_len, &state.aggregate_state())
 }
 
 unsafe extern "C" fn last_error(handle: *mut c_void, out: *mut c_char, out_len: usize) -> c_int {
@@ -553,7 +881,7 @@ unsafe extern "C" fn last_error(handle: *mut c_void, out: *mut c_char, out_len: 
         return -1;
     }
     let state = &*(handle as *mut PackState);
-    write_cstr(out, out_len, &state.last_error)
+    write_cstr(out, out_len, &state.aggregate_error())
 }
 
 unsafe extern "C" fn is_connected(handle: *mut c_void) -> c_int {
@@ -561,7 +889,7 @@ unsafe extern "C" fn is_connected(handle: *mut c_void) -> c_int {
         return 0;
     }
     let state = &*(handle as *mut PackState);
-    if state.connected {
+    if state.any_connected() {
         1
     } else {
         0
@@ -572,9 +900,9 @@ unsafe extern "C" fn topics_json(handle: *mut c_void, out: *mut c_char, out_len:
     if handle.is_null() {
         return -1;
     }
+    // Host/UI reads the multi-client snapshot from this buffer.
     let state = &*(handle as *mut PackState);
-    let json = serde_json::to_string(&state.topics).unwrap_or_else(|_| "[]".into());
-    write_cstr(out, out_len, &json)
+    write_cstr(out, out_len, &state.clients_snapshot_json())
 }
 
 #[cfg(test)]
@@ -582,20 +910,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_parses_defaults() {
-        let cfg: MqttConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.host, "127.0.0.1");
-        assert_eq!(cfg.port, 1883);
-        assert!(cfg.transport_kind().is_ok());
-    }
-
-    #[test]
     fn register_fills_api() {
         let mut api = unsafe { std::mem::zeroed::<PbPackApi>() };
         let rc = unsafe { pb_pack_register(&mut api) };
         assert_eq!(rc, 0);
         assert_eq!(api.abi_version, PB_ABI_VERSION);
-        assert!(!api.id.is_null());
-        assert!(api.create.is_some());
+    }
+
+    #[test]
+    fn client_point_ids() {
+        assert_eq!(
+            point_id_for_client_topic("local", "a/b"),
+            "mqtt/local/a/b"
+        );
+        assert_eq!(
+            point_id_for_client_field("local", "a/b", "temp"),
+            "mqtt/local/a/b::temp"
+        );
+    }
+
+    #[test]
+    fn reconcile_empty_ok() {
+        let host = PbHostApi {
+            abi_version: PB_ABI_VERSION,
+            ctx: std::ptr::null_mut(),
+            upsert_point: None,
+            log_message: None,
+        };
+        let mut state = PackState::new(host);
+        assert!(state.reconcile_clients(Vec::new()).is_ok());
     }
 }

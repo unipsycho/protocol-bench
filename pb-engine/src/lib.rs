@@ -162,6 +162,7 @@ impl ProtocolEngine for IdleEngine {
             connected: false,
             last_error: String::new(),
             topics: Vec::new(),
+            detail_json: String::new(),
             pack_loaded: false,
         }
     }
@@ -179,6 +180,8 @@ pub struct SlotSnapshot {
     pub connected: bool,
     pub last_error: String,
     pub topics: Vec<String>,
+    /// Pack-specific JSON snapshot (MQTT: clients array).
+    pub detail_json: String,
     pub pack_loaded: bool,
 }
 
@@ -194,6 +197,7 @@ impl SlotSnapshot {
             connected: false,
             last_error: String::new(),
             topics: Vec::new(),
+            detail_json: String::new(),
             pack_loaded: false,
         }
     }

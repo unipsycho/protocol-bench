@@ -1,5 +1,6 @@
 //! Protocol Bench shell: menu bar, icon rail, docked panes, themes.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
@@ -12,8 +13,10 @@ use crate::brand_logo::AaLogoCache;
 use crate::dnd::{self, DropCommit, PaneHit};
 use crate::dock::DockPane;
 use crate::layout::{LayoutNode, SplitDir, TabGroup};
+use crate::mqtt_panel::{self, MqttPanelState};
 use crate::panels;
 use crate::persist::{self, UiState};
+use crate::project::{self, MqttProject, ProjectFile};
 use crate::theme::{
     self, divider_bar, font_semi, font_ui, tint, AppTheme, ThemePalette, BAR_H, HEADER_H, MIN_PANE,
     RADIUS, RAIL_W, SEP, STATUS_H,
@@ -39,7 +42,18 @@ pub struct ProtocolBenchApp {
     aa_logo: AaLogoCache,
     dirty: bool,
     last_save: Instant,
-    mqtt_form: panels::MqttForm,
+    mqtt: MqttPanelState,
+    /// Current JSON project path (MQTT wire config).
+    project_path: PathBuf,
+    /// Last MQTT snapshot written to the project file.
+    mqtt_saved: MqttProject,
+    last_project_save: Instant,
+    project_dialog: Option<ProjectDialog>,
+}
+
+enum ProjectDialog {
+    Open { path: String },
+    SaveAs { path: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -75,8 +89,28 @@ impl ProtocolBenchApp {
         let ui_state = persist::load();
         let theme = persist::theme_from_state(&ui_state);
         theme::apply_theme(&cc.egui_ctx, theme);
+        let project_path = project::default_project_path().unwrap_or_else(|| {
+            PathBuf::from("protocol-bench-project.json")
+        });
+        let mut mqtt = MqttPanelState::default();
+        let mut mqtt_saved = MqttProject::default();
+        let mut status = "Ready".into();
+        let engine = EngineHandle::spawn();
+        if project_path.is_file() {
+            match project::load(&project_path) {
+                Ok(file) => {
+                    file.mqtt.apply_to_panel(&mut mqtt);
+                    mqtt_saved = file.mqtt.clone();
+                    mqtt_panel::apply_mqtt_session(&engine, &mqtt);
+                    status = format!("Loaded project {}", project_path.display());
+                }
+                Err(err) => {
+                    status = format!("Project load skipped: {err}");
+                }
+            }
+        }
         Self {
-            engine: EngineHandle::spawn(),
+            engine,
             ui_state,
             theme,
             theme_applied: Some(theme),
@@ -85,12 +119,16 @@ impl ProtocolBenchApp {
             about_open: false,
             settings_open: false,
             menu: None,
-            status: "Ready".into(),
+            status,
             service_connected: true,
             aa_logo: AaLogoCache::default(),
             dirty: false,
             last_save: Instant::now(),
-            mqtt_form: panels::MqttForm::default(),
+            mqtt,
+            project_path,
+            mqtt_saved,
+            last_project_save: Instant::now(),
+            project_dialog: None,
         }
     }
 
@@ -109,6 +147,132 @@ impl ProtocolBenchApp {
             Err(err) => self.status = format!("Could not save layout: {err}"),
         }
         self.last_save = Instant::now();
+    }
+
+    fn autosave_project(&mut self, _host: &pb_engine::HostSnapshot) {
+        let current = MqttProject::from_panel(&self.mqtt);
+        if current == self.mqtt_saved {
+            return;
+        }
+        if self.last_project_save.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        match self.save_project_now() {
+            Ok(()) => {}
+            Err(err) => self.status = format!("Could not save project: {err}"),
+        }
+    }
+
+    fn save_project_now(&mut self) -> Result<(), String> {
+        let mqtt = MqttProject::from_panel(&self.mqtt);
+        let file = ProjectFile {
+            version: project::PROJECT_VERSION,
+            mqtt: mqtt.clone(),
+        };
+        project::save(&self.project_path, &file)?;
+        self.mqtt_saved = mqtt;
+        self.last_project_save = Instant::now();
+        Ok(())
+    }
+
+    fn load_project_from_path(&mut self, path: PathBuf) -> Result<(), String> {
+        let file = project::load(&path)?;
+        file.mqtt.apply_to_panel(&mut self.mqtt);
+        self.mqtt_saved = file.mqtt.clone();
+        self.project_path = path;
+        mqtt_panel::apply_mqtt_session(&self.engine, &self.mqtt);
+        self.status = format!("Opened {}", self.project_path.display());
+        Ok(())
+    }
+
+    fn project_dialog_window(&mut self, ctx: &egui::Context, p: &ThemePalette) {
+        let Some(dialog) = self.project_dialog.as_ref() else {
+            return;
+        };
+        let title = match dialog {
+            ProjectDialog::Open { .. } => "Open project",
+            ProjectDialog::SaveAs { .. } => "Save project as",
+        };
+        let is_open = matches!(dialog, ProjectDialog::Open { .. });
+        let mut path_buf = match dialog {
+            ProjectDialog::Open { path } | ProjectDialog::SaveAs { path } => path.clone(),
+        };
+        let mut open = true;
+        let mut commit = false;
+        let mut cancel = false;
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "JSON project (multi-client MQTT: brokers, creds, subscriptions, parse paths, outputs). Path entry avoids Hyprland file-dialog stalls.",
+                    )
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+                );
+                ui.add_space(8.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut path_buf)
+                        .desired_width(ui.available_width())
+                        .hint_text("/path/to/project.json"),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let primary = if is_open { "Open" } else { "Save" };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(primary)
+                                    .font(font_ui(12.5))
+                                    .color(Color32::from_rgb(0x12, 0x14, 0x18)),
+                            )
+                            .fill(p.accent),
+                        )
+                        .clicked()
+                    {
+                        commit = true;
+                    }
+                    ui.add_space(10.0);
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if let Some(dialog) = self.project_dialog.as_mut() {
+            match dialog {
+                ProjectDialog::Open { path } | ProjectDialog::SaveAs { path } => {
+                    *path = path_buf.clone();
+                }
+            }
+        }
+        if !open || cancel {
+            self.project_dialog = None;
+            return;
+        }
+        if commit {
+            self.project_dialog = None;
+            let path = PathBuf::from(path_buf.trim());
+            if path.as_os_str().is_empty() {
+                self.status = "Project path is empty".into();
+                return;
+            }
+            if is_open {
+                if let Err(err) = self.load_project_from_path(path) {
+                    self.status = format!("Open failed: {err}");
+                }
+            } else {
+                self.project_path = path;
+                match self.save_project_now() {
+                    Ok(()) => {
+                        self.status = format!("Saved {}", self.project_path.display());
+                    }
+                    Err(err) => self.status = format!("Save failed: {err}"),
+                }
+            }
+        }
     }
 
     fn reset_layout(&mut self) {
@@ -136,10 +300,14 @@ impl ProtocolBenchApp {
         match action {
             MenuAction::Close => {}
             MenuAction::OpenProject => {
-                self.status = "Open project — not wired yet".into();
+                self.project_dialog = Some(ProjectDialog::Open {
+                    path: self.project_path.display().to_string(),
+                });
             }
             MenuAction::SaveAsProject => {
-                self.status = "Save as project — not wired yet".into();
+                self.project_dialog = Some(ProjectDialog::SaveAs {
+                    path: self.project_path.display().to_string(),
+                });
             }
             MenuAction::ResetLayout => self.reset_layout(),
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -196,6 +364,7 @@ impl eframe::App for ProtocolBenchApp {
         self.pane_rail(ctx, &p);
         self.settings_drawer(ctx, &p, &host);
         self.about_window(ctx, &p);
+        self.project_dialog_window(ctx, &p);
 
         let host_for_panes = host;
         egui::CentralPanel::default()
@@ -231,6 +400,7 @@ impl eframe::App for ProtocolBenchApp {
 
         self.handle_drop(ctx, &p);
         self.autosave();
+        self.autosave_project(&host_for_panes);
         // Keep MQTT / pack snapshots fresh without pinning the compositor.
         ctx.request_repaint_after(Duration::from_millis(250));
     }
@@ -238,6 +408,7 @@ impl eframe::App for ProtocolBenchApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.ui_state.theme_id = self.theme.id().into();
         let _ = persist::save(&self.ui_state);
+        let _ = self.save_project_now();
         self.engine.shutdown();
     }
 }
@@ -1033,7 +1204,7 @@ impl ProtocolBenchApp {
                 p,
                 &mut self.ui_state.hubs,
                 &self.engine,
-                &mut self.mqtt_form,
+                &mut self.mqtt,
             );
             if hub_change.dirty {
                 self.mark_dirty();

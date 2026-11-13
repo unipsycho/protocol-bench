@@ -85,19 +85,12 @@ fn subscribe_point_and_publish() {
     let handle = unsafe { create(&host_api) };
     assert!(!handle.is_null());
 
+    let topic = "pb/smoke/in";
     let cfg = format!(
-        r#"{{"host":"{host}","port":{port},"client_id":"pb-smoke","transport":"tcp"}}"#
+        r#"{{"clients":[{{"id":"smoke","label":"smoke","host":"{host}","port":{port},"client_id":"pb-smoke","transport":"tcp","subscriptions":["{topic}"],"auto_connect":true}}]}}"#
     );
     let configure = api.configure.expect("configure");
     assert_eq!(unsafe { configure(handle, cfg.as_ptr() as *const c_char, cfg.len()) }, 0);
-
-    let connect = api.connect.expect("connect");
-    assert_eq!(unsafe { connect(handle) }, 0);
-
-    let topic = "pb/smoke/in";
-    let subscribe = api.subscribe.expect("subscribe");
-    let c_topic = std::ffi::CString::new(topic).unwrap();
-    assert_eq!(unsafe { subscribe(handle, c_topic.as_ptr(), 0) }, 0);
 
     // Wait for ConnAck + resubscribe path.
     let poll = api.poll.expect("poll");
@@ -154,7 +147,7 @@ fn subscribe_point_and_publish() {
 
     // Point write → publish path.
     let write_point = api.write_point.expect("write_point");
-    let point_name = std::ffi::CString::new("mqtt/pb/smoke/write").unwrap();
+    let point_name = std::ffi::CString::new("mqtt/smoke/pb/smoke/write").unwrap();
     let body = b"via-point";
     assert_eq!(
         unsafe {

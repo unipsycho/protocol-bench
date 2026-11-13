@@ -9,8 +9,10 @@ mod dnd;
 mod dock;
 mod hubs;
 mod layout;
+mod mqtt_panel;
 mod panels;
 mod persist;
+mod project;
 mod theme;
 
 use eframe::egui;

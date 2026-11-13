@@ -196,8 +196,8 @@ impl ProtocolEngine for PackEngine {
             .is_connected
             .map(|f| unsafe { f(self.handle) } != 0)
             .unwrap_or(false);
-        let topics_raw = self.read_cstr(self.pack.api.topics_json);
-        let topics = parse_topics_json(&topics_raw);
+        let detail_json = self.read_cstr(self.pack.api.topics_json);
+        let topics = mqtt_topics_from_detail(&detail_json);
         let state = if state.is_empty() {
             if connected {
                 "connected".into()
@@ -217,33 +217,64 @@ impl ProtocolEngine for PackEngine {
             connected,
             last_error,
             topics,
+            detail_json,
             pack_loaded: true,
         }
     }
 }
 
-fn parse_topics_json(raw: &str) -> Vec<String> {
+/// Pull `client/topic` rows from an MQTT clients snapshot JSON array.
+fn mqtt_topics_from_detail(raw: &str) -> Vec<String> {
     let t = raw.trim();
     if t.is_empty() || t == "[]" {
         return Vec::new();
     }
-    // Minimal JSON string-array parse without pulling serde into the hot path.
+    // Lightweight extract: look for "topics":["a","b"] blocks under each client.
     let mut out = Vec::new();
-    let mut rest = t.trim_start_matches('[').trim_end_matches(']');
-    while !rest.is_empty() {
-        rest = rest.trim_start_matches(',').trim_start();
-        if !rest.starts_with('"') {
-            break;
-        }
-        rest = &rest[1..];
-        if let Some(end) = rest.find('"') {
-            out.push(rest[..end].to_string());
-            rest = &rest[end + 1..];
-        } else {
-            break;
+    let mut rest = t;
+    while let Some(idx) = rest.find("\"id\"") {
+        rest = &rest[idx + 4..];
+        let id = json_string_after(rest).unwrap_or_default();
+        if let Some(tidx) = rest.find("\"topics\"") {
+            let after = &rest[tidx + 8..];
+            if let Some(bracket) = after.find('[') {
+                let mut arr = &after[bracket + 1..];
+                while let Some(topic) = next_json_string(&mut arr) {
+                    if id.is_empty() {
+                        out.push(topic);
+                    } else {
+                        out.push(format!("{id}/{topic}"));
+                    }
+                }
+            }
         }
     }
     out
+}
+
+fn json_string_after(s: &str) -> Option<String> {
+    let mut rest = s.trim_start_matches(|c: char| c != '"');
+    if !rest.starts_with('"') {
+        return None;
+    }
+    rest = &rest[1..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn next_json_string(rest: &mut &str) -> Option<String> {
+    *rest = rest.trim_start_matches(|c: char| c == ',' || c.is_whitespace() || c == ']');
+    if rest.is_empty() || rest.starts_with(']') {
+        return None;
+    }
+    if !rest.starts_with('"') {
+        return None;
+    }
+    *rest = &rest[1..];
+    let end = rest.find('"')?;
+    let val = rest[..end].to_string();
+    *rest = &rest[end + 1..];
+    Some(val)
 }
 
 pub unsafe extern "C" fn host_upsert_point(

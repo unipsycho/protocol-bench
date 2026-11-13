@@ -39,7 +39,38 @@ PB_MODULES="$PWD/modules" DISPLAY=:0 cargo run -p pb-ui
 PB_MODULES="$PWD/modules" cargo run -p pb-service
 ```
 
-If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use the MQTT panel (or smoke script) to subscribe and publish. Subscribe payloads land as host points named `mqtt/<topic>`.
+If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use the MQTT panel (or smoke script) to subscribe and publish. Subscribe payloads land as host points named `mqtt/<client>/<topic>` (JSON fields: `mqtt/<client>/<topic>::<path>`).
+
+### Project JSON (multi-client MQTT)
+
+Editable wire config (not layout). Default path: `…/ProtocolBench/project.json` (via `directories`). File → Open / Save as project uses a path dialog (non-blocking). MQTT panel changes autosave here.
+
+```json
+{
+  "version": 2,
+  "mqtt": {
+    "selected_id": "local",
+    "clients": [
+      {
+        "id": "local",
+        "label": "Local broker",
+        "host": "127.0.0.1",
+        "port": 1883,
+        "client_id": "protocol-bench",
+        "username": "",
+        "password": "",
+        "transport": "tcp",
+        "subscriptions": ["pb/#"],
+        "parse_rules": [{ "topic": "pb/#", "path": "temp", "point": "" }],
+        "outputs": [{ "point": "some/point", "topic": "out/x", "qos": 0, "retain": false }],
+        "auto_connect": true
+      }
+    ]
+  }
+}
+```
+
+`ui.toml` remains layout/theme only. Password is stored in the project JSON for now (no keyring).
 
 ## Option A — in-process `cdylib` + fixed C ABI — **settled**
 
