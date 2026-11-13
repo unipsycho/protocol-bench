@@ -100,9 +100,13 @@ pub fn paint(
     }
     let now = Instant::now();
     let mut pick = None;
-    // No group guide lines in the topic tree.
+    // Tight vertical rhythm; no group guide lines.
     let prev_vline = ui.visuals().indent_has_left_vline;
     ui.visuals_mut().indent_has_left_vline = false;
+    let prev_y = ui.spacing().item_spacing.y;
+    let prev_interact_y = ui.spacing().interact_size.y;
+    ui.spacing_mut().item_spacing.y = 1.0;
+    ui.spacing_mut().interact_size.y = 16.0;
     paint_node(
         ui,
         &tree.root,
@@ -115,6 +119,8 @@ pub fn paint(
         &mut pick,
     );
     ui.visuals_mut().indent_has_left_vline = prev_vline;
+    ui.spacing_mut().item_spacing.y = prev_y;
+    ui.spacing_mut().interact_size.y = prev_interact_y;
     pick
 }
 
