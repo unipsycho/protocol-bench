@@ -40,75 +40,140 @@ pub fn paint(
 
 fn points_panel(ui: &mut egui::Ui, host: &HostSnapshot, p: &ThemePalette) {
     ui.label(
-        egui::RichText::new(
-            "Host points bus — sequential ids (`mqtt_1`, …); SOURCE holds broker/topic/field metadata.",
-        )
-        .font(font_ui(12.5))
-        .color(p.muted),
+        egui::RichText::new("Live values from wired inputs — every protocol lands here.")
+            .font(font_ui(12.5))
+            .color(p.muted),
     );
     ui.add_space(8.0);
     if host.points.is_empty() {
         ui.label(
-            egui::RichText::new("No points yet. Connect MQTT and subscribe to populate the bus.")
+            egui::RichText::new("No points yet. Connect an input and subscribe to populate.")
                 .font(font_ui(12.5))
                 .color(p.muted),
         );
         return;
     }
+
+    const NAME_W: f32 = 88.0;
+    const VALUE_W: f32 = 120.0;
+    const UPDATED_W: f32 = 118.0;
+    const DOT_W: f32 = 14.0;
+    const GAP: f32 = 10.0;
+
     egui::ScrollArea::vertical()
         .id_salt("pb_points_live")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            egui::Grid::new("pb_points_grid")
-                .num_columns(5)
-                .spacing([10.0, 4.0])
-                .striped(true)
-                .min_col_width(40.0)
-                .show(ui, |ui| {
-                    for (label, _) in [
-                        ("NAME", 0),
-                        ("VALUE", 0),
-                        ("QUALITY", 0),
-                        ("SOURCE", 0),
-                        ("UPDATED", 0),
-                    ] {
-                        ui.label(
-                            egui::RichText::new(label)
-                                .font(font_ui(10.5))
-                                .color(p.muted),
-                        );
-                    }
-                    ui.end_row();
-                    for point in &host.points {
-                        ui.label(
+            // Header
+            ui.horizontal(|ui| {
+                ui.add_space(DOT_W + 4.0);
+                header_cell(ui, "NAME", NAME_W, p);
+                header_cell(ui, "VALUE", VALUE_W, p);
+                let source_w = (ui.available_width() - UPDATED_W - GAP).max(40.0);
+                header_cell(ui, "SOURCE", source_w, p);
+                header_cell(ui, "UPDATED", UPDATED_W, p);
+            });
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(2.0);
+
+            for point in &host.points {
+                ui.horizontal(|ui| {
+                    quality_dot(ui, &point.quality, p);
+                    ui.add_sized(
+                        [NAME_W, 18.0],
+                        egui::Label::new(
                             egui::RichText::new(&point.name)
                                 .font(font_ui(12.0))
                                 .color(p.text),
-                        );
-                        ui.label(
-                            egui::RichText::new(&point.value)
+                        ),
+                    );
+                    ui.add_sized(
+                        [VALUE_W, 18.0],
+                        egui::Label::new(
+                            egui::RichText::new(truncate_chars(&point.value, 18))
                                 .font(font_ui(12.0))
                                 .color(p.text),
-                        );
-                        ui.label(
-                            egui::RichText::new(&point.quality)
+                        ),
+                    );
+                    let source_w = (ui.available_width() - UPDATED_W - GAP).max(40.0);
+                    // ~7px per char at 12pt — keep the end of the path visible.
+                    let max_chars = ((source_w / 7.0) as usize).max(6);
+                    let shown = truncate_keep_end(&point.source, max_chars);
+                    ui.add_sized(
+                        [source_w, 18.0],
+                        egui::Label::new(
+                            egui::RichText::new(&shown)
                                 .font(font_ui(12.0))
                                 .color(p.muted),
-                        );
-                        ui.label(
-                            egui::RichText::new(&point.source)
-                                .font(font_ui(12.0))
-                                .color(p.muted),
-                        );
-                        ui.label(
+                        ),
+                    )
+                    .on_hover_text(&point.source);
+                    ui.add_sized(
+                        [UPDATED_W, 18.0],
+                        egui::Label::new(
                             egui::RichText::new(format_updated(point.updated_ms))
                                 .font(font_ui(12.0))
                                 .color(p.muted),
-                        );
-                        ui.end_row();
-                    }
+                        ),
+                    );
                 });
+                ui.add_space(2.0);
+            }
         });
+}
+
+fn header_cell(ui: &mut egui::Ui, label: &str, width: f32, p: &ThemePalette) {
+    ui.add_sized(
+        [width, 16.0],
+        egui::Label::new(
+            egui::RichText::new(label)
+                .font(font_ui(10.5))
+                .color(p.muted),
+        ),
+    );
+}
+
+fn quality_dot(ui: &mut egui::Ui, quality: &str, p: &ThemePalette) {
+    let color = match quality {
+        "good" => Color32::from_rgb(0x3d, 0xb8, 0x6b),
+        "bad" => Color32::from_rgb(0xe0, 0x55, 0x55),
+        _ => Color32::from_rgb(0xd4, 0xa0, 0x3c),
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+    let r = 3.5;
+    ui.painter()
+        .circle_filled(rect.center(), r, color);
+    // Soft ring so the dot stays readable on light and dark panes.
+    ui.painter().circle_stroke(
+        rect.center(),
+        r,
+        Stroke::new(1.0, tint(p.text, 40)),
+    );
+    response.on_hover_text(quality);
+}
+
+/// Ellipsis at the start so the end of a long path stays visible.
+fn truncate_keep_end(value: &str, max_chars: usize) -> String {
+    let flat = value.replace('\n', " ");
+    let count = flat.chars().count();
+    if count <= max_chars {
+        return flat;
+    }
+    let keep = max_chars.saturating_sub(1);
+    let end: String = flat.chars().skip(count.saturating_sub(keep)).collect();
+    format!("…{end}")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let flat = value.replace('\n', " ");
+    if flat.chars().count() <= max_chars {
+        flat
+    } else {
+        let mut out: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 fn format_updated(updated_ms: u64) -> String {
@@ -191,7 +256,7 @@ fn blurb(pane: DockPane, host: &HostSnapshot) -> String {
     }
     match pane {
         DockPane::Project => "Hubs, inputs, outputs, and edge transforms for this project.".into(),
-        DockPane::Points => "One value, quality, and timestamp for every named point.".into(),
+        DockPane::Points => "Live values from every wired protocol input.".into(),
         DockPane::Mappings => "A point that arrives on one link can leave on another.".into(),
         DockPane::Traffic => "Bytes and frames from every link, when capture exists.".into(),
         _ => String::new(),

@@ -4,7 +4,7 @@
 //! Outputs bind host points → publish topics on this client.
 //! Cross-protocol point routing stays in the Mappings panel.
 
-use egui::{Color32, Sense, Stroke, Vec2};
+use egui::{Color32, Layout, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2};
 use pb_engine::{EngineCommand, EngineHandle, EngineId, HostSnapshot};
 
 use crate::theme::{font_semi, font_ui, ThemePalette};
@@ -165,17 +165,21 @@ pub fn paint(
     state: &mut MqttPanelState,
 ) {
     state.ensure_selection();
-    // Pad without wrapping in a horizontal row (that collapses available height).
-    ui.add_space(4.0);
-    let width = (ui.available_width() - 16.0).max(1.0);
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        ui.allocate_ui_with_layout(
-            Vec2::new(width, ui.available_height()),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| paint_body(ui, host, p, engine, state),
-        );
-    });
+    // Claim the full pane body with an explicit rect — nested horizontal rows
+    // collapse available_height and clip the config editor.
+    let full = ui.available_rect_before_wrap();
+    let inner = Rect::from_min_max(
+        Pos2::new(full.min.x + 8.0, full.min.y + 4.0),
+        Pos2::new(full.max.x - 8.0, full.max.y),
+    );
+    ui.allocate_new_ui(
+        UiBuilder::new()
+            .max_rect(inner)
+            .layout(Layout::top_down(egui::Align::Min)),
+        |ui| paint_body(ui, host, p, engine, state),
+    );
+    // Consume the outer rect so the dock body does not layout underneath.
+    ui.allocate_rect(full, Sense::hover());
 }
 
 fn paint_body(
@@ -201,51 +205,63 @@ fn paint_body(
     clients_bar(ui, state, engine, p);
     ui.add_space(10.0);
 
-    // Capture remaining pane size before nested layouts eat the height budget.
-    let rem = ui.available_size();
-    let side_by_side = rem.x >= SIDE_BY_SIDE_MIN;
+    // Remaining pane rect after blurb + connections — config scrolls inside this.
+    let rem = ui.available_rect_before_wrap();
+    let rem_size = rem.size();
+    let side_by_side = rem_size.x >= SIDE_BY_SIDE_MIN;
+    let col_h = rem_size.y.max(120.0);
+
     if side_by_side {
         let gap = 16.0;
-        let left_w = (rem.x * 0.55).clamp(340.0, rem.x - 260.0);
-        let right_w = (rem.x - left_w - gap).max(220.0);
-        let col_h = rem.y.max(120.0);
-        ui.allocate_ui_with_layout(
-            Vec2::new(rem.x, col_h),
-            egui::Layout::left_to_right(egui::Align::Min),
+        let left_w = (rem_size.x * 0.55).clamp(340.0, rem_size.x - 260.0);
+        let right_w = (rem_size.x - left_w - gap).max(220.0);
+        let left = Rect::from_min_size(rem.min, Vec2::new(left_w, col_h));
+        let right = Rect::from_min_size(
+            Pos2::new(rem.min.x + left_w + gap, rem.min.y),
+            Vec2::new(right_w, col_h),
+        );
+
+        ui.allocate_new_ui(
+            UiBuilder::new()
+                .max_rect(left)
+                .layout(Layout::top_down(egui::Align::Min)),
             |ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(left_w, col_h),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("pb_mqtt_cfg")
-                            .max_height(col_h)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                selected_client_editor(ui, host, state, engine, p);
-                            });
-                    },
-                );
-                ui.add_space(gap);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(right_w, col_h),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| live_values(ui, host, state, p, true, col_h),
-                );
+                egui::ScrollArea::vertical()
+                    .id_salt("pb_mqtt_cfg")
+                    .max_height(col_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width((left_w - 4.0).max(1.0));
+                        selected_client_editor(ui, host, state, engine, p);
+                    });
             },
         );
+        ui.allocate_new_ui(
+            UiBuilder::new()
+                .max_rect(right)
+                .layout(Layout::top_down(egui::Align::Min)),
+            |ui| live_values(ui, host, state, p, true, col_h),
+        );
+        ui.allocate_rect(rem, Sense::hover());
     } else {
-        egui::ScrollArea::vertical()
-            .id_salt("pb_mqtt_stack")
-            .max_height(rem.y.max(120.0))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                live_values(ui, host, state, p, false, 220.0);
-                ui.add_space(12.0);
-                selected_client_editor(ui, host, state, engine, p);
-            });
+        ui.allocate_new_ui(
+            UiBuilder::new()
+                .max_rect(rem)
+                .layout(Layout::top_down(egui::Align::Min)),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("pb_mqtt_stack")
+                    .max_height(col_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width((rem_size.x - 4.0).max(1.0));
+                        live_values(ui, host, state, p, false, 220.0);
+                        ui.add_space(12.0);
+                        selected_client_editor(ui, host, state, engine, p);
+                    });
+            },
+        );
+        ui.allocate_rect(rem, Sense::hover());
     }
 }
 
