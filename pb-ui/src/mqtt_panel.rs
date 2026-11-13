@@ -116,21 +116,30 @@ impl MqttPanelState {
             .collect()
     }
 
-    /// Refresh topic trees from MQTT pack `detail_json` traffic.
+    /// Refresh topic trees from pack traffic, merged with live point sources.
+    /// Points are a fallback when `topics_json` traffic is empty/truncated so the
+    /// tree stays in sync with what the Points panel already shows.
     pub fn sync_trees_from_host(&mut self, host: &HostSnapshot) {
         let detail = host
             .slot(EngineId::Mqtt)
             .map(|s| s.detail_json.as_str())
             .unwrap_or("[]");
         // Truncated / invalid JSON must not wipe an existing tree (wildcard flood).
-        let Some(by_client) = topic_tree::traffic_from_detail_ok(detail) else {
-            return;
-        };
+        let by_client = topic_tree::traffic_from_detail_ok(detail);
         let known: std::collections::BTreeSet<_> =
             self.clients.iter().map(|c| c.id.clone()).collect();
         self.trees.retain(|id, _| known.contains(id));
         for c in &self.clients {
-            let rows = by_client.get(&c.id).cloned().unwrap_or_default();
+            let mut rows = by_client
+                .as_ref()
+                .and_then(|m| m.get(&c.id).cloned())
+                .unwrap_or_default();
+            merge_point_topics(&mut rows, host, &c.id);
+            if rows.is_empty() {
+                // Keep prior tree; do not clear on empty poll.
+                self.trees.entry(c.id.clone()).or_default();
+                continue;
+            }
             self.trees
                 .entry(c.id.clone())
                 .or_default()
@@ -720,6 +729,35 @@ fn secondary_btn(ui: &mut egui::Ui, label: &str, p: &ThemePalette) -> egui::Resp
         .stroke(Stroke::new(1.0, p.line))
         .min_size(Vec2::new(72.0, 26.0)),
     )
+}
+
+/// Pull topic leaves from host points (`mqtt/<conn>/<topic>[::path]`).
+fn merge_point_topics(
+    rows: &mut Vec<(String, String, u64)>,
+    host: &HostSnapshot,
+    conn_id: &str,
+) {
+    let prefix = format!("mqtt/{conn_id}/");
+    for pt in &host.points {
+        let src = pt.source.as_str();
+        let Some(rest) = src.strip_prefix(&prefix) else {
+            continue;
+        };
+        let topic = rest.split_once("::").map(|(t, _)| t).unwrap_or(rest);
+        if topic.is_empty() {
+            continue;
+        }
+        // Whole-topic sources win over field-only paths for the leaf payload.
+        let from_field = rest.contains("::");
+        if let Some((_, payload, count)) = rows.iter_mut().find(|(t, _, _)| t == topic) {
+            if !from_field || payload.is_empty() {
+                *payload = pt.value.clone();
+            }
+            *count = count.saturating_add(1);
+        } else {
+            rows.push((topic.to_string(), pt.value.clone(), 1));
+        }
+    }
 }
 
 #[allow(dead_code)]

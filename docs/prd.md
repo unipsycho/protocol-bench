@@ -45,7 +45,7 @@ Moving a value between a serial instrument, a Modbus device, a growing CSV, an M
 
 ## Engines
 
-Each protocol engine owns its work on a thread the UI does not block. `pb-engine` lives in the **service**; the UI takes a snapshot and submits commands (IPC details follow-on). Packs load via the C ABI (`pb-abi`) from a `modules/` directory. **MQTT client** is the first live pack (`pb-mqtt` / rumqttc): configure, connect, disconnect, subscribe, publish. Other slots (Streams, Modbus, OPC UA, File follow) remain idle scaffolds until their packs land.
+Each protocol engine owns its work on a thread the UI does not block. `pb-engine` lives in the **service**; the UI takes a snapshot and submits commands (IPC details follow-on). Packs load via the C ABI (`pb-abi`) from a `modules/` directory. **MQTT client** is the first live pack (`pb-mqtt` / rumqttc): multi-client connect, wildcard subscribe, traffic topic tree, hub Input/Output point binds, publish. Other slots (Streams, Modbus, OPC UA, File follow) remain idle scaffolds until their packs land.
 
 ## Hubs
 
@@ -56,13 +56,21 @@ A **hub** is the main protocol conversion / routing point. It is always **one pr
 - Add aggregator / Add calculation attaches to a **selected link/edge** (or a right-clicked connection), rendered on that line.
 - Sample hubs ship for framing (Plant Modbus + Edge MQTT, MQTT link between them) — configuration only, not a live bridge.
 
-### MQTT connections vs hub Input/Output binds
+### MQTT model (client pack)
 
-- The **MQTT panel** owns **connections only** (broker, client id, credentials, transport, optional wide subscribe for traffic / bring-up).
-- **Point promotion** lives on hub **Input** / **Output** nodes: an Input picks a connection + topic/field → creates points (always auto sequential `mqtt_N`, no manual point-id picker); an Output picks a connection + topic + points to publish.
-- Many Input nodes may **share one MQTT connection**; each node owns its own topic/field → point binds. Overlap across nodes is OK (different graph uses).
-- Shared **topic tree** (TopicBench-style) shows subscribed traffic after connect — MQTT panel preview and hub Input inspector (click leaf → bind). MQTT Input nodes show bound **point count** on the right of the title.
-- Broker subscribe may be broad; **only node-defined paths become points**. Bindings + hubs persist in `project.json`.
+| Surface | Owns |
+| --- | --- |
+| **MQTT panel** | Connections only: broker host/port, client id (optional Unique), credentials, transport, Connect/Disconnect, optional **wide subscribe** (`+` / `#` wildcards OK) for traffic / bring-up |
+| **Hub Input node** | Point promotion: pick a shared connection + topic/field → auto sequential `mqtt_N` (no manual point-id picker). Click leaf in topic tree to bind |
+| **Hub Output node** | Publish: pick connection + topic + which points to publish |
+
+Rules:
+
+- Many **Input** nodes may **share one MQTT connection**; each owns its own topic/field → point binds. Overlap across nodes is OK (different graph uses).
+- Wide subscribe may be broad; **only hub Input–defined paths become points** (pack traffic still feeds the topic tree).
+- Shared **topic tree** (TopicBench-style): MQTT panel preview + Input inspector. Tree is fed from pack `traffic` snapshot, merged with live point sources so it stays aligned with the Points panel.
+- MQTT Input diagram nodes show bound **point count** on the right of the title. Input inspector has no Hide/Remove — delete via diagram later.
+- Persist in `project.json` v4: `mqtt.clients[]`, `hubs` (binds), `points[]`, `next_point_seq`.
 
 ## What runs today, and what does not
 

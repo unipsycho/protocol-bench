@@ -1049,6 +1049,38 @@ mod tests {
     }
 
     #[test]
+    fn traffic_snapshot_includes_observed_topics() {
+        let host = PbHostApi {
+            abi_version: PB_ABI_VERSION,
+            ctx: std::ptr::null_mut(),
+            upsert_point: None,
+            log_message: None,
+        };
+        let mut state = PackState::new(host);
+        let mut cfg = ClientConfig::default();
+        cfg.id = "local".into();
+        cfg.subscriptions = vec!["pb/#".into(), "sensor/+/temp".into()];
+        state.reconcile_clients(vec![cfg]).unwrap();
+        let rt = state.clients.get_mut("local").unwrap();
+        rt.observe_traffic("pb/a/b", "{\"n\":1}");
+        rt.observe_traffic("sensor/1/temp", "21.5");
+        let snap = state.clients_snapshot_json();
+        let v: Value = serde_json::from_str(&snap).unwrap();
+        let traffic = v[0]["traffic"].as_array().unwrap();
+        assert!(
+            traffic.iter().any(|t| t["topic"] == "pb/a/b"),
+            "missing pb/a/b in {snap}"
+        );
+        assert!(
+            traffic.iter().any(|t| t["topic"] == "sensor/1/temp"),
+            "missing sensor topic in {snap}"
+        );
+        let topics = v[0]["topics"].as_array().unwrap();
+        assert!(topics.iter().any(|t| t == "pb/#"));
+        assert!(topics.iter().any(|t| t == "sensor/+/temp"));
+    }
+
+    #[test]
     fn reconcile_empty_ok() {
         let host = PbHostApi {
             abi_version: PB_ABI_VERSION,

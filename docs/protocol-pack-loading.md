@@ -39,16 +39,31 @@ PB_MODULES="$PWD/modules" DISPLAY=:0 cargo run -p pb-ui
 PB_MODULES="$PWD/modules" cargo run -p pb-service
 ```
 
-If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use the MQTT panel for connections and hub **Input** / **Output** nodes for point binds (or the smoke script). Only hub Input–defined topic/field paths become host points (sequential short ids `mqtt_1`, `mqtt_2`, … — never reused in a project); the broker/topic (and optional JSON `::path`) is kept as **source** metadata. Bindings persist in `project.json` under `points`. Wide subscribe on a connection is optional traffic / bring-up — it does not promote every message.
+If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use the MQTT panel for connections and hub **Input** / **Output** nodes for point binds (or the smoke script).
+
+### MQTT runtime model
+
+1. **MQTT panel — connections only**  
+   Broker, client id (optional Unique / random on connect), credentials, transport, Apply/Connect, Disconnect. Optional **wide subscribe** filters (`pb/#`, `sensor/+/temp`, `#`, …) for traffic / bring-up. Wildcards (`+`, `#`) are supported end-to-end in pack subscribe + sync.
+
+2. **Hub Input / Output nodes — point binds**  
+   - **Input:** pick a connection (many Inputs may share one broker) + topic/field → creates points. Point ids are always auto sequential `mqtt_N` (never reused in a project; no manual picker).  
+   - **Output:** pick connection + publish topic + points.  
+   Overlap of the same topic/field across Inputs is OK.
+
+3. **Topic tree**  
+   TopicBench-style hierarchy from subscribed traffic. Shown in the MQTT panel (preview) and the hub Input inspector (click leaf → bind). Fed from pack `clients[].traffic` in `topics_json`, **merged with live point sources** (`mqtt/<client>/<topic>`) so the tree matches the Points panel even if the traffic snapshot is empty or mid-truncate. Host `read_cstr` grows the buffer (was 512) so `#` floods do not clear the tree.
+
+4. **Points**  
+   Only hub Input–defined paths become host points. Source metadata: `mqtt/<client>/<topic>[::path]`. Persist under `points` + `next_point_seq`.
 
 ### Project JSON (MQTT connections + hub binds)
 
-Editable wire config (not dock layout). Default path: `…/ProtocolBench/project.json` (via `directories`). File → Open / Save as project uses a path dialog (non-blocking). MQTT panel and hub Input/Output bind changes autosave here.
+Editable wire config (not dock layout). Default path: `…/ProtocolBench/project.json` (via `directories` — e.g. `~/.config/protocolbench/project.json`). File → Open / Save as project uses a path dialog (non-blocking). MQTT panel and hub Input/Output bind changes autosave here.
 
-- **MQTT panel** = connections (broker, client id, optional wide subscribe).
-- **Hub Input/Output nodes** = point promotion. Many Inputs may share one connection; each owns its own binds (overlap OK). Input binds always auto-assign sequential `mqtt_N` (no manual point id). Click topics in the shared topic tree (pack `traffic` snapshot) to bind; MQTT Input nodes show bind count on the diagram.
-- MQTT subscription filters support wildcards (`+`, `#`) end-to-end. Pack `topics_json` snapshots grow past 512 bytes when `#` floods traffic; the host reads with a growing buffer so the topic tree does not clear.
-- **`hubs`** in `project.json` holds the diagram + MQTT binds (v4+). Older files without `hubs` keep the diagram from `ui.toml` until the next save.
+- **`mqtt.clients[]`** — connections + wide subscribe only (no Inputs/Outputs editors on the panel).  
+- **`hubs`** — diagram + per-port `mqtt_connection` / `mqtt_inputs` / `mqtt_outputs` (v4+). Older files without `hubs` keep the diagram from `ui.toml` until the next save.  
+- **`points` / `next_point_seq`** — short id bindings.
 
 ```json
 {
