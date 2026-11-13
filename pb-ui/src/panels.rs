@@ -120,28 +120,56 @@ fn points_panel(
     p: &ThemePalette,
     state: &mut PointsPanelState,
 ) {
+    // Same inset as MQTT panel fields (theme item_spacing / button_padding rhythm).
+    const SIDE: f32 = 8.0;
+    const LABEL_W: f32 = 100.0;
+    let full = ui.available_rect_before_wrap();
+    let inner = Rect::from_min_max(
+        Pos2::new(full.min.x + SIDE, full.min.y + 4.0),
+        Pos2::new(full.max.x - SIDE, full.max.y),
+    );
+    ui.allocate_new_ui(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| points_panel_body(ui, host, p, state, LABEL_W),
+    );
+    ui.allocate_rect(full, Sense::hover());
+}
+
+fn points_panel_body(
+    ui: &mut egui::Ui,
+    host: &HostSnapshot,
+    p: &ThemePalette,
+    state: &mut PointsPanelState,
+    label_w: f32,
+) {
     ui.label(
         egui::RichText::new("Live values from wired inputs — every protocol lands here.")
             .font(font_ui(12.5))
             .color(p.muted),
     );
-    ui.add_space(6.0);
+    ui.add_space(8.0);
 
-    // Search filters name OR source.
+    // Search filters name OR source — MQTT-style label width + field gutters.
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Search")
-                .font(font_ui(12.0))
-                .color(p.muted),
+        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.add_sized(
+            [label_w, 20.0],
+            egui::Label::new(
+                egui::RichText::new("Search")
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            ),
         );
-        let w = (ui.available_width() - 8.0).clamp(160.0, 420.0);
+        let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
         ui.add(
             egui::TextEdit::singleline(&mut state.filter)
                 .desired_width(w)
                 .hint_text("name or source…"),
         );
     });
-    ui.add_space(6.0);
+    ui.add_space(8.0);
 
     if host.points.is_empty() {
         ui.label(
