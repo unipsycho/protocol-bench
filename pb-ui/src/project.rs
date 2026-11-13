@@ -8,6 +8,34 @@ use std::path::{Path, PathBuf};
 
 use crate::mqtt_panel::{MqttClient, MqttOutput, MqttPanelState, MqttParseRule};
 
+/// Rewrite legacy `mqtt/<topic>` point ids to `mqtt/<client>/<topic>`.
+fn migrate_point_name(name: &str, known_clients: &[String], default_client: &str) -> String {
+    // Keep logic local so UI does not depend on the pack crate.
+    let name = name.trim();
+    if name.is_empty() || !name.starts_with("mqtt/") {
+        return name.to_string();
+    }
+    let rest = &name["mqtt/".len()..];
+    let (body, path) = match rest.split_once("::") {
+        Some((b, p)) if !p.is_empty() => (b, Some(p)),
+        _ => (rest, None),
+    };
+    if let Some((first, topic)) = body.split_once('/') {
+        if !topic.is_empty() && known_clients.iter().any(|c| c == first) {
+            return name.to_string();
+        }
+    }
+    let client = if default_client.is_empty() {
+        "default"
+    } else {
+        default_client
+    };
+    match path {
+        Some(p) => format!("mqtt/{client}/{body}::{p}"),
+        None => format!("mqtt/{client}/{body}"),
+    }
+}
+
 pub const PROJECT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -228,6 +256,17 @@ impl MqttProject {
         state.clients = self.clients.iter().map(|c| c.to_client()).collect();
         if state.clients.is_empty() {
             state.clients.push(MqttClient::default_local());
+        }
+        let known: Vec<String> = state.clients.iter().map(|c| c.id.clone()).collect();
+        for client in &mut state.clients {
+            for rule in &mut client.parse_rules {
+                if !rule.point.is_empty() {
+                    rule.point = migrate_point_name(&rule.point, &known, &client.id);
+                }
+            }
+            for out in &mut client.outputs {
+                out.point = migrate_point_name(&out.point, &known, &client.id);
+            }
         }
         state.selected = state
             .clients

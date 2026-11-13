@@ -7,7 +7,8 @@ mod json_path;
 mod session;
 
 pub use json_path::{
-    extract_path_value, point_id_for_field, point_id_for_topic, split_point_id, topic_matches,
+    extract_path_value, migrate_point_id, point_id_for_client_field, point_id_for_client_topic,
+    split_point_id, topic_matches,
 };
 
 use pb_abi::{
@@ -125,18 +126,6 @@ impl ClientConfig {
             other => Err(format!("unknown transport '{other}'")),
         }
     }
-}
-
-/// Point id for a whole topic on one connection: `mqtt/<conn>/<topic>`.
-pub fn point_id_for_client_topic(conn_id: &str, topic: &str) -> String {
-    format!("mqtt/{conn_id}/{topic}")
-}
-
-/// Point id for a JSON field: `mqtt/<conn>/<topic>::<path>`.
-pub fn point_id_for_client_field(conn_id: &str, topic: &str, path: &str) -> String {
-    let base = point_id_for_client_topic(conn_id, topic);
-    let path = json_path::normalize_field_path(path);
-    format!("{base}::{path}")
 }
 
 struct ClientRuntime {
@@ -400,6 +389,11 @@ impl PackState {
 
     fn reconcile_clients(&mut self, clients: Vec<ClientConfig>) -> Result<(), String> {
         let mut wanted = BTreeMap::new();
+            let known: Vec<String> = clients.iter().map(|c| c.id.clone()).collect();
+        let default_client = known
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "default".into());
         for mut cfg in clients {
             if cfg.id.trim().is_empty() {
                 return Err("client id required".into());
@@ -407,6 +401,15 @@ impl PackState {
             cfg.transport = normalize_transport(&cfg.transport);
             if cfg.label.trim().is_empty() {
                 cfg.label = cfg.id.clone();
+            }
+            // Migrate legacy mqtt/<topic> point overrides / output binds.
+            for rule in &mut cfg.parse_rules {
+                if !rule.point.trim().is_empty() {
+                    rule.point = migrate_point_id(&rule.point, &known, &default_client);
+                }
+            }
+            for out in &mut cfg.outputs {
+                out.point = migrate_point_id(&out.point, &known, &cfg.id);
             }
             wanted.insert(cfg.id.clone(), cfg);
         }
@@ -576,15 +579,19 @@ impl PackState {
         serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
     }
 
+    fn known_client_ids(&self) -> Vec<String> {
+        self.clients.keys().cloned().collect()
+    }
+
     /// Publish via output binding if `point` matches; else derive topic from point id.
     fn publish_for_point(&mut self, point: &str, payload: &[u8]) -> Result<(), String> {
+        let known = self.known_client_ids();
+        let default = known.first().cloned().unwrap_or_else(|| "default".into());
+        let point = migrate_point_id(point, &known, &default);
         for rt in self.clients.values() {
-            if let Some(out) = rt
-                .config
-                .outputs
-                .iter()
-                .find(|o| o.point == point)
-            {
+            if let Some(out) = rt.config.outputs.iter().find(|o| {
+                migrate_point_id(&o.point, &known, &default) == point
+            }) {
                 let session = rt
                     .session
                     .as_ref()
@@ -592,15 +599,11 @@ impl PackState {
                 return session.publish(&out.topic, payload, out.qos, out.retain);
             }
         }
-        // Fallback: mqtt/<conn>/<topic>[::path]
-        let rest = point.strip_prefix("mqtt/").unwrap_or(point);
-        let (conn_and_topic, _) = rest.split_once("::").unwrap_or((rest, ""));
-        let (conn, topic) = match conn_and_topic.split_once('/') {
-            Some((c, t)) if !t.is_empty() => (c.to_string(), t.to_string()),
-            _ => {
-                return Err("write_point: no output binding and cannot derive topic".into());
-            }
-        };
+        // Fallback: mqtt/<client>/<topic>[::path]
+        let (client, topic, _) = split_point_id(&point, &known);
+        let conn = client
+            .map(|s| s.to_string())
+            .ok_or_else(|| "write_point: no output binding and cannot derive client/topic".to_string())?;
         let value = serde_json::json!({
             "op": "publish",
             "id": conn,
@@ -919,13 +922,15 @@ mod tests {
 
     #[test]
     fn client_point_ids() {
-        assert_eq!(
-            point_id_for_client_topic("local", "a/b"),
-            "mqtt/local/a/b"
-        );
+        assert_eq!(point_id_for_client_topic("local", "a/b"), "mqtt/local/a/b");
         assert_eq!(
             point_id_for_client_field("local", "a/b", "temp"),
             "mqtt/local/a/b::temp"
+        );
+        let clients = vec!["local".into()];
+        assert_eq!(
+            migrate_point_id("mqtt/a/b", &clients, "local"),
+            "mqtt/local/a/b"
         );
     }
 

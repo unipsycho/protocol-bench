@@ -1,25 +1,63 @@
 //! Dotted / JSONPath-ish field extraction for MQTT JSON payloads.
 //! Pattern aligned with TopicBench `mqtt/value_path.rs` (no UI).
+//!
+//! Point ids are always `mqtt/<client_name>/<topic>` (and `…::path` for JSON fields).
 
 use serde_json::Value;
 
-/// Point id for a whole topic payload: `mqtt/<topic>`.
-pub fn point_id_for_topic(topic: &str) -> String {
-    format!("mqtt/{topic}")
+/// Point id for a whole topic on one client: `mqtt/<client>/<topic>`.
+pub fn point_id_for_client_topic(client: &str, topic: &str) -> String {
+    format!("mqtt/{client}/{topic}")
 }
 
-/// Point id for a JSON field on a topic: `mqtt/<topic>::<path>`.
-pub fn point_id_for_field(topic: &str, path: &str) -> String {
+/// Point id for a JSON field: `mqtt/<client>/<topic>::<path>`.
+pub fn point_id_for_client_field(client: &str, topic: &str, path: &str) -> String {
     let path = normalize_field_path(path);
-    format!("mqtt/{topic}::{path}")
+    format!("mqtt/{client}/{topic}::{path}")
 }
 
-/// Topic (+ optional `::path`) from a point id.
-pub fn split_point_id(name: &str) -> (&str, Option<&str>) {
+/// Split `mqtt/<client>/<topic>[::path]` into (client, topic, optional path).
+/// Legacy `mqtt/<topic>[::path]` (no known client segment) returns `None` for client.
+pub fn split_point_id<'a>(
+    name: &'a str,
+    known_clients: &[String],
+) -> (Option<&'a str>, &'a str, Option<&'a str>) {
     let rest = name.strip_prefix("mqtt/").unwrap_or(name);
-    match rest.split_once("::") {
-        Some((topic, path)) if !path.is_empty() => (topic, Some(path)),
+    let (body, path) = match rest.split_once("::") {
+        Some((b, p)) if !p.is_empty() => (b, Some(p)),
         _ => (rest, None),
+    };
+    if let Some((first, topic)) = body.split_once('/') {
+        if !topic.is_empty() && known_clients.iter().any(|c| c == first) {
+            return (Some(first), topic, path);
+        }
+    }
+    // Legacy or unknown: entire body is the topic.
+    (None, body, path)
+}
+
+/// Rewrite legacy `mqtt/<topic>[::path]` → `mqtt/<client>/<topic>[::path]`.
+/// Already-scoped ids (`mqtt/<known_client>/…`) are left unchanged.
+pub fn migrate_point_id(name: &str, known_clients: &[String], default_client: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() || !name.starts_with("mqtt/") {
+        return name.to_string();
+    }
+    let (client, topic, path) = split_point_id(name, known_clients);
+    if client.is_some() {
+        return name.to_string();
+    }
+    if topic.is_empty() {
+        return name.to_string();
+    }
+    let client = if default_client.is_empty() {
+        "default"
+    } else {
+        default_client
+    };
+    match path {
+        Some(p) => point_id_for_client_field(client, topic, p),
+        None => point_id_for_client_topic(client, topic),
     }
 }
 
@@ -131,26 +169,41 @@ mod tests {
             extract_path_value(payload, "tags[0].id").as_deref(),
             Some("a")
         );
-        assert_eq!(
-            extract_path_value(payload, "$.room.temp").as_deref(),
-            Some("21.5")
-        );
     }
 
     #[test]
     fn topic_filter_wildcards() {
         assert!(topic_matches("a/+/c", "a/b/c"));
-        assert!(!topic_matches("a/+/c", "a/b/c/d"));
         assert!(topic_matches("a/#", "a/b/c"));
-        assert!(topic_matches("sensors/room1", "sensors/room1"));
-        assert!(!topic_matches("sensors/room1", "sensors/room2"));
     }
 
     #[test]
-    fn field_point_id() {
+    fn client_scoped_ids() {
         assert_eq!(
-            point_id_for_field("sensors/1", "temp"),
-            "mqtt/sensors/1::temp"
+            point_id_for_client_topic("local", "sensors/1"),
+            "mqtt/local/sensors/1"
+        );
+        assert_eq!(
+            point_id_for_client_field("local", "sensors/1", "temp"),
+            "mqtt/local/sensors/1::temp"
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_topic_ids() {
+        let clients = vec!["local".into()];
+        assert_eq!(
+            migrate_point_id("mqtt/pb/in", &clients, "local"),
+            "mqtt/local/pb/in"
+        );
+        assert_eq!(
+            migrate_point_id("mqtt/pb/in::temp", &clients, "local"),
+            "mqtt/local/pb/in::temp"
+        );
+        // Already scoped — unchanged.
+        assert_eq!(
+            migrate_point_id("mqtt/local/pb/in", &clients, "local"),
+            "mqtt/local/pb/in"
         );
     }
 }

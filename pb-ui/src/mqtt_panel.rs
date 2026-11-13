@@ -351,7 +351,7 @@ fn inputs_section(
     section(ui, "INPUTS — subscribe → points", p);
     ui.label(
         egui::RichText::new(
-            "Subscriptions create host points `mqtt/<client>/<topic>`. JSON paths create field points `…::path`.",
+            "Subscriptions create host points `mqtt/<client_name>/<topic>`. JSON paths create field points `mqtt/<client_name>/<topic>::<path>`.",
         )
         .font(font_ui(12.0))
         .color(p.muted),
@@ -408,7 +408,7 @@ fn inputs_section(
         field(ui, "JSON path", &mut c.draft_path, p);
         field(ui, "Point id", &mut c.draft_path_point, p);
         ui.label(
-            egui::RichText::new("Point id optional — default mqtt/<client>/<topic>::<path>")
+            egui::RichText::new("Point id optional — default mqtt/<client_name>/<topic>::<path>")
                 .font(font_ui(11.0))
                 .color(p.muted),
         );
