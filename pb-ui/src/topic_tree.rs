@@ -5,9 +5,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Color32, RichText, Sense, Stroke, Vec2};
+use egui::{Align2, Color32, Pos2, RichText, Rounding, Sense, Stroke, Vec2};
 
-use crate::theme::{font_ui, ThemePalette};
+use crate::theme::{font_ui, tint, ThemePalette};
 
 const FLASH_MS: u64 = 500;
 
@@ -147,21 +147,20 @@ fn paint_node(
             let id = ui.make_persistent_id(("pb_tt_open", id_salt, &child_path));
             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
                 .show_header(ui, |ui| {
-                    row_label(ui, seg, child, is_leaf, now, mode, p, &child_path, pick);
+                    // Parent headers: labels only (expand owns the row).
+                    row_contents(ui, seg, child, is_leaf, now, mode, p, &child_path, pick);
                 })
                 .body(|ui| {
                     paint_node(ui, child, child_path, id_salt, mode, now, p, pick);
                 });
         } else {
-            ui.horizontal(|ui| {
-                ui.add_space(18.0);
-                row_label(ui, seg, child, is_leaf, now, mode, p, &child_path, pick);
-            });
+            // Full-width leaf row so hover/click covers topic + payload.
+            paint_leaf_row(ui, seg, child, is_leaf, now, mode, p, &child_path, pick);
         }
     }
 }
 
-fn row_label(
+fn paint_leaf_row(
     ui: &mut egui::Ui,
     seg: &str,
     child: &TopicNode,
@@ -172,6 +171,48 @@ fn row_label(
     full_path: &str,
     pick: &mut Option<TreePick>,
 ) {
+    let row_h = ui.spacing().interact_size.y.max(16.0);
+    let w = ui.available_width().max(1.0);
+    let pickable = mode == TreeMode::PickTopic && is_leaf;
+    let sense = if pickable {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (row, resp) = ui.allocate_exact_size(Vec2::new(w, row_h), sense);
+    // Match inspector list hover: soft accent wash + hand on pickable leaves.
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(row, Rounding::same(4.0), tint(p.accent, 16));
+        if pickable {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    let mut x = row.min.x + 18.0;
+    paint_row_text(ui, row, &mut x, seg, child, is_leaf, now, p);
+    if pickable && resp.clicked() {
+        *pick = Some(TreePick {
+            topic: full_path.to_string(),
+            path: String::new(),
+        });
+    }
+    if pickable {
+        resp.on_hover_text("Click to bind topic → auto mqtt_N");
+    }
+}
+
+fn row_contents(
+    ui: &mut egui::Ui,
+    seg: &str,
+    child: &TopicNode,
+    is_leaf: bool,
+    now: Instant,
+    mode: TreeMode,
+    p: &ThemePalette,
+    full_path: &str,
+    pick: &mut Option<TreePick>,
+) {
+    let pickable = mode == TreeMode::PickTopic && is_leaf;
     let flash = child
         .flash_until
         .map(|until| until > now)
@@ -180,10 +221,17 @@ fn row_label(
     if flash {
         text = text.color(p.accent);
     }
-    let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
+    let sense = if pickable {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let resp = ui.add(egui::Label::new(text).sense(sense));
+    if pickable && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     if is_leaf {
         if let Some(payload) = child.last_payload.as_deref() {
-            // Small gap between topic segment and payload value.
             ui.add_space(8.0);
             let preview = truncate(payload, 40);
             ui.label(
@@ -193,14 +241,44 @@ fn row_label(
             );
         }
     }
-    if mode == TreeMode::PickTopic && is_leaf && resp.clicked() {
+    if pickable && resp.clicked() {
         *pick = Some(TreePick {
             topic: full_path.to_string(),
             path: String::new(),
         });
     }
-    if mode == TreeMode::PickTopic && is_leaf {
+    if pickable {
         resp.on_hover_text("Click to bind topic → auto mqtt_N");
+    }
+}
+
+fn paint_row_text(
+    ui: &mut egui::Ui,
+    row: egui::Rect,
+    x: &mut f32,
+    seg: &str,
+    child: &TopicNode,
+    is_leaf: bool,
+    now: Instant,
+    p: &ThemePalette,
+) {
+    let flash = child
+        .flash_until
+        .map(|until| until > now)
+        .unwrap_or(false);
+    let color = if flash { p.accent } else { p.text };
+    let galley = ui.fonts(|f| f.layout_no_wrap(seg.to_owned(), font_ui(12.5), color));
+    let pos = Pos2::new(*x, row.center().y - galley.size().y * 0.5);
+    *x += galley.size().x;
+    ui.painter().galley(pos, galley, color);
+    if is_leaf {
+        if let Some(payload) = child.last_payload.as_deref() {
+            *x += 8.0;
+            let preview = truncate(payload, 40);
+            let galley = ui.fonts(|f| f.layout_no_wrap(preview, font_ui(11.0), p.muted));
+            let pos = Pos2::new(*x, row.center().y - galley.size().y * 0.5);
+            ui.painter().galley(pos, galley, p.muted);
+        }
     }
 }
 
