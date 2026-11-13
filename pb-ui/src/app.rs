@@ -15,8 +15,8 @@ use crate::layout::{LayoutNode, SplitDir, TabGroup};
 use crate::panels;
 use crate::persist::{self, UiState};
 use crate::theme::{
-    self, font_semi, font_ui, tint, AppTheme, ThemePalette, BAR_H, HEADER_H, MIN_PANE, RADIUS,
-    RAIL_W, SEP, STATUS_H,
+    self, divider_bar, font_semi, font_ui, tint, AppTheme, ThemePalette, BAR_H, HEADER_H, MIN_PANE,
+    RADIUS, RAIL_W, SEP, STATUS_H,
 };
 
 /// Product slogan from earlier shell About copy (stashed WIP).
@@ -1505,21 +1505,6 @@ fn text_button(ui: &mut egui::Ui, label: &str, p: &ThemePalette) -> egui::Respon
             .rounding(Rounding::same(6.0))
             .stroke(Stroke::new(1.0, p.line)),
     )
-}
-
-/// A 2px bar centered in the gap, pulled in from both ends so it misses the rounded corners.
-fn divider_bar(gap: Rect, vertical_bar: bool) -> Rect {
-    const THICK: f32 = 2.0;
-    const INSET: f32 = 24.0;
-    if vertical_bar {
-        let inset = INSET.min(((gap.height() - 16.0) * 0.5).max(0.0));
-        let length = (gap.height() - inset * 2.0).max(THICK);
-        Rect::from_center_size(gap.center(), Vec2::new(THICK, length))
-    } else {
-        let inset = INSET.min(((gap.width() - 16.0) * 0.5).max(0.0));
-        let length = (gap.width() - inset * 2.0).max(THICK);
-        Rect::from_center_size(gap.center(), Vec2::new(length, THICK))
-    }
 }
 
 fn tile_splitter(
