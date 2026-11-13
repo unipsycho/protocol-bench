@@ -1,8 +1,8 @@
 //! Hub diagram. Each hub is a conversion point: sources in, then aggregate or calculate, outputs out. No protocol I/O.
 
 use egui::{
-    pos2, vec2, Align2, Color32, Id, Layout, Pos2, Rect, Rounding, ScrollArea, Sense, Shape,
-    Stroke, Ui, Vec2,
+    pos2, vec2, Align2, Color32, CursorIcon, Id, Layout, Pos2, Rect, Rounding, ScrollArea, Sense,
+    Shape, Stroke, Ui, Vec2,
 };
 
 use crate::dock::DockPane;
@@ -15,6 +15,14 @@ const HUB_H: f32 = 68.0;
 const GAP: f32 = 12.0;
 const COL_GAP: f32 = 52.0;
 const MARGIN: f32 = 40.0;
+const INSPECT_DEFAULT: f32 = 276.0;
+const INSPECT_MIN: f32 = 180.0;
+const DIAGRAM_MIN: f32 = 280.0;
+const INSPECT_SPLIT: f32 = 6.0;
+
+fn default_inspector_width() -> f32 {
+    INSPECT_DEFAULT
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HubProto {
@@ -134,6 +142,9 @@ pub struct HubModel {
     /// Set when a source or output node is the one showing details.
     #[serde(default)]
     pub selected_port: Option<u64>,
+    /// Width of the right-hand configure panel when the hubs view is wide enough.
+    #[serde(default = "default_inspector_width")]
+    pub inspector_width: f32,
     #[serde(default)]
     next_id: u64,
 }
@@ -151,6 +162,7 @@ impl HubModel {
             next_id: 20,
             selected: Some(1),
             selected_port: None,
+            inspector_width: INSPECT_DEFAULT,
             hubs: vec![
                 Hub {
                     id: 1,
@@ -238,6 +250,9 @@ impl HubModel {
         if self.selected.is_some_and(|id| self.hub(id).is_none()) {
             self.selected = self.hubs.first().map(|hub| hub.id);
             self.selected_port = None;
+        }
+        if !self.inspector_width.is_finite() || self.inspector_width < INSPECT_MIN {
+            self.inspector_width = INSPECT_DEFAULT;
         }
         self.keep_focus();
     }
@@ -823,13 +838,29 @@ pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
     ui.add_space(8.0);
     let wide = ui.available_width() > 760.0;
     if wide {
-        let inspect_w = 276.0;
-        let gap = 10.0;
-        let diagram_w = (ui.available_width() - inspect_w - gap).max(280.0);
+        let gap = INSPECT_SPLIT;
+        let total = ui.available_width();
         let height = ui.available_height().max(160.0);
+        let max_inspect = (total - gap - DIAGRAM_MIN).max(INSPECT_MIN);
+        let inspect_w = model.inspector_width.clamp(INSPECT_MIN, max_inspect);
+        let diagram_w = (total - inspect_w - gap).max(DIAGRAM_MIN);
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
+            ui.spacing_mut().item_spacing.x = 0.0;
             change = change.join(diagram_view(ui, model, diagram_w, height, p));
+            match hub_inspect_splitter(ui, height, gap, p) {
+                SplitCmd::Reset => {
+                    model.inspector_width = INSPECT_DEFAULT.clamp(INSPECT_MIN, max_inspect);
+                    change.dirty = true;
+                }
+                SplitCmd::Delta(delta) => {
+                    let next = (model.inspector_width - delta).clamp(INSPECT_MIN, max_inspect);
+                    if (next - model.inspector_width).abs() > 0.01 {
+                        model.inspector_width = next;
+                        change.dirty = true;
+                    }
+                }
+                SplitCmd::Idle => {}
+            }
             change = change.join(inspector(ui, model, inspect_w, height, p));
         });
     } else {
@@ -845,6 +876,35 @@ pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
         ));
     }
     change
+}
+
+enum SplitCmd {
+    Idle,
+    Delta(f32),
+    Reset,
+}
+
+/// Vertical drag bar between the hub canvas and the properties panel.
+fn hub_inspect_splitter(ui: &mut Ui, height: f32, gap: f32, p: &ThemePalette) -> SplitCmd {
+    let (rect, resp) = ui.allocate_exact_size(vec2(gap, height), Sense::click_and_drag());
+    let fill = if resp.hovered() || resp.dragged() {
+        p.accent
+    } else {
+        tint(p.line, 153)
+    };
+    let bar = Rect::from_center_size(rect.center(), vec2(2.0, (height - 8.0).max(2.0)));
+    ui.painter()
+        .rect_filled(bar, Rounding::same(1.0), fill);
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+    }
+    if resp.double_clicked() {
+        return SplitCmd::Reset;
+    }
+    if resp.dragged() {
+        return SplitCmd::Delta(resp.drag_delta().x);
+    }
+    SplitCmd::Idle
 }
 
 fn legend(ui: &mut Ui, p: &ThemePalette) {

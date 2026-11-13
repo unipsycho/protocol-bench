@@ -20,7 +20,8 @@ fn main() -> eframe::Result<()> {
         .with_inner_size([1600.0, 980.0])
         .with_min_inner_size([1200.0, 760.0])
         .with_app_id("protocol-bench")
-        .with_title(format!("Protocol Bench  {}", env!("CARGO_PKG_VERSION")));
+        // Product name only — Omarchy/Hyprland groups by title; version lives in About.
+        .with_title("Protocol Bench");
 
     // Vsync swap waits on a Wayland frame callback. Hyprland does not send one
     // for a window on another workspace, so the wait blocks the event loop and
