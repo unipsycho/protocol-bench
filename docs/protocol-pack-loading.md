@@ -1,6 +1,6 @@
 # Protocol Bench — loading protocol packs into a free core
 
-Date: 2026-11-13. Status: **settled — Option A (plugin ABI)**. Complements [free-vs-paid-isolation.md](free-vs-paid-isolation.md) and PRD Settled #1 / #9 / #12.
+Date: 2026-11-13. Status: **settled — Option A (plugin ABI)**. Complements [free-vs-paid-isolation.md](free-vs-paid-isolation.md) and PRD Settled #1 / #9 / #12 / #13.
 
 ## Verdict
 
@@ -15,7 +15,7 @@ Pack ships as `pb_modbus.so` / `pb_modbus.dll` (etc.). Core uses `libloading`, c
 **Pros**
 
 - One service process; lowest latency; same thread model as today’s engine slots.
-- Matches “driver pack” mental model; installer can drop files into a module dir.
+- Matches “driver pack” mental model; Windows MSI (`cargo-wix` / WiX) drops files into the module dir beside service + UI.
 - Paid code stays off the core disk until purchase / entitlement download.
 
 **Cons**
@@ -50,15 +50,15 @@ All engines compile into the free install; a signed entitlement list unlocks pai
 
 ## Installer + license server flow
 
-1. User installs **core** (installer / bare binary) — service + UI; packs per entitlement.
+1. User installs **core** on Windows via **MSI (WiX / `cargo-wix`)** — **service + UI + module dir** (Linux installer later / TBD). Upgrades must **preserve config, licenses, and packs**.
 2. App **login / activate** against the central license server (PC transfer, enterprise accounts later).
 3. Server returns **entitlements** (pack IDs + expiry / seats) — the license defines which protocols/packs the customer gets (**no fixed free list**).
-4. App **downloads signed pack artifacts** for those entitlements.
+4. App **downloads signed pack artifacts** for those entitlements (same license-server path as product updates: **manifest + signed downloads** — installer choice does not replace updates).
 5. Service **verifies signature** (and ABI version) before accepting the file.
 6. Packs land in a known **module directory** (`…/protocol-bench/modules/` or beside the install).
 7. On start (or after download), the **service** **registers engines** from verified packs into the `pb-engine` registry.
 
-Offline after purchase: verify local signature + cached entitlement; phone-home for renewals / transfer with ~**7-day** offline grace (not a strict check on every operation). Installer / auto-updater still TBD (PRD Still open #9).
+Offline after purchase: verify local signature + cached entitlement; phone-home for renewals / transfer with ~**7-day** offline grace (not a strict check on every operation). Windows installer settled (PRD Settled #13); auto-updater poll / UX and Linux install channel still TBD (PRD Still open #9).
 
 ## What stays in core vs pack
 
@@ -84,7 +84,7 @@ Hub canvas and points store never live in the pack. Packs speak into the service
 4. **Defer Option B** (pack sidecars) unless pack crashes or hostile third-party packs force process isolation.
 5. **Do not** implement Option C as the paid-IP path.
 
-No packaging or license-server code in this pass — design only. Remaining open: installer / auto-updater (and further license-server product details). Offline grace (~7 days) is settled.
+No packaging or license-server code in this pass — design only. Windows MSI via WiX / `cargo-wix` is settled (PRD Settled #13). Remaining open: auto-updater poll / UX, Linux installer (later / TBD), and further license-server product details. Offline grace (~7 days) is settled.
 
 ## Open questions
 
@@ -92,4 +92,5 @@ No packaging or license-server code in this pass — design only. Remaining open
 2. ~~**Free pack list**~~ — **settled:** no fixed free list; entitlement-driven (PRD Settled #9).
 3. ~~**Offline grace**~~ — **settled:** ~7 days (phone-home; not every check).
 4. **Windows DLL load rules** — SafeDllSearchMode, install-dir vs `%LOCALAPPDATA%` modules, and whether packs need Authenticode in addition to app-level ed25519 signatures?
-5. **Installer / auto-updater** — still TBD (PRD Still open #9).
+5. ~~**Windows installer**~~ — **settled:** MSI via WiX / `cargo-wix` (not Inno Setup); service + UI + module dir; preserve config / licenses / packs on upgrade (PRD Settled #13).
+6. **Auto-updater / Linux install** — update poll / UX and Linux channel still TBD (PRD Still open #9); updates remain license-server manifest + signed downloads.

@@ -136,10 +136,11 @@ Recorded 2026-11-13 from Mike’s answers (numbering matches the former Open dec
 10. **Modbus Bench** — Protocol Bench is a new, separate product; can be tested with Modbus Bench.
 11. **File parsers** — CSV and JSON lines stay the first-build set.
 12. **Language** — Protocol Bench service + UI remain Rust. Online license server can also be Rust; Cloudflare Workers + workers-rs is a viable host for a license API (see [Runtime](#runtime)).
+13. **Windows installer** — **MSI via WiX**, driven from the Rust repo with **`cargo-wix`** (not Inno Setup). Chosen for IT-friendly deploys (GPO / SCCM / silent install, standard Add/Remove Programs). Layout installs **service + UI + module dir**; upgrades must **preserve config, licenses, and packs**. Product **updates** stay on the Rust **license server** path (manifest + signed downloads) — the installer choice does not replace that. **Linux installer** is later / TBD and is not blocking.
 
 ## Still open
 
-9. **License / packs — remaining details** — architecture, entitlements, and ~7-day offline grace are settled (see Settled #1, #9, #12). Still open: **installer** and **auto-updater** details (and any further license-server product details beyond the Runtime note). Do not implement packaging or license-server code until those land.
+9. **License / packs — remaining details** — architecture, entitlements, ~7-day offline grace, and the Windows MSI/`cargo-wix` installer are settled (see Settled #1, #9, #12, #13). Still open: **auto-updater** poll / UX details, **Linux** install channel (later / TBD), and any further license-server product details beyond the Runtime note. Do not implement packaging or license-server code until those residual pieces land.
 
 ## Polish still in front of us
 
