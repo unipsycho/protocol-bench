@@ -79,7 +79,7 @@ struct PointsCols {
 
 impl PointsCols {
     fn from_width(avail: f32) -> Self {
-        const GAP: f32 = 10.0;
+        const GAP: f32 = 5.0;
         const DOT: f32 = 12.0;
         const NAME: f32 = 78.0;
         const VALUE: f32 = 78.0;
