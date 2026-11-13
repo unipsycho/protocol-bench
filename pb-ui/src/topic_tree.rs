@@ -40,14 +40,6 @@ impl TopicNode {
     pub fn is_empty(&self) -> bool {
         self.children.is_empty()
     }
-
-    pub fn subtree_message_count(&self) -> u64 {
-        let mut total = self.message_count;
-        for child in self.children.values() {
-            total = total.saturating_add(child.subtree_message_count());
-        }
-        total
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -108,6 +100,9 @@ pub fn paint(
     }
     let now = Instant::now();
     let mut pick = None;
+    // No group guide lines in the topic tree.
+    let prev_vline = ui.visuals().indent_has_left_vline;
+    ui.visuals_mut().indent_has_left_vline = false;
     paint_node(
         ui,
         &tree.root,
@@ -119,6 +114,7 @@ pub fn paint(
         p,
         &mut pick,
     );
+    ui.visuals_mut().indent_has_left_vline = prev_vline;
     pick
 }
 
@@ -197,27 +193,12 @@ fn row_label(
     let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
     if is_leaf {
         if let Some(payload) = child.last_payload.as_deref() {
+            // Small gap between topic segment and payload value.
+            ui.add_space(8.0);
             let preview = truncate(payload, 40);
             ui.label(
                 RichText::new(preview)
                     .font(font_ui(11.0))
-                    .color(p.muted),
-            );
-        }
-        let count = child.message_count;
-        if count > 0 {
-            ui.label(
-                RichText::new(format!("×{count}"))
-                    .font(font_ui(10.5))
-                    .color(p.muted),
-            );
-        }
-    } else {
-        let n = child.subtree_message_count();
-        if n > 0 {
-            ui.label(
-                RichText::new(format!("({n})"))
-                    .font(font_ui(10.5))
                     .color(p.muted),
             );
         }
