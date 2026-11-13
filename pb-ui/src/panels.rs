@@ -244,7 +244,16 @@ fn project_panel(ui: &mut egui::Ui, hubs: &HubModel, p: &ThemePalette) {
 }
 
 fn hub_names(hubs: &HubModel) -> Vec<String> {
-    hubs.hubs.iter().map(|hub| hub.name.clone()).collect()
+    hubs.hubs
+        .iter()
+        .map(|hub| {
+            let proto = hub
+                .protocol
+                .map(|p| p.label())
+                .unwrap_or("Split");
+            format!("{} ({})", hub.name, proto)
+        })
+        .collect()
 }
 
 fn step_names(hubs: &HubModel, aggregator: bool) -> Vec<String> {
