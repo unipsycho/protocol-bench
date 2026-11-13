@@ -1,8 +1,8 @@
-//! Shared full-width point list rows.
+//! Shared Points table (headers + columns + live values).
 //!
 //! Used by the Points panel (all points) and Hub Input binds (this node).
 
-use egui::{Align2, Color32, FontId, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
+use egui::{Align2, Color32, FontId, Id, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
 use pb_engine::PointSnapshot;
 
 use crate::theme::{font_ui, tint, ThemePalette};
@@ -15,6 +15,31 @@ const VALUE: f32 = 78.0;
 const UPDATED: f32 = 110.0;
 const REMOVE: f32 = 18.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PointsSort {
+    #[default]
+    Name,
+    Value,
+    Source,
+    Updated,
+}
+
+/// Sort state for a Points table instance (panel or Input binds).
+#[derive(Debug, Clone)]
+pub struct PointsTableState {
+    pub sort: PointsSort,
+    pub ascending: bool,
+}
+
+impl Default for PointsTableState {
+    fn default() -> Self {
+        Self {
+            sort: PointsSort::Name,
+            ascending: true,
+        }
+    }
+}
+
 /// Column geometry for the full Points table.
 #[derive(Clone, Copy)]
 pub struct PointsCols {
@@ -25,12 +50,16 @@ pub struct PointsCols {
     value: f32,
     source: f32,
     updated: f32,
+    remove: f32,
 }
 
 impl PointsCols {
-    pub fn from_width(avail: f32) -> Self {
+    pub fn from_width(avail: f32, with_remove: bool) -> Self {
+        let remove = if with_remove { REMOVE } else { 0.0 };
         let row_w = avail.max(1.0);
-        let source = (row_w - DOT - NAME - VALUE - UPDATED - GAP * 4.0).max(48.0);
+        let source = (row_w - DOT - NAME - VALUE - UPDATED - remove - GAP * 4.0
+            - if with_remove { GAP } else { 0.0 })
+        .max(40.0);
         Self {
             row_w,
             gap: GAP,
@@ -39,10 +68,11 @@ impl PointsCols {
             value: VALUE,
             source,
             updated: UPDATED,
+            remove,
         }
     }
 
-    pub fn cell_rects(&self, row: Rect) -> (Rect, Rect, Rect, Rect, Rect) {
+    pub fn cell_rects(&self, row: Rect) -> (Rect, Rect, Rect, Rect, Rect, Option<Rect>) {
         let y0 = row.min.y;
         let y1 = row.max.y;
         let mut x = row.min.x;
@@ -55,35 +85,53 @@ impl PointsCols {
         let source = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.source, y1));
         x += self.source + self.gap;
         let updated = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.updated, y1));
-        (dot, name, value, source, updated)
+        x += self.updated;
+        let remove = if self.remove > 0.0 {
+            x += self.gap;
+            Some(Rect::from_min_max(
+                Pos2::new(x, y0),
+                Pos2::new(x + self.remove, y1),
+            ))
+        } else {
+            None
+        };
+        (dot, name, value, source, updated, remove)
     }
 }
 
-/// Compact id | source row (Hub Input binds, optional Points subset).
-#[derive(Clone, Copy)]
-pub struct IdSourceCols {
-    pub row_w: f32,
-    id: f32,
-    source: f32,
-    remove: f32,
+/// One painted row (live host point or pending Input bind).
+#[derive(Clone, Debug)]
+pub struct PointsTableRow {
+    pub id: String,
+    pub source: String,
+    pub value: String,
+    pub quality: String,
+    pub updated: String,
+    pub updated_ms: u64,
+    /// When set, × removes / click edits this bind index on the Input node.
+    pub bind_index: Option<usize>,
+    /// Topic / JSON path for Manual edit fill (Input binds only).
+    pub topic: String,
+    pub path: String,
 }
 
-impl IdSourceCols {
-    pub fn from_width(avail: f32, with_remove: bool) -> Self {
-        let row_w = avail.max(1.0);
-        let remove = if with_remove { REMOVE } else { 0.0 };
-        let id = NAME.max(64.0);
-        let source = (row_w - id - GAP - remove).max(48.0);
+impl PointsTableRow {
+    pub fn from_snapshot(point: &PointSnapshot) -> Self {
         Self {
-            row_w,
-            id,
-            source,
-            remove,
+            id: point.name.clone(),
+            source: point.source.clone(),
+            value: point.value.clone(),
+            quality: point.quality.clone(),
+            updated: format_updated(point.updated_ms),
+            updated_ms: point.updated_ms,
+            bind_index: None,
+            topic: String::new(),
+            path: String::new(),
         }
     }
 }
 
-/// One row's display fields (Points panel or Input bind).
+/// One row's display fields for painters that borrow.
 #[derive(Clone, Copy)]
 pub struct PointRowRef<'a> {
     pub id: &'a str,
@@ -94,13 +142,13 @@ pub struct PointRowRef<'a> {
 }
 
 impl<'a> PointRowRef<'a> {
-    pub fn from_snapshot(point: &'a PointSnapshot, updated: &'a str) -> Self {
+    pub fn from_table_row(row: &'a PointsTableRow) -> Self {
         Self {
-            id: point.name.as_str(),
-            source: point.source.as_str(),
-            value: Some(point.value.as_str()),
-            quality: Some(point.quality.as_str()),
-            updated: Some(updated),
+            id: row.id.as_str(),
+            source: row.source.as_str(),
+            value: Some(row.value.as_str()),
+            quality: Some(row.quality.as_str()),
+            updated: Some(row.updated.as_str()),
         }
     }
 }
@@ -108,17 +156,210 @@ impl<'a> PointRowRef<'a> {
 #[derive(Clone, Copy, Default)]
 pub struct PointRowAction {
     pub remove_clicked: bool,
+    pub row_clicked: bool,
 }
 
-/// Full Points table data row (quality · id · value · source · updated).
+#[derive(Clone, Copy, Default)]
+pub struct PointsTableAction {
+    pub remove: Option<usize>,
+    /// Bind index when a data row (not ×) is clicked — Input Manual edit.
+    pub row_clicked: Option<usize>,
+}
+
+/// Sort + paint the shared Points table.
+pub fn paint_points_table(
+    ui: &mut egui::Ui,
+    rows: &mut [PointsTableRow],
+    state: &mut PointsTableState,
+    p: &ThemePalette,
+    id_salt: impl Into<Id>,
+    with_remove: bool,
+) -> PointsTableAction {
+    let id_salt = id_salt.into();
+    sort_table_rows(rows, state);
+
+    let cols = PointsCols::from_width(ui.available_width(), with_remove);
+    ui.set_min_width(cols.row_w);
+
+    if let Some(col) = paint_points_header(ui, cols, state, p, id_salt) {
+        if state.sort == col {
+            state.ascending = !state.ascending;
+        } else {
+            state.sort = col;
+            state.ascending = true;
+        }
+        sort_table_rows(rows, state);
+    }
+    ui.add_space(2.0);
+    ui.separator();
+    ui.add_space(1.0);
+
+    let mut out = PointsTableAction::default();
+    for row in rows.iter() {
+        let action = paint_full_row(ui, cols, PointRowRef::from_table_row(row), p, row.bind_index);
+        if action.remove_clicked {
+            out.remove = row.bind_index;
+        } else if action.row_clicked {
+            out.row_clicked = row.bind_index;
+        }
+    }
+    out
+}
+
+/// Load/store sort state in egui memory (Hub Input inspector).
+pub fn table_state_for(ui: &egui::Ui, id_salt: impl Into<Id>) -> PointsTableState {
+    let id = Id::new(("pb_pts_tbl", id_salt.into()));
+    ui.ctx()
+        .data(|d| d.get_temp::<PointsTableState>(id))
+        .unwrap_or_default()
+}
+
+pub fn store_table_state(ui: &egui::Ui, id_salt: impl Into<Id>, state: PointsTableState) {
+    let id = Id::new(("pb_pts_tbl", id_salt.into()));
+    ui.ctx().data_mut(|d| d.insert_temp(id, state));
+}
+
+fn sort_table_rows(rows: &mut [PointsTableRow], state: &PointsTableState) {
+    rows.sort_by(|a, b| {
+        let ord = match state.sort {
+            PointsSort::Name => a.id.cmp(&b.id),
+            PointsSort::Value => a.value.cmp(&b.value),
+            PointsSort::Source => a.source.cmp(&b.source),
+            PointsSort::Updated => a.updated_ms.cmp(&b.updated_ms),
+        };
+        if state.ascending {
+            ord
+        } else {
+            ord.reverse()
+        }
+    });
+}
+
+fn sort_mark(state: &PointsTableState, col: PointsSort) -> &'static str {
+    if state.sort != col {
+        return "";
+    }
+    if state.ascending {
+        " ▲"
+    } else {
+        " ▼"
+    }
+}
+
+fn paint_points_header(
+    ui: &mut egui::Ui,
+    cols: PointsCols,
+    state: &PointsTableState,
+    p: &ThemePalette,
+    id_salt: Id,
+) -> Option<PointsSort> {
+    let (row, _) = ui.allocate_exact_size(Vec2::new(cols.row_w, ROW_H), Sense::hover());
+    let (_dot, name_r, value_r, source_r, updated_r, _rm) = cols.cell_rects(row);
+    let font = font_ui(10.5);
+    let mut clicked = None;
+
+    if header_label(
+        ui,
+        name_r,
+        &format!("NAME{}", sort_mark(state, PointsSort::Name)),
+        &font,
+        p,
+        false,
+        id_salt.with("name"),
+    )
+    .clicked()
+    {
+        clicked = Some(PointsSort::Name);
+    }
+    if header_label(
+        ui,
+        value_r,
+        &format!("VALUE{}", sort_mark(state, PointsSort::Value)),
+        &font,
+        p,
+        false,
+        id_salt.with("value"),
+    )
+    .clicked()
+    {
+        clicked = Some(PointsSort::Value);
+    }
+    if header_label(
+        ui,
+        source_r,
+        &format!("SOURCE{}", sort_mark(state, PointsSort::Source)),
+        &font,
+        p,
+        false,
+        id_salt.with("source"),
+    )
+    .clicked()
+    {
+        clicked = Some(PointsSort::Source);
+    }
+    if header_label(
+        ui,
+        updated_r,
+        &format!("UPDATED{}", sort_mark(state, PointsSort::Updated)),
+        &font,
+        p,
+        true,
+        id_salt.with("updated"),
+    )
+    .clicked()
+    {
+        clicked = Some(PointsSort::Updated);
+    }
+    clicked
+}
+
+fn header_label(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    text: &str,
+    font: &FontId,
+    p: &ThemePalette,
+    right: bool,
+    id: Id,
+) -> egui::Response {
+    let resp = ui.interact(rect, id, Sense::click());
+    let align = if right {
+        Align2::RIGHT_CENTER
+    } else {
+        Align2::LEFT_CENTER
+    };
+    let pos = if right {
+        Pos2::new(rect.max.x, rect.center().y)
+    } else {
+        Pos2::new(rect.min.x, rect.center().y)
+    };
+    let color = if resp.hovered() { p.accent } else { p.muted };
+    ui.painter().text(pos, align, text, font.clone(), color);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Full Points table data row (quality · id · value · source · updated [· ×]).
 pub fn paint_full_row(
     ui: &mut egui::Ui,
     cols: PointsCols,
     row: PointRowRef<'_>,
     p: &ThemePalette,
-) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(cols.row_w, ROW_H), Sense::hover());
-    let (dot_r, name_r, value_r, source_r, updated_r) = cols.cell_rects(rect);
+    bind_index: Option<usize>,
+) -> PointRowAction {
+    let sense = if bind_index.is_some() {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(cols.row_w, ROW_H), sense);
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, Rounding::same(4.0), tint(p.accent, 12));
+        if bind_index.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    let (dot_r, name_r, value_r, source_r, updated_r, remove_r) = cols.cell_rects(rect);
 
     if let Some(quality) = row.quality {
         paint_quality_dot(ui, dot_r, quality, row.id, p);
@@ -134,62 +375,22 @@ pub fn paint_full_row(
             font.clone(),
             p.text,
             false,
-        );
+        )
+        .on_hover_text(value);
     }
     let max_chars = ((cols.source / 7.0) as usize).max(6);
     let shown = truncate_keep_end(row.source, max_chars);
-    paint_cell_text(ui, source_r, &shown, font.clone(), p.muted, false)
-        .on_hover_text(row.source);
+    paint_cell_text(ui, source_r, &shown, font.clone(), p.muted, false).on_hover_text(row.source);
     if let Some(updated) = row.updated {
         paint_cell_text(ui, updated_r, updated, font, p.muted, true);
     }
-}
-
-/// Full-width id (left) + source path (right); optional trailing × for binds.
-pub fn paint_id_source_row(
-    ui: &mut egui::Ui,
-    cols: IdSourceCols,
-    row: PointRowRef<'_>,
-    p: &ThemePalette,
-) -> PointRowAction {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(cols.row_w, ROW_H), Sense::hover());
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, Rounding::same(4.0), tint(p.accent, 12));
-    }
-
-    let y0 = rect.min.y;
-    let y1 = rect.max.y;
-    let mut x = rect.min.x;
-    let id_r = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + cols.id, y1));
-    x += cols.id + GAP;
-    let source_r = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + cols.source, y1));
-    x += cols.source;
-    let remove_r = if cols.remove > 0.0 {
-        Some(Rect::from_min_max(
-            Pos2::new(x, y0),
-            Pos2::new(x + cols.remove, y1),
-        ))
-    } else {
-        None
-    };
-
-    let font = font_ui(12.0);
-    paint_cell_text(ui, id_r, row.id, font.clone(), p.text, false);
-    let max_chars = ((cols.source / 7.0) as usize).max(6);
-    let shown = truncate_keep_end(row.source, max_chars);
-    paint_cell_text(ui, source_r, &shown, font, p.muted, false).on_hover_text(row.source);
 
     let mut action = PointRowAction::default();
-    if let Some(r) = remove_r {
-        let click = ui.interact(r, ui.id().with(("rm", row.id, row.source)), Sense::click());
-        let fill = if click.hovered() {
-            tint(p.accent, 20)
-        } else {
-            Color32::TRANSPARENT
-        };
-        if fill.a() > 0 {
-            ui.painter().rect_filled(r, Rounding::same(4.0), fill);
+    if let (Some(r), Some(bi)) = (remove_r, bind_index) {
+        let click = ui.interact(r, ui.id().with(("rm", bi, row.id)), Sense::click());
+        if click.hovered() {
+            ui.painter()
+                .rect_filled(r, Rounding::same(4.0), tint(p.accent, 20));
         }
         ui.painter().text(
             r.center(),
@@ -202,6 +403,12 @@ pub fn paint_id_source_row(
             action.remove_clicked = true;
         }
         click.on_hover_cursor(egui::CursorIcon::PointingHand);
+    } else if bind_index.is_some() && resp.clicked() {
+        action.row_clicked = true;
+        resp.clone().on_hover_text("Edit topic in Manual");
+    }
+    if bind_index.is_some() && !action.remove_clicked {
+        resp.on_hover_text("Click to edit topic in Manual");
     }
     action
 }
@@ -223,44 +430,65 @@ pub fn mqtt_bind_source(conn: &str, topic: &str, path: &str) -> String {
     }
 }
 
-/// Resolve display id + source for one Input bind against live host points.
-pub fn resolve_input_bind_row<'a>(
-    bind_point: &'a str,
-    source: &'a str,
+/// Build table rows for one Input node's binds (live host points + pending placeholders).
+pub fn rows_for_input_binds(
+    conn: &str,
+    binds: &[(String, String, String)],
+    host_points: &[PointSnapshot],
+) -> Vec<PointsTableRow> {
+    // binds: (point, topic, path)
+    let mut out = Vec::with_capacity(binds.len());
+    for (i, (point, topic, path)) in binds.iter().enumerate() {
+        let source = mqtt_bind_source(conn, topic, path);
+        if let Some(pt) = find_live_point(point, &source, host_points) {
+            let mut row = PointsTableRow::from_snapshot(pt);
+            row.bind_index = Some(i);
+            row.topic = topic.clone();
+            row.path = path.clone();
+            // Prefer short id when host already remapped.
+            if !is_short_point_id(&row.id) && !point.trim().is_empty() {
+                row.id = point.clone();
+            } else if !is_short_point_id(&row.id) {
+                row.id = "mqtt_N".into();
+            }
+            if !row.source.starts_with("mqtt/") {
+                row.source = source;
+            }
+            out.push(row);
+        } else {
+            out.push(PointsTableRow {
+                id: if point.trim().is_empty() {
+                    "mqtt_N".into()
+                } else {
+                    point.clone()
+                },
+                source,
+                value: "—".into(),
+                quality: "uncertain".into(),
+                updated: "—".into(),
+                updated_ms: 0,
+                bind_index: Some(i),
+                topic: topic.clone(),
+                path: path.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn find_live_point<'a>(
+    bind_point: &str,
+    source: &str,
     host_points: &'a [PointSnapshot],
-) -> (String, &'a str) {
-    let live = host_points.iter().find(|pt| {
+) -> Option<&'a PointSnapshot> {
+    host_points.iter().find(|pt| {
         pt.source == source
             || (!bind_point.trim().is_empty() && pt.name == bind_point)
             || pt.name == source
-    });
-    let id = if let Some(pt) = live {
-        if is_short_point_id(&pt.name) {
-            pt.name.clone()
-        } else if !bind_point.trim().is_empty() {
-            bind_point.to_string()
-        } else {
-            "mqtt_N".into()
-        }
-    } else if !bind_point.trim().is_empty() {
-        bind_point.to_string()
-    } else {
-        "mqtt_N".into()
-    };
-    let shown_source = live
-        .map(|pt| {
-            if pt.source.starts_with("mqtt/") {
-                pt.source.as_str()
-            } else {
-                source
-            }
-        })
-        .unwrap_or(source);
-    (id, shown_source)
+    })
 }
 
 fn is_short_point_id(name: &str) -> bool {
-    // mqtt_1 / opc_12 — proto + '_' + digits
     let Some((proto, rest)) = name.split_once('_') else {
         return false;
     };
@@ -298,7 +526,8 @@ pub fn paint_cell_text(
 ) -> egui::Response {
     let resp = ui.interact(
         rect,
-        ui.id().with(("cell", rect.min.x.to_bits(), rect.min.y.to_bits(), text)),
+        ui.id()
+            .with(("cell", rect.min.x.to_bits(), rect.min.y.to_bits(), text)),
         Sense::hover(),
     );
     let painter = ui.painter().with_clip_rect(rect);
@@ -336,5 +565,57 @@ pub fn truncate_chars(value: &str, max_chars: usize) -> String {
         let mut out: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+pub fn format_updated(updated_ms: u64) -> String {
+    if updated_ms == 0 {
+        return "—".into();
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(updated_ms);
+    let age_secs = now_ms.saturating_sub(updated_ms) / 1000;
+
+    // Fresh samples read as live.
+    if age_secs < 5 {
+        return "just now".into();
+    }
+
+    const WEEK_SECS: u64 = 7 * 24 * 3600;
+    if age_secs < WEEK_SECS {
+        if age_secs < 60 {
+            return format!(
+                "{} second{} ago",
+                age_secs,
+                if age_secs == 1 { "" } else { "s" }
+            );
+        }
+        let minutes = age_secs / 60;
+        if minutes < 60 {
+            return format!(
+                "{} minute{} ago",
+                minutes,
+                if minutes == 1 { "" } else { "s" }
+            );
+        }
+        // ≥1h and <1 week: hours only (including multi-day ages).
+        let hours = age_secs / 3600;
+        return format!(
+            "{} hour{} ago",
+            hours,
+            if hours == 1 { "" } else { "s" }
+        );
+    }
+
+    // Older than a week: local date + time to the minute.
+    let secs = (updated_ms / 1000) as i64;
+    match chrono::DateTime::from_timestamp(secs, 0) {
+        Some(utc) => utc
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string(),
+        None => "—".into(),
     }
 }

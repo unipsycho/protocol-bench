@@ -1,40 +1,30 @@
 //! Pane bodies. Tables are empty on purpose: this build does not read or write a link.
 //! MQTT lives in `mqtt_panel` (connections); hub Input/Output nodes own point binds.
 
-use egui::{Align2, Color32, FontId, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
-use pb_engine::{EngineHandle, HostSnapshot, PointSnapshot};
+use egui::{Align2, Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
+use pb_engine::{EngineHandle, HostSnapshot};
 
 use crate::art;
 use crate::dock::DockPane;
 use crate::hubs::HubModel;
 use crate::mqtt_panel::{self, MqttPanelState};
-use crate::point_rows::{self, PointRowRef, PointsCols};
+use crate::point_rows::{self, PointsTableRow, PointsTableState};
 use crate::theme::{font_semi, font_ui, scope, tint, ThemePalette};
 
 /// Points panel filter + sort (session UI state).
 #[derive(Debug, Clone)]
 pub struct PointsPanelState {
     pub filter: String,
-    pub sort: PointsSort,
-    pub ascending: bool,
+    pub table: PointsTableState,
 }
 
 impl Default for PointsPanelState {
     fn default() -> Self {
         Self {
             filter: String::new(),
-            sort: PointsSort::Name,
-            ascending: true,
+            table: PointsTableState::default(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PointsSort {
-    Name,
-    Value,
-    Source,
-    Updated,
 }
 
 /// Fill the pane body for one dock leaf.
@@ -138,7 +128,7 @@ fn points_panel_body(
     }
 
     let filter = state.filter.trim().to_ascii_lowercase();
-    let mut rows: Vec<&PointSnapshot> = host
+    let mut rows: Vec<PointsTableRow> = host
         .points
         .iter()
         .filter(|pt| {
@@ -148,21 +138,8 @@ fn points_panel_body(
             pt.name.to_ascii_lowercase().contains(&filter)
                 || pt.source.to_ascii_lowercase().contains(&filter)
         })
+        .map(PointsTableRow::from_snapshot)
         .collect();
-
-    rows.sort_by(|a, b| {
-        let ord = match state.sort {
-            PointsSort::Name => a.name.cmp(&b.name),
-            PointsSort::Value => a.value.cmp(&b.value),
-            PointsSort::Source => a.source.cmp(&b.source),
-            PointsSort::Updated => a.updated_ms.cmp(&b.updated_ms),
-        };
-        if state.ascending {
-            ord
-        } else {
-            ord.reverse()
-        }
-    });
 
     if rows.is_empty() {
         ui.label(
@@ -173,197 +150,20 @@ fn points_panel_body(
         return;
     }
 
-    let updated: Vec<String> = rows
-        .iter()
-        .map(|pt| format_updated(pt.updated_ms))
-        .collect();
-
-    // Compute column table once from the outer width, then lock it for header+rows.
-    let cols = PointsCols::from_width(ui.available_width());
-
     egui::ScrollArea::vertical()
         .id_salt("pb_points_live")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.set_min_width(cols.row_w);
-            let header_clicked = paint_points_header(ui, cols, state, p);
-            if let Some(col) = header_clicked {
-                if state.sort == col {
-                    state.ascending = !state.ascending;
-                } else {
-                    state.sort = col;
-                    state.ascending = true;
-                }
-            }
-            ui.add_space(2.0);
-            ui.separator();
-            ui.add_space(1.0);
-
-            for (i, point) in rows.iter().enumerate() {
-                point_rows::paint_full_row(
-                    ui,
-                    cols,
-                    PointRowRef::from_snapshot(point, &updated[i]),
-                    p,
-                );
-            }
+            let _action = point_rows::paint_points_table(
+                ui,
+                &mut rows,
+                &mut state.table,
+                p,
+                "points-panel",
+                false,
+            );
         });
 }
-
-fn sort_mark(state: &PointsPanelState, col: PointsSort) -> &'static str {
-    if state.sort != col {
-        return "";
-    }
-    if state.ascending {
-        " ▲"
-    } else {
-        " ▼"
-    }
-}
-
-fn paint_points_header(
-    ui: &mut egui::Ui,
-    cols: PointsCols,
-    state: &PointsPanelState,
-    p: &ThemePalette,
-) -> Option<PointsSort> {
-    let (row, _) = ui.allocate_exact_size(Vec2::new(cols.row_w, 18.0), Sense::hover());
-    let (_dot, name_r, value_r, source_r, updated_r) = cols.cell_rects(row);
-    let font = font_ui(10.5);
-    let mut clicked = None;
-
-    if header_label(
-        ui,
-        name_r,
-        &format!("NAME{}", sort_mark(state, PointsSort::Name)),
-        &font,
-        p,
-        false,
-    )
-    .clicked()
-    {
-        clicked = Some(PointsSort::Name);
-    }
-    if header_label(
-        ui,
-        value_r,
-        &format!("VALUE{}", sort_mark(state, PointsSort::Value)),
-        &font,
-        p,
-        false,
-    )
-    .clicked()
-    {
-        clicked = Some(PointsSort::Value);
-    }
-    if header_label(
-        ui,
-        source_r,
-        &format!("SOURCE{}", sort_mark(state, PointsSort::Source)),
-        &font,
-        p,
-        false,
-    )
-    .clicked()
-    {
-        clicked = Some(PointsSort::Source);
-    }
-    if header_label(
-        ui,
-        updated_r,
-        &format!("UPDATED{}", sort_mark(state, PointsSort::Updated)),
-        &font,
-        p,
-        true,
-    )
-    .clicked()
-    {
-        clicked = Some(PointsSort::Updated);
-    }
-    clicked
-}
-
-fn header_label(
-    ui: &mut egui::Ui,
-    rect: Rect,
-    text: &str,
-    font: &FontId,
-    p: &ThemePalette,
-    right: bool,
-) -> egui::Response {
-    let resp = ui.interact(rect, ui.id().with(text), Sense::click());
-    let align = if right {
-        Align2::RIGHT_CENTER
-    } else {
-        Align2::LEFT_CENTER
-    };
-    let pos = if right {
-        Pos2::new(rect.max.x, rect.center().y)
-    } else {
-        Pos2::new(rect.min.x, rect.center().y)
-    };
-    let color = if resp.hovered() { p.accent } else { p.muted };
-    ui.painter()
-        .text(pos, align, text, font.clone(), color);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-fn format_updated(updated_ms: u64) -> String {
-    if updated_ms == 0 {
-        return "—".into();
-    }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(updated_ms);
-    let age_secs = now_ms.saturating_sub(updated_ms) / 1000;
-
-    // Fresh samples read as live.
-    if age_secs < 5 {
-        return "just now".into();
-    }
-
-    const WEEK_SECS: u64 = 7 * 24 * 3600;
-    if age_secs < WEEK_SECS {
-        if age_secs < 60 {
-            return format!(
-                "{} second{} ago",
-                age_secs,
-                if age_secs == 1 { "" } else { "s" }
-            );
-        }
-        let minutes = age_secs / 60;
-        if minutes < 60 {
-            return format!(
-                "{} minute{} ago",
-                minutes,
-                if minutes == 1 { "" } else { "s" }
-            );
-        }
-        // ≥1h and <1 week: hours only (including multi-day ages).
-        let hours = age_secs / 3600;
-        return format!(
-            "{} hour{} ago",
-            hours,
-            if hours == 1 { "" } else { "s" }
-        );
-    }
-
-    // Older than a week: local date + time to the minute.
-    format_absolute_minutes(updated_ms)
-}
-
-fn format_absolute_minutes(updated_ms: u64) -> String {
-    let secs = (updated_ms / 1000) as i64;
-    match chrono::DateTime::from_timestamp(secs, 0) {
-        Some(utc) => utc
-            .with_timezone(&chrono::Local)
-            .format("%Y-%m-%d %H:%M")
-            .to_string(),
-        None => "—".into(),
-    }
-}
-
 
 fn scaffold_panel(ui: &mut egui::Ui, pane: DockPane, host: &HostSnapshot, p: &ThemePalette) {
     let tall = ui.available_height() > 380.0;

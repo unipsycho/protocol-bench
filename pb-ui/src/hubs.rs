@@ -13,7 +13,7 @@ use pb_engine::HostSnapshot;
 
 use crate::dock::DockPane;
 use crate::mqtt_panel::MqttPanelState;
-use crate::point_rows::{self, IdSourceCols, PointRowRef};
+use crate::point_rows;
 use crate::theme::{blend_scope, divider_bar, font_semi, font_ui, tint, ThemePalette, SEP};
 use crate::topic_tree::{self, TopicTree, TreeMode};
 
@@ -171,6 +171,12 @@ pub struct HubPort {
     pub draft_mqtt_out_point: String,
     #[serde(skip)]
     pub draft_mqtt_out_topic: String,
+    /// Input bind editor: false = Topic tree (default), true = Manual.
+    #[serde(skip)]
+    pub draft_input_manual: bool,
+    /// When set, Manual edits this existing bind index.
+    #[serde(skip)]
+    pub draft_edit_bind: Option<usize>,
 }
 
 impl HubPort {
@@ -187,6 +193,8 @@ impl HubPort {
             draft_mqtt_path: String::new(),
             draft_mqtt_out_point: String::new(),
             draft_mqtt_out_topic: String::new(),
+            draft_input_manual: false,
+            draft_edit_bind: None,
         }
     }
 }
@@ -2532,92 +2540,147 @@ fn edit_mqtt_port_binds(
     if incoming {
         ui.add_space(10.0);
         ui.label(
-            egui::RichText::new("INPUT BINDS — point id · source (this node)")
+            egui::RichText::new("INPUT BINDS — this node’s points")
                 .font(font_ui(10.5))
                 .color(p.muted),
         );
         ui.add_space(4.0);
         let mut remove = None;
+        let mut edit_row: Option<usize> = None;
         let mut add_from_tree: Option<(String, String)> = None;
-        let mut add_manual = false;
+        let mut save_manual = false;
+        let mut clear_edit = false;
         let conn = port_field(model, hub_id, port_id)
             .mqtt_connection
             .clone();
-        // Full-width rows: short id left, wire source right (shared with Points).
+        // Same Points table (headers + live value), filtered to this Input’s binds.
         {
             let port = port_field(model, hub_id, port_id);
-            let cols = IdSourceCols::from_width(ui.available_width(), true);
-            // Own source strings for the row lifetime (resolve returns &str into these).
-            let sources: Vec<String> = port
+            let binds: Vec<(String, String, String)> = port
                 .mqtt_inputs
                 .iter()
-                .map(|b| point_rows::mqtt_bind_source(&conn, &b.topic, &b.path))
+                .map(|b| (b.point.clone(), b.topic.clone(), b.path.clone()))
                 .collect();
-            for (i, bind) in port.mqtt_inputs.iter().enumerate() {
-                let (id, source) = point_rows::resolve_input_bind_row(
-                    &bind.point,
-                    &sources[i],
-                    &host.points,
+            if binds.is_empty() {
+                ui.label(
+                    egui::RichText::new("No binds yet — pick a topic below.")
+                        .font(font_ui(11.0))
+                        .color(p.muted),
                 );
-                let action = point_rows::paint_id_source_row(
+            } else {
+                let mut rows =
+                    point_rows::rows_for_input_binds(&conn, &binds, &host.points);
+                let salt = Id::new(("hub-input-binds", port_id));
+                let mut table = point_rows::table_state_for(ui, salt);
+                let action = point_rows::paint_points_table(
                     ui,
-                    cols,
-                    PointRowRef {
-                        id: id.as_str(),
-                        source,
-                        value: None,
-                        quality: None,
-                        updated: None,
-                    },
+                    &mut rows,
+                    &mut table,
                     p,
+                    salt,
+                    true,
                 );
-                if action.remove_clicked {
-                    remove = Some(i);
-                }
+                point_rows::store_table_state(ui, salt, table);
+                remove = action.remove;
+                edit_row = action.row_clicked;
             }
         }
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new("TOPIC TREE — click a leaf to bind (auto mqtt_N)")
-                .font(font_ui(10.5))
-                .color(p.muted),
-        );
-        ui.add_space(2.0);
-        let empty = TopicTree::default();
-        let tree = if conn.is_empty() {
-            &empty
-        } else {
-            mqtt.tree_for(&conn).unwrap_or(&empty)
-        };
-        if conn.is_empty() {
-            ui.label(
-                egui::RichText::new("Pick a connection above to see traffic.")
-                    .font(font_ui(11.0))
-                    .color(p.muted),
-            );
-        } else if let Some(picked) =
-            topic_tree::paint(ui, tree, &format!("hub-{port_id}"), TreeMode::PickTopic, p)
-        {
-            add_from_tree = Some((picked.topic, picked.path));
-        }
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("Or type a topic / JSON path")
-                .font(font_ui(10.5))
-                .color(p.muted),
-        );
-        {
+        // Row click → Manual with topic/path filled for edit.
+        if let Some(i) = edit_row {
+            let (topic, path) = port_field(model, hub_id, port_id)
+                .mqtt_inputs
+                .get(i)
+                .map(|b| (b.topic.clone(), b.path.clone()))
+                .unwrap_or_default();
             let port = port_field(model, hub_id, port_id);
-            inspect_field(ui, "Topic", &mut port.draft_mqtt_topic, p);
-            inspect_field(ui, "JSON path", &mut port.draft_mqtt_path, p);
-            if text_button(ui, "Add bind", false, p).clicked() {
-                add_manual = true;
-            }
+            port.draft_mqtt_topic = topic;
+            port.draft_mqtt_path = path;
+            port.draft_edit_bind = Some(i);
+            port.draft_input_manual = true;
         }
         if let Some(i) = remove {
-            port_field(model, hub_id, port_id).mqtt_inputs.remove(i);
+            let port = port_field(model, hub_id, port_id);
+            port.mqtt_inputs.remove(i);
+            if port.draft_edit_bind == Some(i) {
+                port.draft_edit_bind = None;
+                port.draft_mqtt_topic.clear();
+                port.draft_mqtt_path.clear();
+            } else if let Some(e) = port.draft_edit_bind {
+                if e > i {
+                    port.draft_edit_bind = Some(e - 1);
+                }
+            }
             change.dirty = true;
         }
+
+        ui.add_space(8.0);
+        // Header toggle: Topic tree (default) | Manual.
+        let manual = port_field(model, hub_id, port_id).draft_input_manual;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if text_button(ui, "Topic tree", !manual, p).clicked() {
+                port_field(model, hub_id, port_id).draft_input_manual = false;
+            }
+            if text_button(ui, "Manual", manual, p).clicked() {
+                port_field(model, hub_id, port_id).draft_input_manual = true;
+            }
+        });
+        ui.add_space(6.0);
+
+        let manual = port_field(model, hub_id, port_id).draft_input_manual;
+        if !manual {
+            ui.label(
+                egui::RichText::new("Click a leaf to bind (auto mqtt_N)")
+                    .font(font_ui(10.5))
+                    .color(p.muted),
+            );
+            ui.add_space(2.0);
+            let empty = TopicTree::default();
+            let tree = if conn.is_empty() {
+                &empty
+            } else {
+                mqtt.tree_for(&conn).unwrap_or(&empty)
+            };
+            if conn.is_empty() {
+                ui.label(
+                    egui::RichText::new("Pick a connection above to see traffic.")
+                        .font(font_ui(11.0))
+                        .color(p.muted),
+                );
+            } else if let Some(picked) =
+                topic_tree::paint(ui, tree, &format!("hub-{port_id}"), TreeMode::PickTopic, p)
+            {
+                add_from_tree = Some((picked.topic, picked.path));
+            }
+        } else {
+            let editing = port_field(model, hub_id, port_id).draft_edit_bind.is_some();
+            ui.label(
+                egui::RichText::new(if editing {
+                    "Edit bind — topic / JSON path"
+                } else {
+                    "Type a topic / JSON path"
+                })
+                .font(font_ui(10.5))
+                .color(p.muted),
+            );
+            ui.add_space(2.0);
+            {
+                let port = port_field(model, hub_id, port_id);
+                inspect_field(ui, "Topic", &mut port.draft_mqtt_topic, p);
+                inspect_field(ui, "JSON path", &mut port.draft_mqtt_path, p);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let label = if editing { "Update bind" } else { "Add bind" };
+                    if text_button(ui, label, false, p).clicked() {
+                        save_manual = true;
+                    }
+                    if editing && text_button(ui, "Clear", false, p).clicked() {
+                        clear_edit = true;
+                    }
+                });
+            }
+        }
+
         if let Some((topic, path)) = add_from_tree {
             let port = port_field(model, hub_id, port_id);
             let bind = MqttInputBind {
@@ -2634,25 +2697,41 @@ fn edit_mqtt_port_binds(
                 change.dirty = true;
             }
         }
-        if add_manual {
+        if clear_edit {
+            let port = port_field(model, hub_id, port_id);
+            port.draft_edit_bind = None;
+            port.draft_mqtt_topic.clear();
+            port.draft_mqtt_path.clear();
+        }
+        if save_manual {
             let port = port_field(model, hub_id, port_id);
             let topic = port.draft_mqtt_topic.trim().to_string();
+            let path = port.draft_mqtt_path.trim().to_string();
             if !topic.is_empty() {
-                let bind = MqttInputBind {
-                    topic,
-                    path: port.draft_mqtt_path.trim().to_string(),
-                    point: String::new(),
-                };
-                if !port
-                    .mqtt_inputs
-                    .iter()
-                    .any(|b| b.topic == bind.topic && b.path == bind.path)
-                {
-                    port.mqtt_inputs.push(bind);
+                if let Some(i) = port.draft_edit_bind {
+                    if let Some(bind) = port.mqtt_inputs.get_mut(i) {
+                        bind.topic = topic;
+                        bind.path = path;
+                        change.dirty = true;
+                    }
+                } else {
+                    let bind = MqttInputBind {
+                        topic,
+                        path,
+                        point: String::new(),
+                    };
+                    if !port
+                        .mqtt_inputs
+                        .iter()
+                        .any(|b| b.topic == bind.topic && b.path == bind.path)
+                    {
+                        port.mqtt_inputs.push(bind);
+                        change.dirty = true;
+                    }
                 }
                 port.draft_mqtt_topic.clear();
                 port.draft_mqtt_path.clear();
-                change.dirty = true;
+                port.draft_edit_bind = None;
             }
         }
     } else {
