@@ -68,9 +68,15 @@ pub mod scope {
     pub const TEXT: Color32 = Color32::from_rgb(0xc5, 0xd4, 0xe4);
 }
 
-/// Scope blue mixed halfway with the theme background. The well stays blue and follows the theme.
-pub fn blend_scope(theme_bg: Color32) -> Color32 {
-    mix(theme_bg, scope::BG, 0.5)
+/// Scope blue mixed into the theme background for hub / protocol diagram wells.
+/// Light themes stay mostly the theme bg (clearly lighter); dark themes keep the half-blend.
+pub fn blend_scope(theme_bg: Color32, is_light: bool) -> Color32 {
+    if is_light {
+        // ~12% scope blue — cool tint without a dark slate well on Frost/Daylight.
+        mix(theme_bg, scope::BG, 0.12)
+    } else {
+        mix(theme_bg, scope::BG, 0.5)
+    }
 }
 
 /// `t` is the share of `b`. 0 keeps `a`, 1 keeps `b`.
@@ -480,15 +486,26 @@ mod tests {
     }
 
     #[test]
-    fn scope_blue_mixes_halfway_with_the_theme_background() {
-        let theme = Color32::from_rgb(0xe7, 0xe1, 0xd6);
-        let blended = blend_scope(theme);
+    fn scope_blue_mixes_halfway_on_dark_themes() {
+        let theme = Color32::from_rgb(0x1a, 0x14, 0x10);
+        let blended = blend_scope(theme, false);
         let mid = |a: u8, b: u8| ((a as f32 + b as f32) * 0.5).round() as u8;
         assert_eq!(blended.r(), mid(theme.r(), scope::BG.r()));
         assert_eq!(blended.g(), mid(theme.g(), scope::BG.g()));
         assert_eq!(blended.b(), mid(theme.b(), scope::BG.b()));
-        assert_ne!(blended, scope::BG);
-        assert_ne!(blended, theme);
+    }
+
+    #[test]
+    fn light_theme_wells_stay_near_the_theme_background() {
+        let frost_bg = AppTheme::Frost.palette().bg;
+        let well = blend_scope(frost_bg, true);
+        // Clearly lighter than the old 50% scope mix.
+        let heavy = mix(frost_bg, scope::BG, 0.5);
+        let luma = |c: Color32| c.r() as u16 + c.g() as u16 + c.b() as u16;
+        assert!(luma(well) > luma(heavy));
+        assert!(luma(well) > luma(frost_bg) * 8 / 10);
+        assert_ne!(well, frost_bg);
+        assert_ne!(well, scope::BG);
     }
 
     #[test]

@@ -1196,7 +1196,7 @@ fn diagram_view(
 ) -> HubChange {
     let (rect, _) = ui.allocate_exact_size(vec2(width.max(1.0), height.max(1.0)), Sense::hover());
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, Rounding::same(8.0), blend_scope(p.bg));
+    painter.rect_filled(rect, Rounding::same(8.0), blend_scope(p.bg, p.is_light));
     paint_grid(&painter, rect, p.is_light);
     painter.rect_stroke(
         rect,

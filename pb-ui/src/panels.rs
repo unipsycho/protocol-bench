@@ -60,8 +60,12 @@ fn hero_well(ui: &mut egui::Ui, pane: DockPane, p: &ThemePalette) {
     let width = ui.available_width().max(1.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 150.0), Sense::hover());
     let painter = ui.painter().with_clip_rect(rect);
-    // Scope blue at half strength over the theme background. The drawing on top stays.
-    painter.rect_filled(rect, Rounding::same(8.0), crate::theme::blend_scope(p.bg));
+    // Scope blue over the theme background (lighter on Frost/Daylight). Art stays on top.
+    painter.rect_filled(
+        rect,
+        Rounding::same(8.0),
+        crate::theme::blend_scope(p.bg, p.is_light),
+    );
     let step = 18.0;
     let grid = Stroke::new(1.0, scope::grid(p.is_light));
     let mut x = rect.min.x;
