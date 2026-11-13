@@ -114,7 +114,6 @@ pub fn paint(
         id_salt,
         mode,
         now,
-        0,
         p,
         &mut pick,
     );
@@ -131,7 +130,6 @@ fn paint_node(
     id_salt: &str,
     mode: TreeMode,
     now: Instant,
-    depth: usize,
     p: &ThemePalette,
     pick: &mut Option<TreePick>,
 ) {
@@ -143,31 +141,17 @@ fn paint_node(
         };
         let has_kids = !child.children.is_empty();
         let is_leaf = child.last_payload.is_some();
-        let default_open = depth < 2;
 
         if has_kids {
-            let id = ui.make_persistent_id(("pb_tt", id_salt, &child_path));
-            egui::collapsing_header::CollapsingState::load_with_default_open(
-                ui.ctx(),
-                id,
-                default_open,
-            )
-            .show_header(ui, |ui| {
-                row_label(ui, seg, child, is_leaf, now, mode, p, &child_path, pick);
-            })
-            .body(|ui| {
-                paint_node(
-                    ui,
-                    child,
-                    child_path,
-                    id_salt,
-                    mode,
-                    now,
-                    depth + 1,
-                    p,
-                    pick,
-                );
-            });
+            // Salt bump clears prior depth<2 defaults so deep leaves open.
+            let id = ui.make_persistent_id(("pb_tt_open", id_salt, &child_path));
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+                .show_header(ui, |ui| {
+                    row_label(ui, seg, child, is_leaf, now, mode, p, &child_path, pick);
+                })
+                .body(|ui| {
+                    paint_node(ui, child, child_path, id_salt, mode, now, p, pick);
+                });
         } else {
             ui.horizontal(|ui| {
                 ui.add_space(18.0);
