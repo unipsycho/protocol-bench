@@ -61,6 +61,7 @@ A **hub** is the main protocol conversion / routing point. It is always **one pr
 - The **MQTT panel** owns **connections only** (broker, client id, credentials, transport, optional wide subscribe for traffic / bring-up).
 - **Point promotion** lives on hub **Input** / **Output** nodes: an Input picks a connection + topic/field → creates points (always auto sequential `mqtt_N`, no manual point-id picker); an Output picks a connection + topic + points to publish.
 - Many Input nodes may **share one MQTT connection**; each node owns its own topic/field → point binds. Overlap across nodes is OK (different graph uses).
+- Shared **topic tree** (TopicBench-style) shows subscribed traffic after connect — MQTT panel preview and hub Input inspector (click leaf → bind). MQTT Input nodes show bound **point count** on the right of the title.
 - Broker subscribe may be broad; **only node-defined paths become points**. Bindings + hubs persist in `project.json`.
 
 ## What runs today, and what does not

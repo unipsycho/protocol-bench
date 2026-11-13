@@ -14,6 +14,7 @@ mod panels;
 mod persist;
 mod project;
 mod theme;
+mod topic_tree;
 
 use eframe::egui;
 

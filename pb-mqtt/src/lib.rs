@@ -151,6 +151,15 @@ impl ClientConfig {
     }
 }
 
+/// Last payload + count for one observed topic (topic-tree preview; not a point).
+#[derive(Debug, Clone)]
+struct TrafficLeaf {
+    payload: String,
+    count: u64,
+}
+
+const TRAFFIC_TOPIC_CAP: usize = 2048;
+
 struct ClientRuntime {
     config: ClientConfig,
     session: Option<MqttSession>,
@@ -158,6 +167,8 @@ struct ClientRuntime {
     state: String,
     last_error: String,
     quality_bad: bool,
+    /// Subscribed traffic for UI topic tree (independent of point promotion).
+    traffic: BTreeMap<String, TrafficLeaf>,
 }
 
 impl ClientRuntime {
@@ -169,7 +180,32 @@ impl ClientRuntime {
             state: "disconnected".into(),
             last_error: String::new(),
             quality_bad: false,
+            traffic: BTreeMap::new(),
         }
+    }
+
+    fn observe_traffic(&mut self, topic: &str, payload: &str) {
+        if topic.is_empty() {
+            return;
+        }
+        if let Some(leaf) = self.traffic.get_mut(topic) {
+            leaf.payload = payload.to_string();
+            leaf.count = leaf.count.saturating_add(1);
+            return;
+        }
+        if self.traffic.len() >= TRAFFIC_TOPIC_CAP {
+            // Drop an arbitrary oldest-key entry to stay bounded.
+            if let Some(key) = self.traffic.keys().next().cloned() {
+                self.traffic.remove(&key);
+            }
+        }
+        self.traffic.insert(
+            topic.to_string(),
+            TrafficLeaf {
+                payload: payload.to_string(),
+                count: 1,
+            },
+        );
     }
 }
 
@@ -316,8 +352,13 @@ impl PackState {
                 self.log(PB_LOG_INFO, &format!("[{id}] {detail}"));
             }
             SessionEvent::Message { topic, payload } => {
-                // Only hub Input (parse_rules) paths become points — wide subscribe
-                // may be broad for traffic/bring-up without promoting every message.
+                // Always record traffic for the UI topic tree; only hub Input
+                // parse_rules promote payloads to host points.
+                let preview = match std::str::from_utf8(&payload) {
+                    Ok(t) => t.to_string(),
+                    Err(_) => format!("<{} bytes>", payload.len()),
+                };
+                rt.observe_traffic(&topic, &preview);
                 let rules = rt.config.parse_rules.clone();
                 let conn = rt.config.id.clone();
                 let bad = rt.quality_bad;
@@ -598,6 +639,17 @@ impl PackState {
             .clients
             .values()
             .map(|rt| {
+                let traffic: Vec<Value> = rt
+                    .traffic
+                    .iter()
+                    .map(|(topic, leaf)| {
+                        serde_json::json!({
+                            "topic": topic,
+                            "payload": truncate_preview(&leaf.payload, 256),
+                            "count": leaf.count,
+                        })
+                    })
+                    .collect();
                 serde_json::json!({
                     "id": rt.config.id,
                     "label": rt.config.label,
@@ -607,6 +659,7 @@ impl PackState {
                     "topics": rt.config.subscriptions,
                     "host": rt.config.host,
                     "port": rt.config.port,
+                    "traffic": traffic,
                 })
             })
             .collect();
@@ -656,6 +709,17 @@ fn normalize_transport(raw: &str) -> String {
         "ws" | "websocket" => "ws".into(),
         "wss" => "wss".into(),
         _ => "tcp".into(),
+    }
+}
+
+fn truncate_preview(value: &str, max: usize) -> String {
+    let flat = value.replace('\n', " ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
 }
 

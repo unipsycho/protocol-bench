@@ -6,8 +6,11 @@
 use egui::{Color32, Layout, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2};
 use pb_engine::{EngineCommand, EngineHandle, EngineId, HostSnapshot};
 
+use std::collections::BTreeMap;
+
 use crate::hubs::HubModel;
 use crate::theme::{font_semi, font_ui, ThemePalette};
+use crate::topic_tree::{self, TopicTree, TreeMode};
 
 const SIDE_BY_SIDE_MIN: f32 = 720.0;
 const TRANSPORTS: &[&str] = &["tcp", "tls", "ws", "wss"];
@@ -76,6 +79,8 @@ pub struct MqttPanelState {
     pub clients: Vec<MqttClient>,
     /// Index into `clients` when a connection is selected; `None` = list only.
     pub selected: Option<usize>,
+    /// Per-connection topic trees from pack traffic (UI-owned).
+    pub trees: BTreeMap<String, TopicTree>,
 }
 
 impl Default for MqttPanelState {
@@ -83,6 +88,7 @@ impl Default for MqttPanelState {
         Self {
             clients: vec![MqttClient::default_local()],
             selected: None,
+            trees: BTreeMap::new(),
         }
     }
 }
@@ -108,6 +114,26 @@ impl MqttPanelState {
                 (c.id.clone(), label)
             })
             .collect()
+    }
+
+    /// Refresh topic trees from MQTT pack `detail_json` traffic.
+    pub fn sync_trees_from_host(&mut self, host: &HostSnapshot) {
+        let detail = host
+            .slot(EngineId::Mqtt)
+            .map(|s| s.detail_json.as_str())
+            .unwrap_or("[]");
+        let by_client = topic_tree::traffic_from_detail(detail);
+        let known: std::collections::BTreeSet<_> =
+            self.clients.iter().map(|c| c.id.clone()).collect();
+        self.trees.retain(|id, _| known.contains(id));
+        for c in &self.clients {
+            let rows = by_client.get(&c.id).cloned().unwrap_or_default();
+            self.trees.entry(c.id.clone()).or_default().sync_from_traffic(&rows);
+        }
+    }
+
+    pub fn tree_for(&self, conn_id: &str) -> Option<&TopicTree> {
+        self.trees.get(conn_id)
     }
 
     fn ensure_clients(&mut self) {
@@ -247,6 +273,7 @@ pub fn paint(
     hubs: &HubModel,
 ) {
     state.ensure_clients();
+    state.sync_trees_from_host(host);
     // Claim the full pane body with an explicit rect — nested horizontal rows
     // collapse available_height and clip the config editor.
     let full = ui.available_rect_before_wrap();
@@ -331,7 +358,7 @@ fn paint_body(
             UiBuilder::new()
                 .max_rect(right)
                 .layout(Layout::top_down(egui::Align::Min)),
-            |ui| live_values(ui, host, state, p, true, col_h),
+            |ui| topic_tree_preview(ui, state, p, true, col_h),
         );
         ui.allocate_rect(rem, Sense::hover());
     } else {
@@ -346,7 +373,7 @@ fn paint_body(
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_min_width((rem_size.x - 4.0).max(1.0));
-                        live_values(ui, host, state, p, false, 220.0);
+                        topic_tree_preview(ui, state, p, false, 220.0);
                         ui.add_space(12.0);
                         selected_client_editor(ui, state, engine, hubs, p);
                     });
@@ -525,74 +552,34 @@ fn wide_subscribe_section(
     }
 }
 
-fn live_values(
+fn topic_tree_preview(
     ui: &mut egui::Ui,
-    host: &HostSnapshot,
     state: &MqttPanelState,
     p: &ThemePalette,
     side: bool,
     col_h: f32,
 ) {
-    section(ui, "LIVE VALUES", p);
-    let client_id = state.selected().map(|c| c.id.as_str()).unwrap_or("");
-    let addr_prefix = format!("mqtt/{client_id}/");
-    let points: Vec<_> = host
-        .points_for_source("mqtt")
-        .filter(|pt| client_id.is_empty() || pt.source.starts_with(&addr_prefix))
-        .collect();
-    if points.is_empty() {
-        ui.label(
-            egui::RichText::new(
-                "No points for this connection yet — promote topics on a hub Input node.",
-            )
-            .font(font_ui(12.0))
+    section(ui, "TOPIC TREE", p);
+    ui.label(
+        egui::RichText::new("Subscribed traffic preview — bind topics on hub Input nodes.")
+            .font(font_ui(11.0))
             .color(p.muted),
-        );
-        return;
-    }
+    );
+    ui.add_space(4.0);
+    let client_id = state.selected().map(|c| c.id.as_str()).unwrap_or("");
+    let empty = TopicTree::default();
+    let tree = state.tree_for(client_id).unwrap_or(&empty);
     let height = if side {
-        (col_h - 28.0).max(80.0)
+        (col_h - 48.0).max(80.0)
     } else {
-        ((points.len() as f32) * 22.0 + 28.0).clamp(72.0, col_h.min(220.0))
+        220.0_f32.min(col_h)
     };
     egui::ScrollArea::vertical()
-        .id_salt("pb_mqtt_live")
+        .id_salt("pb_mqtt_topic_tree")
         .max_height(height)
         .auto_shrink([false, !side])
         .show(ui, |ui| {
-            egui::Grid::new("pb_mqtt_live_grid")
-                .num_columns(3)
-                .spacing([10.0, 4.0])
-                .striped(true)
-                .show(ui, |ui| {
-                    for h in ["POINT", "VALUE", "QUALITY"] {
-                        ui.label(
-                            egui::RichText::new(h)
-                                .font(font_ui(10.5))
-                                .color(p.muted),
-                        );
-                    }
-                    ui.end_row();
-                    for pt in points {
-                        ui.label(
-                            egui::RichText::new(&pt.name)
-                                .font(font_ui(12.0))
-                                .color(p.text),
-                        )
-                        .on_hover_text(&pt.source);
-                        ui.label(
-                            egui::RichText::new(truncate(&pt.value, 48))
-                                .font(font_ui(12.0))
-                                .color(p.text),
-                        );
-                        ui.label(
-                            egui::RichText::new(&pt.quality)
-                                .font(font_ui(12.0))
-                                .color(p.muted),
-                        );
-                        ui.end_row();
-                    }
-                });
+            let _ = topic_tree::paint(ui, tree, client_id, TreeMode::Preview, p);
         });
 }
 
@@ -727,17 +714,6 @@ fn secondary_btn(ui: &mut egui::Ui, label: &str, p: &ThemePalette) -> egui::Resp
         .stroke(Stroke::new(1.0, p.line))
         .min_size(Vec2::new(72.0, 26.0)),
     )
-}
-
-fn truncate(value: &str, max: usize) -> String {
-    let flat = value.replace('\n', " ");
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
 }
 
 #[allow(dead_code)]

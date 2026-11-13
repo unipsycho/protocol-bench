@@ -1,0 +1,296 @@
+//! Shared TopicBench-style topic tree from subscribed MQTT traffic.
+//!
+//! Used for MQTT panel preview and hub Input bind picking (topic → auto mqtt_N).
+
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+use egui::{Align2, Color32, RichText, Sense, Stroke, Vec2};
+
+use crate::theme::{font_ui, ThemePalette};
+
+const FLASH_MS: u64 = 500;
+
+#[derive(Clone, Debug, Default)]
+pub struct TopicNode {
+    pub children: BTreeMap<String, TopicNode>,
+    pub last_payload: Option<String>,
+    pub message_count: u64,
+    pub flash_until: Option<Instant>,
+}
+
+impl TopicNode {
+    pub fn observe(&mut self, topic: &str, payload: &str, count: u64, now: Instant) {
+        let flash = now + Duration::from_millis(FLASH_MS);
+        let parts: Vec<&str> = topic.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() {
+            return;
+        }
+        let mut node = self;
+        for (i, part) in parts.iter().enumerate() {
+            node = node.children.entry((*part).to_string()).or_default();
+            if i + 1 == parts.len() {
+                node.last_payload = Some(payload.to_string());
+                node.message_count = count.max(1);
+                node.flash_until = Some(flash);
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.children.is_empty()
+    }
+
+    pub fn subtree_message_count(&self) -> u64 {
+        let mut total = self.message_count;
+        for child in self.children.values() {
+            total = total.saturating_add(child.subtree_message_count());
+        }
+        total
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TopicTree {
+    pub root: TopicNode,
+}
+
+impl TopicTree {
+    pub fn clear(&mut self) {
+        self.root = TopicNode::default();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.root.is_empty()
+    }
+
+    /// Replace tree from pack traffic rows `{topic, payload, count}`.
+    pub fn sync_from_traffic(&mut self, rows: &[(String, String, u64)]) {
+        self.clear();
+        let now = Instant::now();
+        for (topic, payload, count) in rows {
+            self.root.observe(topic, payload, *count, now);
+        }
+    }
+}
+
+/// How the tree responds to clicks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeMode {
+    /// Browse only (MQTT panel preview).
+    Preview,
+    /// Click a leaf topic → pick for Input bind.
+    PickTopic,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TreePick {
+    pub topic: String,
+    /// Optional JSON field path when a payload key row is clicked (unused for now).
+    pub path: String,
+}
+
+/// Draw the tree. Returns a pick when `mode` is [`TreeMode::PickTopic`] and a leaf is clicked.
+pub fn paint(
+    ui: &mut egui::Ui,
+    tree: &TopicTree,
+    id_salt: &str,
+    mode: TreeMode,
+    p: &ThemePalette,
+) -> Option<TreePick> {
+    if tree.is_empty() {
+        ui.label(
+            RichText::new("No traffic yet — connect and subscribe to see topics.")
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        return None;
+    }
+    let now = Instant::now();
+    let mut pick = None;
+    paint_node(
+        ui,
+        &tree.root,
+        String::new(),
+        id_salt,
+        mode,
+        now,
+        0,
+        p,
+        &mut pick,
+    );
+    pick
+}
+
+fn paint_node(
+    ui: &mut egui::Ui,
+    node: &TopicNode,
+    path: String,
+    id_salt: &str,
+    mode: TreeMode,
+    now: Instant,
+    depth: usize,
+    p: &ThemePalette,
+    pick: &mut Option<TreePick>,
+) {
+    for (seg, child) in &node.children {
+        let child_path = if path.is_empty() {
+            seg.clone()
+        } else {
+            format!("{path}/{seg}")
+        };
+        let has_kids = !child.children.is_empty();
+        let is_leaf = child.last_payload.is_some();
+        let default_open = depth < 2;
+
+        if has_kids {
+            let id = ui.make_persistent_id(("pb_tt", id_salt, &child_path));
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                id,
+                default_open,
+            )
+            .show_header(ui, |ui| {
+                row_label(ui, seg, child, is_leaf, now, mode, p, &child_path, pick);
+            })
+            .body(|ui| {
+                paint_node(
+                    ui,
+                    child,
+                    child_path,
+                    id_salt,
+                    mode,
+                    now,
+                    depth + 1,
+                    p,
+                    pick,
+                );
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.add_space(18.0);
+                row_label(ui, seg, child, is_leaf, now, mode, p, &child_path, pick);
+            });
+        }
+    }
+}
+
+fn row_label(
+    ui: &mut egui::Ui,
+    seg: &str,
+    child: &TopicNode,
+    is_leaf: bool,
+    now: Instant,
+    mode: TreeMode,
+    p: &ThemePalette,
+    full_path: &str,
+    pick: &mut Option<TreePick>,
+) {
+    let flash = child
+        .flash_until
+        .map(|until| until > now)
+        .unwrap_or(false);
+    let mut text = RichText::new(seg).font(font_ui(12.5)).color(p.text);
+    if flash {
+        text = text.color(p.accent);
+    }
+    let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
+    if is_leaf {
+        if let Some(payload) = child.last_payload.as_deref() {
+            let preview = truncate(payload, 40);
+            ui.label(
+                RichText::new(preview)
+                    .font(font_ui(11.0))
+                    .color(p.muted),
+            );
+        }
+        let count = child.message_count;
+        if count > 0 {
+            ui.label(
+                RichText::new(format!("×{count}"))
+                    .font(font_ui(10.5))
+                    .color(p.muted),
+            );
+        }
+    } else {
+        let n = child.subtree_message_count();
+        if n > 0 {
+            ui.label(
+                RichText::new(format!("({n})"))
+                    .font(font_ui(10.5))
+                    .color(p.muted),
+            );
+        }
+    }
+    if mode == TreeMode::PickTopic && is_leaf && resp.clicked() {
+        *pick = Some(TreePick {
+            topic: full_path.to_string(),
+            path: String::new(),
+        });
+    }
+    if mode == TreeMode::PickTopic && is_leaf {
+        resp.on_hover_text("Click to bind topic → auto mqtt_N");
+    }
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    let flat = value.replace('\n', " ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Parse pack `detail_json` clients array into per-connection traffic rows.
+pub fn traffic_from_detail(detail_json: &str) -> BTreeMap<String, Vec<(String, String, u64)>> {
+    let mut out = BTreeMap::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(detail_json) else {
+        return out;
+    };
+    let Some(arr) = value.as_array() else {
+        return out;
+    };
+    for client in arr {
+        let id = client
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let mut rows = Vec::new();
+        if let Some(traffic) = client.get("traffic").and_then(|v| v.as_array()) {
+            for leaf in traffic {
+                let topic = leaf
+                    .get("topic")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if topic.is_empty() {
+                    continue;
+                }
+                let payload = leaf
+                    .get("payload")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let count = leaf.get("count").and_then(|v| v.as_u64()).unwrap_or(1);
+                rows.push((topic, payload, count));
+            }
+        }
+        out.insert(id, rows);
+    }
+    out
+}
+
+#[allow(dead_code)]
+fn _theme_bits(p: &ThemePalette) {
+    let _ = Color32::BLACK;
+    let _ = Stroke::new(1.0, p.line);
+    let _ = Vec2::ZERO;
+    let _ = Align2::LEFT_CENTER;
+}

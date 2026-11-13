@@ -10,7 +10,9 @@ use egui::{
 use serde::Deserialize;
 
 use crate::dock::DockPane;
+use crate::mqtt_panel::MqttPanelState;
 use crate::theme::{blend_scope, divider_bar, font_semi, font_ui, tint, ThemePalette, SEP};
+use crate::topic_tree::{self, TopicTree, TreeMode};
 
 const PORT_W: f32 = 156.0;
 const PORT_H: f32 = 44.0;
@@ -1221,6 +1223,7 @@ pub fn paint(
     model: &mut HubModel,
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
+    mqtt: &MqttPanelState,
 ) -> HubChange {
     let mut change = HubChange::quiet();
     // The dock column zeros item spacing, and that style is inherited here.
@@ -1277,7 +1280,15 @@ pub fn paint(
                 }
                 SplitCmd::Idle => {}
             }
-            change = change.join(inspector(ui, model, inspect_w, height, p, mqtt_connections));
+            change = change.join(inspector(
+                ui,
+                model,
+                inspect_w,
+                height,
+                p,
+                mqtt_connections,
+                mqtt,
+            ));
         });
     } else {
         let height = (ui.available_height() * 0.58).clamp(180.0, 420.0);
@@ -1290,6 +1301,7 @@ pub fn paint(
             ui.available_height().max(120.0),
             p,
             mqtt_connections,
+            mqtt,
         ));
     }
     change
@@ -2070,13 +2082,35 @@ fn paint_port_node(
         font_ui(10.0 * z),
         ink,
     );
-    painter.with_clip_rect(clip).text(
-        pos2(clip.min.x, node.rect.center().y + 8.0 * z),
+    // Title left; MQTT Input bound-point count right, inline with title.
+    let title_y = node.rect.center().y + 8.0 * z;
+    let bind_count = if node.role == Role::Source && port.protocol == HubProto::Mqtt {
+        Some(port.mqtt_inputs.len())
+    } else {
+        None
+    };
+    let title_right = if bind_count.is_some() {
+        clip.max.x - 28.0 * z
+    } else {
+        clip.max.x
+    };
+    let title_clip = Rect::from_min_max(clip.min, pos2(title_right.max(clip.min.x + 8.0), clip.max.y));
+    painter.with_clip_rect(title_clip).text(
+        pos2(clip.min.x, title_y),
         Align2::LEFT_CENTER,
         &port.label,
         font_ui(13.0 * z),
         p.text,
     );
+    if let Some(n) = bind_count {
+        painter.with_clip_rect(clip).text(
+            pos2(clip.max.x, title_y),
+            Align2::RIGHT_CENTER,
+            format!("{n}"),
+            font_ui(12.0 * z),
+            p.muted,
+        );
+    }
 }
 
 fn paint_step_node(
@@ -2188,6 +2222,7 @@ fn inspector(
     height: f32,
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
+    mqtt: &MqttPanelState,
 ) -> HubChange {
     let (rect, _) = ui.allocate_exact_size(vec2(width.max(1.0), height.max(1.0)), Sense::hover());
     ui.painter()
@@ -2210,7 +2245,7 @@ fn inspector(
             // Overlay scrollbar sits on the right; keep Add / × / row edges clear of it.
             let width = (ui.available_width() - INSPECT_SCROLL_GUTTER).max(1.0);
             ui.set_width(width);
-            change = change.join(edit_selected(ui, model, p, mqtt_connections));
+            change = change.join(edit_selected(ui, model, p, mqtt_connections, mqtt));
         });
     change
 }
@@ -2220,6 +2255,7 @@ fn edit_selected(
     model: &mut HubModel,
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
+    mqtt: &MqttPanelState,
 ) -> HubChange {
     // Item-specific properties only when exactly one canvas node is selected.
     if model.multi_selected() {
@@ -2254,7 +2290,7 @@ fn edit_selected(
         {
             return edit_step(ui, model, p);
         }
-        return edit_port(ui, model, p, mqtt_connections);
+        return edit_port(ui, model, p, mqtt_connections, mqtt);
     }
     edit_hub(ui, model, p)
 }
@@ -2329,6 +2365,7 @@ fn edit_port(
     model: &mut HubModel,
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
+    mqtt: &MqttPanelState,
 ) -> HubChange {
     let Some(hub_id) = model.selected else {
         return HubChange::quiet();
@@ -2388,6 +2425,7 @@ fn edit_port(
             port_id,
             incoming,
             mqtt_connections,
+            mqtt,
             p,
         ));
     }
@@ -2395,17 +2433,20 @@ fn edit_port(
     if text_button(ui, &format!("Open {} panel", proto.label()), true, p).clicked() {
         change.open = Some(proto.pane());
     }
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        if text_button(ui, "Hub details", false, p).clicked() {
-            model.focus_hub(hub_id);
-            change.dirty = true;
-        }
-        if text_button(ui, "Remove", false, p).clicked() {
-            model.remove_port(hub_id, port_id);
-            change.dirty = true;
-        }
-    });
+    // MQTT Input: no Hub details / Remove — delete via diagram select/Delete or right-click.
+    if !(proto == HubProto::Mqtt && incoming) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if text_button(ui, "Hub details", false, p).clicked() {
+                model.focus_hub(hub_id);
+                change.dirty = true;
+            }
+            if text_button(ui, "Remove", false, p).clicked() {
+                model.remove_port(hub_id, port_id);
+                change.dirty = true;
+            }
+        });
+    }
     change
 }
 
@@ -2416,6 +2457,7 @@ fn edit_mqtt_port_binds(
     port_id: u64,
     incoming: bool,
     mqtt_connections: &[(String, String)],
+    mqtt: &MqttPanelState,
     p: &ThemePalette,
 ) -> HubChange {
     let mut change = HubChange::quiet();
@@ -2461,17 +2503,20 @@ fn edit_mqtt_port_binds(
     if incoming {
         ui.add_space(10.0);
         ui.label(
-            egui::RichText::new("INPUT BINDS — topic / field → auto mqtt_N")
+            egui::RichText::new("INPUT BINDS — topic → auto mqtt_N")
                 .font(font_ui(10.5))
                 .color(p.muted),
         );
         ui.add_space(4.0);
         let mut remove = None;
-        let mut add = false;
+        let mut add_from_tree: Option<(String, String)> = None;
+        let mut add_manual = false;
+        let conn = port_field(model, hub_id, port_id)
+            .mqtt_connection
+            .clone();
         {
             let port = port_field(model, hub_id, port_id);
             for (i, bind) in port.mqtt_inputs.iter().enumerate() {
-                // Point id is always host-assigned sequential mqtt_N (no manual picker).
                 let label = if bind.path.is_empty() {
                     format!("{} → mqtt_N", bind.topic)
                 } else {
@@ -2488,24 +2533,66 @@ fn edit_mqtt_port_binds(
                     }
                 });
             }
+        }
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("TOPIC TREE — click a leaf to bind (auto mqtt_N)")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(2.0);
+        let empty = TopicTree::default();
+        let tree = if conn.is_empty() {
+            &empty
+        } else {
+            mqtt.tree_for(&conn).unwrap_or(&empty)
+        };
+        if conn.is_empty() {
+            ui.label(
+                egui::RichText::new("Pick a connection above to see traffic.")
+                    .font(font_ui(11.0))
+                    .color(p.muted),
+            );
+        } else if let Some(picked) =
+            topic_tree::paint(ui, tree, &format!("hub-{port_id}"), TreeMode::PickTopic, p)
+        {
+            add_from_tree = Some((picked.topic, picked.path));
+        }
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Or type a topic / JSON path")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        {
+            let port = port_field(model, hub_id, port_id);
             inspect_field(ui, "Topic", &mut port.draft_mqtt_topic, p);
             inspect_field(ui, "JSON path", &mut port.draft_mqtt_path, p);
-            ui.label(
-                egui::RichText::new(
-                    "Path optional (whole payload). Point id always auto-assigned (mqtt_1, mqtt_2, …).",
-                )
-                .font(font_ui(11.0))
-                .color(p.muted),
-            );
             if text_button(ui, "Add bind", false, p).clicked() {
-                add = true;
+                add_manual = true;
             }
         }
         if let Some(i) = remove {
             port_field(model, hub_id, port_id).mqtt_inputs.remove(i);
             change.dirty = true;
         }
-        if add {
+        if let Some((topic, path)) = add_from_tree {
+            let port = port_field(model, hub_id, port_id);
+            let bind = MqttInputBind {
+                topic,
+                path,
+                point: String::new(),
+            };
+            if !port
+                .mqtt_inputs
+                .iter()
+                .any(|b| b.topic == bind.topic && b.path == bind.path)
+            {
+                port.mqtt_inputs.push(bind);
+                change.dirty = true;
+            }
+        }
+        if add_manual {
             let port = port_field(model, hub_id, port_id);
             let topic = port.draft_mqtt_topic.trim().to_string();
             if !topic.is_empty() {
