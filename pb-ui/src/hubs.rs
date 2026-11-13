@@ -123,7 +123,8 @@ pub struct MqttInputBind {
     /// Empty = whole payload; otherwise dotted JSON path.
     #[serde(default)]
     pub path: String,
-    /// Empty = auto-assign next `mqtt_N` short id.
+    /// Always empty on new Input binds — host auto-assigns sequential `mqtt_N`.
+    /// Persisted only for legacy migrated binds that already have an id.
     #[serde(default)]
     pub point: String,
 }
@@ -162,8 +163,6 @@ pub struct HubPort {
     #[serde(skip)]
     pub draft_mqtt_path: String,
     #[serde(skip)]
-    pub draft_mqtt_point: String,
-    #[serde(skip)]
     pub draft_mqtt_out_point: String,
     #[serde(skip)]
     pub draft_mqtt_out_topic: String,
@@ -181,7 +180,6 @@ impl HubPort {
             mqtt_outputs: Vec::new(),
             draft_mqtt_topic: String::new(),
             draft_mqtt_path: String::new(),
-            draft_mqtt_point: String::new(),
             draft_mqtt_out_point: String::new(),
             draft_mqtt_out_topic: String::new(),
         }
@@ -2463,7 +2461,7 @@ fn edit_mqtt_port_binds(
     if incoming {
         ui.add_space(10.0);
         ui.label(
-            egui::RichText::new("INPUT BINDS — topic / field → point")
+            egui::RichText::new("INPUT BINDS — topic / field → auto mqtt_N")
                 .font(font_ui(10.5))
                 .color(p.muted),
         );
@@ -2473,16 +2471,11 @@ fn edit_mqtt_port_binds(
         {
             let port = port_field(model, hub_id, port_id);
             for (i, bind) in port.mqtt_inputs.iter().enumerate() {
+                // Point id is always host-assigned sequential mqtt_N (no manual picker).
                 let label = if bind.path.is_empty() {
-                    if bind.point.is_empty() {
-                        format!("{} → (auto)", bind.topic)
-                    } else {
-                        format!("{} → {}", bind.topic, bind.point)
-                    }
-                } else if bind.point.is_empty() {
-                    format!("{}::{} → (auto)", bind.topic, bind.path)
+                    format!("{} → mqtt_N", bind.topic)
                 } else {
-                    format!("{}::{} → {}", bind.topic, bind.path, bind.point)
+                    format!("{}::{} → mqtt_N", bind.topic, bind.path)
                 };
                 ui.horizontal(|ui| {
                     ui.label(
@@ -2497,11 +2490,12 @@ fn edit_mqtt_port_binds(
             }
             inspect_field(ui, "Topic", &mut port.draft_mqtt_topic, p);
             inspect_field(ui, "JSON path", &mut port.draft_mqtt_path, p);
-            inspect_field(ui, "Point id", &mut port.draft_mqtt_point, p);
             ui.label(
-                egui::RichText::new("Path optional (whole payload). Point id optional → next mqtt_N.")
-                    .font(font_ui(11.0))
-                    .color(p.muted),
+                egui::RichText::new(
+                    "Path optional (whole payload). Point id always auto-assigned (mqtt_1, mqtt_2, …).",
+                )
+                .font(font_ui(11.0))
+                .color(p.muted),
             );
             if text_button(ui, "Add bind", false, p).clicked() {
                 add = true;
@@ -2518,14 +2512,17 @@ fn edit_mqtt_port_binds(
                 let bind = MqttInputBind {
                     topic,
                     path: port.draft_mqtt_path.trim().to_string(),
-                    point: port.draft_mqtt_point.trim().to_string(),
+                    point: String::new(),
                 };
-                if !port.mqtt_inputs.iter().any(|b| b == &bind) {
+                if !port
+                    .mqtt_inputs
+                    .iter()
+                    .any(|b| b.topic == bind.topic && b.path == bind.path)
+                {
                     port.mqtt_inputs.push(bind);
                 }
                 port.draft_mqtt_topic.clear();
                 port.draft_mqtt_path.clear();
-                port.draft_mqtt_point.clear();
                 change.dirty = true;
             }
         }

@@ -46,7 +46,7 @@ If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use th
 Editable wire config (not dock layout). Default path: `…/ProtocolBench/project.json` (via `directories`). File → Open / Save as project uses a path dialog (non-blocking). MQTT panel and hub Input/Output bind changes autosave here.
 
 - **MQTT panel** = connections (broker, client id, optional wide subscribe).
-- **Hub Input/Output nodes** = point promotion. Many Inputs may share one connection; each owns its own binds (overlap OK).
+- **Hub Input/Output nodes** = point promotion. Many Inputs may share one connection; each owns its own binds (overlap OK). Input binds always auto-assign sequential `mqtt_N` (no manual point id).
 - **`hubs`** in `project.json` holds the diagram + MQTT binds (v4+). Older files without `hubs` keep the diagram from `ui.toml` until the next save.
 
 ```json
@@ -88,8 +88,8 @@ Editable wire config (not dock layout). Default path: `…/ProtocolBench/project
             "label": "Local broker",
             "mqtt_connection": "local",
             "mqtt_inputs": [
-              { "topic": "pb/in", "path": "", "point": "mqtt_1" },
-              { "topic": "pb/in", "path": "temp", "point": "mqtt_2" }
+              { "topic": "pb/in", "path": "", "point": "" },
+              { "topic": "pb/in", "path": "temp", "point": "" }
             ]
           }
         ],
