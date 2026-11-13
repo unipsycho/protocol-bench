@@ -1197,7 +1197,7 @@ fn diagram_view(
     let (rect, _) = ui.allocate_exact_size(vec2(width.max(1.0), height.max(1.0)), Sense::hover());
     let painter = ui.painter().with_clip_rect(rect);
     painter.rect_filled(rect, Rounding::same(8.0), blend_scope(p.bg));
-    paint_grid(&painter, rect);
+    paint_grid(&painter, rect, p.is_light);
     painter.rect_stroke(
         rect,
         Rounding::same(8.0),
@@ -1765,22 +1765,17 @@ fn open_target(model: &HubModel, node: &Placed) -> Option<DockPane> {
     }
 }
 
-fn paint_grid(painter: &egui::Painter, rect: Rect) {
+fn paint_grid(painter: &egui::Painter, rect: Rect, is_light: bool) {
     let step = 18.0;
+    let stroke = Stroke::new(1.0, crate::theme::scope::grid(is_light));
     let mut x = rect.min.x;
     while x < rect.max.x {
-        painter.line_segment(
-            [pos2(x, rect.min.y), pos2(x, rect.max.y)],
-            Stroke::new(1.0, crate::theme::scope::grid()),
-        );
+        painter.line_segment([pos2(x, rect.min.y), pos2(x, rect.max.y)], stroke);
         x += step;
     }
     let mut y = rect.min.y;
     while y < rect.max.y {
-        painter.line_segment(
-            [pos2(rect.min.x, y), pos2(rect.max.x, y)],
-            Stroke::new(1.0, crate::theme::scope::grid()),
-        );
+        painter.line_segment([pos2(rect.min.x, y), pos2(rect.max.x, y)], stroke);
         y += step;
     }
 }

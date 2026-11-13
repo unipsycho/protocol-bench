@@ -63,11 +63,12 @@ fn hero_well(ui: &mut egui::Ui, pane: DockPane, p: &ThemePalette) {
     // Scope blue at half strength over the theme background. The drawing on top stays.
     painter.rect_filled(rect, Rounding::same(8.0), crate::theme::blend_scope(p.bg));
     let step = 18.0;
+    let grid = Stroke::new(1.0, scope::grid(p.is_light));
     let mut x = rect.min.x;
     while x < rect.max.x {
         painter.line_segment(
             [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
-            Stroke::new(1.0, scope::grid()),
+            grid,
         );
         x += step;
     }
@@ -75,7 +76,7 @@ fn hero_well(ui: &mut egui::Ui, pane: DockPane, p: &ThemePalette) {
     while y < rect.max.y {
         painter.line_segment(
             [Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)],
-            Stroke::new(1.0, scope::grid()),
+            grid,
         );
         y += step;
     }
@@ -216,24 +217,12 @@ fn project_panel(
     hubs: &HubModel,
     p: &ThemePalette,
 ) -> crate::hubs::HubChange {
-    let mut change = crate::hubs::HubChange::quiet();
     egui::ScrollArea::vertical()
         .id_salt("pb_project_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             title_row(ui, p);
             ui.add_space(10.0);
-            // Jump to existing panels — Project does not list points/mappings itself.
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                if panel_jump(ui, "Points", DockPane::Points.ink(p.is_light), p).clicked() {
-                    change.open = Some(DockPane::Points);
-                }
-                if panel_jump(ui, "Mappings", DockPane::Mappings.ink(p.is_light), p).clicked() {
-                    change.open = Some(DockPane::Mappings);
-                }
-            });
-            ui.add_space(12.0);
             stat_row(ui, hubs, p);
             ui.add_space(14.0);
             list_section(
@@ -258,7 +247,7 @@ fn project_panel(
             ui.add_space(10.0);
             list_section(ui, "CALCULATIONS", &step_names(hubs, false), p.accent, p);
         });
-    change
+    crate::hubs::HubChange::quiet()
 }
 
 fn hub_names(hubs: &HubModel) -> Vec<String> {
@@ -340,35 +329,6 @@ fn title_row(ui: &mut egui::Ui, p: &ThemePalette) {
             );
         });
     });
-}
-
-fn panel_jump(ui: &mut egui::Ui, label: &str, ink: Color32, p: &ThemePalette) -> egui::Response {
-    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(label.to_owned(), font_ui(12.0), p.text));
-    let (rect, resp) = ui.allocate_exact_size(galley.size() + Vec2::new(18.0, 10.0), Sense::click());
-    let fill = if resp.hovered() {
-        tint(ink, 36)
-    } else {
-        p.control
-    };
-    ui.painter().rect_filled(rect, Rounding::same(5.0), fill);
-    ui.painter()
-        .rect_stroke(rect, Rounding::same(5.0), Stroke::new(1.0, p.line));
-    ui.painter().rect_filled(
-        Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
-        Rounding {
-            nw: 5.0,
-            ne: 0.0,
-            sw: 5.0,
-            se: 0.0,
-        },
-        ink,
-    );
-    ui.painter().galley(
-        rect.center() - galley.size() * 0.5 + Vec2::new(1.0, 0.0),
-        galley,
-        p.text,
-    );
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn stat_row(ui: &mut egui::Ui, hubs: &HubModel, p: &ThemePalette) {

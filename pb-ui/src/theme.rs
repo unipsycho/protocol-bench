@@ -56,8 +56,14 @@ impl Proto {
 pub mod scope {
     use super::Color32;
     pub const BG: Color32 = Color32::from_rgb(0x0c, 0x12, 0x18);
-    pub fn grid() -> Color32 {
-        Color32::from_rgba_unmultiplied(150, 180, 200, 24)
+    /// Diagram / hero grid stroke. Light themes stay near the well so orange/green ink remains visible.
+    pub fn grid(is_light: bool) -> Color32 {
+        if is_light {
+            // Soft dark lines, low alpha — closer to the blended background than the old pale grid.
+            Color32::from_rgba_unmultiplied(18, 36, 52, 14)
+        } else {
+            Color32::from_rgba_unmultiplied(150, 180, 200, 24)
+        }
     }
     pub const TEXT: Color32 = Color32::from_rgb(0xc5, 0xd4, 0xe4);
 }
@@ -483,6 +489,16 @@ mod tests {
         assert_eq!(blended.b(), mid(theme.b(), scope::BG.b()));
         assert_ne!(blended, scope::BG);
         assert_ne!(blended, theme);
+    }
+
+    #[test]
+    fn light_theme_grid_is_quieter_than_dark() {
+        let light = scope::grid(true);
+        let dark = scope::grid(false);
+        assert!(light.a() < dark.a());
+        assert!(AppTheme::Frost.palette().is_light);
+        assert!(AppTheme::Daylight.palette().is_light);
+        assert!(!AppTheme::Copper.palette().is_light);
     }
 
     #[test]
