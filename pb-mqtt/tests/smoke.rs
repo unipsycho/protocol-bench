@@ -86,8 +86,9 @@ fn subscribe_point_and_publish() {
     assert!(!handle.is_null());
 
     let topic = "pb/smoke/in";
+    // Whole-payload Input bind (empty path) — subscribe alone does not create points.
     let cfg = format!(
-        r#"{{"clients":[{{"id":"smoke","label":"smoke","host":"{host}","port":{port},"client_id":"pb-smoke","transport":"tcp","subscriptions":["{topic}"],"outputs":[{{"point":"mqtt_1","topic":"pb/smoke/write","qos":0,"retain":false}}],"auto_connect":true}}]}}"#
+        r#"{{"clients":[{{"id":"smoke","label":"smoke","host":"{host}","port":{port},"client_id":"pb-smoke","transport":"tcp","subscriptions":["{topic}"],"parse_rules":[{{"topic":"{topic}","path":"","point":""}}],"outputs":[{{"point":"mqtt_1","topic":"pb/smoke/write","qos":0,"retain":false}}],"auto_connect":true}}]}}"#
     );
     let configure = api.configure.expect("configure");
     assert_eq!(unsafe { configure(handle, cfg.as_ptr() as *const c_char, cfg.len()) }, 0);

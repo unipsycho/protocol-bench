@@ -1,12 +1,12 @@
-//! MQTT panel: multi-client list, per-client broker config, Inputs / Outputs.
+//! MQTT panel: connections only (broker, client id, optional wide subscribe).
 //!
-//! Inputs create/bind host points (subscribe + JSON parse paths).
-//! Outputs bind host points → publish topics on this client.
-//! Cross-protocol point routing stays in the Mappings panel.
+//! Point promotion lives on hub Input / Output nodes — many Inputs may share
+//! one connection; each node owns its own topic/field → point binds.
 
 use egui::{Color32, Layout, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2};
 use pb_engine::{EngineCommand, EngineHandle, EngineId, HostSnapshot};
 
+use crate::hubs::HubModel;
 use crate::theme::{font_semi, font_ui, ThemePalette};
 
 const SIDE_BY_SIDE_MIN: f32 = 720.0;
@@ -40,17 +40,14 @@ pub struct MqttClient {
     pub username: String,
     pub password: String,
     pub transport: String,
+    /// Optional wide subscribe for traffic / bring-up (not point promotion).
     pub subscriptions: Vec<String>,
+    /// Legacy — migrated onto hub Input nodes; kept empty after migrate.
     pub parse_rules: Vec<MqttParseRule>,
+    /// Legacy — migrated onto hub Output nodes; kept empty after migrate.
     pub outputs: Vec<MqttOutput>,
     pub auto_connect: bool,
-    // Draft fields for Inputs / Outputs editors.
     pub draft_sub: String,
-    pub draft_path_topic: String,
-    pub draft_path: String,
-    pub draft_path_point: String,
-    pub draft_out_point: String,
-    pub draft_out_topic: String,
 }
 
 impl MqttClient {
@@ -70,11 +67,6 @@ impl MqttClient {
             outputs: Vec::new(),
             auto_connect: false,
             draft_sub: String::new(),
-            draft_path_topic: String::new(),
-            draft_path: String::new(),
-            draft_path_point: String::new(),
-            draft_out_point: String::new(),
-            draft_out_topic: String::new(),
         }
     }
 }
@@ -102,6 +94,20 @@ impl MqttPanelState {
 
     pub fn selected_mut(&mut self) -> Option<&mut MqttClient> {
         self.selected.and_then(|i| self.clients.get_mut(i))
+    }
+
+    pub fn connection_choices(&self) -> Vec<(String, String)> {
+        self.clients
+            .iter()
+            .map(|c| {
+                let label = if c.label.is_empty() {
+                    c.id.clone()
+                } else {
+                    c.label.clone()
+                };
+                (c.id.clone(), label)
+            })
+            .collect()
     }
 
     fn ensure_clients(&mut self) {
@@ -157,14 +163,50 @@ pub fn fresh_mqtt_client_id(conn_id: &str) -> String {
     format!("pb-{conn}-{:x}", mix & 0xffff_ffff)
 }
 
-/// Push full multi-client document to the MQTT pack (reconcile + optional connect).
-pub fn apply_mqtt_session(engine: &EngineHandle, state: &mut MqttPanelState) {
+/// Push multi-client document to the MQTT pack.
+/// Hub Input/Output nodes supply parse/output binds; panel subscriptions are optional wide filters.
+pub fn apply_mqtt_session(engine: &EngineHandle, state: &mut MqttPanelState, hubs: &HubModel) {
     state.ensure_unique_mqtt_client_ids();
     let clients: Vec<serde_json::Value> = state
         .clients
         .iter()
         .map(|c| {
             let port: u16 = c.port.parse().unwrap_or(1883);
+            let (hub_inputs, hub_outs, extra_subs) = hubs.mqtt_binds_for_connection(&c.id);
+            let mut rules: Vec<MqttParseRule> = hub_inputs
+                .into_iter()
+                .map(|b| MqttParseRule {
+                    topic: b.topic,
+                    path: b.path,
+                    point: b.point,
+                })
+                .collect();
+            let mut outs: Vec<MqttOutput> = hub_outs
+                .into_iter()
+                .map(|b| MqttOutput {
+                    point: b.point,
+                    topic: b.topic,
+                    qos: b.qos,
+                    retain: b.retain,
+                })
+                .collect();
+            // Legacy client-level binds (pre hub-node reshape) still apply until migrated.
+            for r in &c.parse_rules {
+                if !rules.iter().any(|x| x == r) {
+                    rules.push(r.clone());
+                }
+            }
+            for o in &c.outputs {
+                if !outs.iter().any(|x| x == o) {
+                    outs.push(o.clone());
+                }
+            }
+            let mut subscriptions = c.subscriptions.clone();
+            for t in extra_subs {
+                if !t.is_empty() && !subscriptions.iter().any(|s| s == &t) {
+                    subscriptions.push(t);
+                }
+            }
             serde_json::json!({
                 "id": c.id,
                 "label": c.label,
@@ -176,13 +218,13 @@ pub fn apply_mqtt_session(engine: &EngineHandle, state: &mut MqttPanelState) {
                 "password": c.password,
                 "transport": c.transport,
                 "keep_alive_secs": 30,
-                "subscriptions": c.subscriptions,
-                "parse_rules": c.parse_rules.iter().map(|r| serde_json::json!({
+                "subscriptions": subscriptions,
+                "parse_rules": rules.iter().map(|r| serde_json::json!({
                     "topic": r.topic,
                     "path": r.path,
                     "point": r.point,
                 })).collect::<Vec<_>>(),
-                "outputs": c.outputs.iter().map(|o| serde_json::json!({
+                "outputs": outs.iter().map(|o| serde_json::json!({
                     "point": o.point,
                     "topic": o.topic,
                     "qos": o.qos,
@@ -202,6 +244,7 @@ pub fn paint(
     p: &ThemePalette,
     engine: &EngineHandle,
     state: &mut MqttPanelState,
+    hubs: &HubModel,
 ) {
     state.ensure_clients();
     // Claim the full pane body with an explicit rect — nested horizontal rows
@@ -215,7 +258,7 @@ pub fn paint(
         UiBuilder::new()
             .max_rect(inner)
             .layout(Layout::top_down(egui::Align::Min)),
-        |ui| paint_body(ui, host, p, engine, state),
+        |ui| paint_body(ui, host, p, engine, state, hubs),
     );
     // Consume the outer rect so the dock body does not layout underneath.
     ui.allocate_rect(full, Sense::hover());
@@ -227,12 +270,13 @@ fn paint_body(
     p: &ThemePalette,
     engine: &EngineHandle,
     state: &mut MqttPanelState,
+    hubs: &HubModel,
 ) {
     let slot = host.slot(EngineId::Mqtt);
     let pack_loaded = slot.map(|s| s.pack_loaded).unwrap_or(false);
     ui.label(
         egui::RichText::new(if pack_loaded {
-            "MQTT clients are sources/outputs only — broker hub role is not active. Cross-protocol routing uses the Mappings panel later."
+            "Connections only — broker, client id, optional wide subscribe. Point binds live on hub Input / Output nodes (many Inputs may share one connection)."
         } else {
             "MQTT pack not loaded. Build pb-mqtt into modules/."
         })
@@ -241,20 +285,18 @@ fn paint_body(
     );
     ui.add_space(8.0);
 
-    clients_bar(ui, state, engine, p);
+    clients_bar(ui, state, engine, hubs, p);
     ui.add_space(10.0);
 
-    // Detail form only when a connection is selected.
     if state.selected().is_none() {
         ui.label(
-            egui::RichText::new("Select a connection to edit broker settings, Inputs, and Outputs.")
+            egui::RichText::new("Select a connection to edit broker settings.")
                 .font(font_ui(12.5))
                 .color(p.muted),
         );
         return;
     }
 
-    // Remaining pane rect after blurb + connections — config scrolls inside this.
     let rem = ui.available_rect_before_wrap();
     let rem_size = rem.size();
     let side_by_side = rem_size.x >= SIDE_BY_SIDE_MIN;
@@ -281,7 +323,7 @@ fn paint_body(
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_min_width((left_w - 4.0).max(1.0));
-                        selected_client_editor(ui, host, state, engine, p);
+                        selected_client_editor(ui, state, engine, hubs, p);
                     });
             },
         );
@@ -306,7 +348,7 @@ fn paint_body(
                         ui.set_min_width((rem_size.x - 4.0).max(1.0));
                         live_values(ui, host, state, p, false, 220.0);
                         ui.add_space(12.0);
-                        selected_client_editor(ui, host, state, engine, p);
+                        selected_client_editor(ui, state, engine, hubs, p);
                     });
             },
         );
@@ -318,6 +360,7 @@ fn clients_bar(
     ui: &mut egui::Ui,
     state: &mut MqttPanelState,
     engine: &EngineHandle,
+    hubs: &HubModel,
     p: &ThemePalette,
 ) {
     section(ui, "CONNECTIONS", p);
@@ -333,11 +376,12 @@ fn clients_bar(
                 client.label.as_str()
             };
             if text_btn(ui, label, selected, p).clicked() {
-                // Toggle: click again clears selection → list only.
                 select = Some(i);
             }
             if state.clients.len() > 1
-                && text_btn(ui, "×", false, p).on_hover_text("Remove connection").clicked()
+                && text_btn(ui, "×", false, p)
+                    .on_hover_text("Remove connection")
+                    .clicked()
             {
                 remove = Some(i);
             }
@@ -358,10 +402,9 @@ fn clients_bar(
                 other => other,
             };
             state.ensure_clients();
-            apply_mqtt_session(engine, state);
+            apply_mqtt_session(engine, state, hubs);
         }
         ui.add_space(8.0);
-        // Secondary fill — keep selected connection on accent yellow.
         if secondary_btn(ui, "+ Add", p).clicked() {
             let id = state.unique_id("broker");
             let mut c = MqttClient::default_local();
@@ -370,16 +413,16 @@ fn clients_bar(
             c.client_id = fresh_mqtt_client_id(&id);
             state.clients.push(c);
             state.selected = Some(state.clients.len() - 1);
-            apply_mqtt_session(engine, state);
+            apply_mqtt_session(engine, state, hubs);
         }
     });
 }
 
 fn selected_client_editor(
     ui: &mut egui::Ui,
-    host: &HostSnapshot,
     state: &mut MqttPanelState,
     engine: &EngineHandle,
+    hubs: &HubModel,
     p: &ThemePalette,
 ) {
     let Some(_) = state.selected() else {
@@ -403,15 +446,14 @@ fn selected_client_editor(
             if let Some(c) = state.selected_mut() {
                 c.auto_connect = true;
             }
-            apply_mqtt_session(engine, state);
+            apply_mqtt_session(engine, state, hubs);
         }
         ui.add_space(12.0);
         if text_btn(ui, "Disconnect", false, p).clicked() {
             if let Some(c) = state.selected_mut() {
                 c.auto_connect = false;
             }
-            // Reconcile: this client stops; others with auto_connect stay up.
-            apply_mqtt_session(engine, state);
+            apply_mqtt_session(engine, state, hubs);
         }
     });
     ui.add_space(4.0);
@@ -422,21 +464,20 @@ fn selected_client_editor(
     );
 
     ui.add_space(14.0);
-    inputs_section(ui, state, engine, p);
-    ui.add_space(14.0);
-    outputs_section(ui, host, state, engine, p);
+    wide_subscribe_section(ui, state, engine, hubs, p);
 }
 
-fn inputs_section(
+fn wide_subscribe_section(
     ui: &mut egui::Ui,
     state: &mut MqttPanelState,
     engine: &EngineHandle,
+    hubs: &HubModel,
     p: &ThemePalette,
 ) {
-    section(ui, "INPUTS — subscribe → points", p);
+    section(ui, "WIDE SUBSCRIBE — traffic / bring-up", p);
     ui.label(
         egui::RichText::new(
-            "Subscriptions create sequential point ids (`mqtt_1`, `mqtt_2`, …); broker/topic (and JSON `::path`) stay as source metadata.",
+            "Optional broker filters (e.g. pb/#). Traffic may be broad; only hub Input node paths become points.",
         )
         .font(font_ui(12.0))
         .color(p.muted),
@@ -445,8 +486,6 @@ fn inputs_section(
 
     let mut remove_sub = None;
     let mut add_sub = false;
-    let mut remove_rule = None;
-    let mut add_rule = false;
     {
         let c = state.selected_mut().unwrap();
         for (i, topic) in c.subscriptions.iter().enumerate() {
@@ -463,42 +502,8 @@ fn inputs_section(
             });
         }
         field(ui, "Subscribe", &mut c.draft_sub, p);
-        if text_btn(ui, "Add subscription", false, p).clicked() {
+        if text_btn(ui, "Add filter", false, p).clicked() {
             add_sub = true;
-        }
-        ui.add_space(10.0);
-        ui.label(
-            egui::RichText::new("Parse paths")
-                .font(font_ui(12.0))
-                .color(p.muted),
-        );
-        for (i, rule) in c.parse_rules.iter().enumerate() {
-            ui.horizontal(|ui| {
-                let label = if rule.point.is_empty() {
-                    format!("{} · {}", rule.topic, rule.path)
-                } else {
-                    format!("{} · {} → {}", rule.topic, rule.path, rule.point)
-                };
-                ui.label(
-                    egui::RichText::new(label)
-                        .font(font_ui(12.0))
-                        .color(p.text),
-                );
-                if text_btn(ui, "Remove", false, p).clicked() {
-                    remove_rule = Some(i);
-                }
-            });
-        }
-        field(ui, "Topic filter", &mut c.draft_path_topic, p);
-        field(ui, "JSON path", &mut c.draft_path, p);
-        field(ui, "Point id", &mut c.draft_path_point, p);
-        ui.label(
-            egui::RichText::new("Point id optional — leave blank to auto-assign the next `mqtt_N`")
-                .font(font_ui(11.0))
-                .color(p.muted),
-        );
-        if text_btn(ui, "Add parse path", false, p).clicked() {
-            add_rule = true;
         }
     }
     let mut dirty = false;
@@ -515,119 +520,8 @@ fn inputs_section(
             dirty = true;
         }
     }
-    if let Some(i) = remove_rule {
-        state.selected_mut().unwrap().parse_rules.remove(i);
-        dirty = true;
-    }
-    if add_rule {
-        let c = state.selected_mut().unwrap();
-        let path = c.draft_path.trim().to_string();
-        if !path.is_empty() {
-            let topic = if c.draft_path_topic.trim().is_empty() {
-                c.subscriptions.first().cloned().unwrap_or_default()
-            } else {
-                c.draft_path_topic.trim().to_string()
-            };
-            let rule = MqttParseRule {
-                topic,
-                path,
-                point: c.draft_path_point.trim().to_string(),
-            };
-            if !c.parse_rules.iter().any(|r| r == &rule) {
-                c.parse_rules.push(rule);
-            }
-            c.draft_path.clear();
-            c.draft_path_point.clear();
-            dirty = true;
-        }
-    }
     if dirty {
-        apply_mqtt_session(engine, state);
-    }
-}
-
-fn outputs_section(
-    ui: &mut egui::Ui,
-    host: &HostSnapshot,
-    state: &mut MqttPanelState,
-    engine: &EngineHandle,
-    p: &ThemePalette,
-) {
-    section(ui, "OUTPUTS — points → publish", p);
-    ui.label(
-        egui::RichText::new(
-            "Bind host points to publish topics on this client. Cross-protocol links stay in Mappings.",
-        )
-        .font(font_ui(12.0))
-        .color(p.muted),
-    );
-    ui.add_space(6.0);
-
-    let mut remove = None;
-    let mut add = false;
-    let mut publish_point: Option<String> = None;
-    {
-        let c = state.selected_mut().unwrap();
-        for (i, out) in c.outputs.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("{} → {}", out.point, out.topic))
-                        .font(font_ui(12.0))
-                        .color(p.text),
-                );
-                ui.add_space(8.0);
-                if text_btn(ui, "Publish", false, p).clicked() {
-                    publish_point = Some(out.point.clone());
-                }
-                if text_btn(ui, "Remove", false, p).clicked() {
-                    remove = Some(i);
-                }
-            });
-        }
-        field(ui, "Point", &mut c.draft_out_point, p);
-        field(ui, "Topic", &mut c.draft_out_topic, p);
-        if text_btn(ui, "Add output", false, p).clicked() {
-            add = true;
-        }
-    }
-    let mut dirty = false;
-    if let Some(i) = remove {
-        state.selected_mut().unwrap().outputs.remove(i);
-        dirty = true;
-    }
-    if add {
-        let c = state.selected_mut().unwrap();
-        let point = c.draft_out_point.trim().to_string();
-        let topic = c.draft_out_topic.trim().to_string();
-        if !point.is_empty() && !topic.is_empty() {
-            let out = MqttOutput {
-                point,
-                topic,
-                qos: 0,
-                retain: false,
-            };
-            if !c.outputs.iter().any(|o| o == &out) {
-                c.outputs.push(out);
-            }
-            c.draft_out_point.clear();
-            c.draft_out_topic.clear();
-            dirty = true;
-        }
-    }
-    if dirty {
-        apply_mqtt_session(engine, state);
-    }
-    if let Some(point) = publish_point {
-        let value = host
-            .points
-            .iter()
-            .find(|pt| pt.name == point)
-            .map(|pt| pt.value.clone())
-            .unwrap_or_default();
-        engine.submit(
-            EngineId::Mqtt,
-            EngineCommand::WritePoint { name: point, value },
-        );
+        apply_mqtt_session(engine, state, hubs);
     }
 }
 
@@ -648,9 +542,11 @@ fn live_values(
         .collect();
     if points.is_empty() {
         ui.label(
-            egui::RichText::new("No points for this client yet — add an Input subscription.")
-                .font(font_ui(12.0))
-                .color(p.muted),
+            egui::RichText::new(
+                "No points for this connection yet — promote topics on a hub Input node.",
+            )
+            .font(font_ui(12.0))
+            .color(p.muted),
         );
         return;
     }
@@ -727,7 +623,6 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
 }
 
 fn client_id_field(ui: &mut egui::Ui, c: &mut MqttClient, p: &ThemePalette) {
-    // Client ID edit + concise Unique checkbox on one row.
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
         ui.add_sized(
@@ -740,7 +635,6 @@ fn client_id_field(ui: &mut egui::Ui, c: &mut MqttClient, p: &ThemePalette) {
         );
         let w = (ui.available_width() - 100.0).clamp(120.0, 280.0);
         let edit = egui::TextEdit::singleline(&mut c.client_id).desired_width(w);
-        // Static id kept when Unique is off; disabled while random overrides CONNECT.
         if c.unique_client_id {
             ui.add_enabled(false, edit);
         } else {
@@ -822,7 +716,6 @@ fn text_btn(ui: &mut egui::Ui, label: &str, accent: bool, p: &ThemePalette) -> e
     )
 }
 
-/// Theme secondary (`live`) — distinct from selection accent yellow.
 fn secondary_btn(ui: &mut egui::Ui, label: &str, p: &ThemePalette) -> egui::Response {
     ui.add(
         egui::Button::new(

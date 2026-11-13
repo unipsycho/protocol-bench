@@ -1,5 +1,7 @@
-//! Hub diagram. Each hub is a conversion / routing point: sources in, optional
-//! aggregator or calculation transforms on the edges, outputs out. No protocol I/O.
+//! Hub diagram. Each hub is a conversion / routing point: sources (Inputs) in,
+//! optional aggregator or calculation transforms on the edges, outputs out.
+//! MQTT Input/Output nodes own topic/field → point binds (connections live in
+//! the MQTT panel). Many Inputs may share one MQTT connection.
 
 use egui::{
     pos2, vec2, Align2, Color32, CursorIcon, Id, Layout, Pos2, Rect, Rounding, ScrollArea, Sense,
@@ -114,6 +116,29 @@ where
     })
 }
 
+/// Input node: topic (+ optional JSON path) → host point on a shared MQTT connection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MqttInputBind {
+    pub topic: String,
+    /// Empty = whole payload; otherwise dotted JSON path.
+    #[serde(default)]
+    pub path: String,
+    /// Empty = auto-assign next `mqtt_N` short id.
+    #[serde(default)]
+    pub point: String,
+}
+
+/// Output node: host point → publish topic on a shared MQTT connection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MqttOutputBind {
+    pub point: String,
+    pub topic: String,
+    #[serde(default)]
+    pub qos: u8,
+    #[serde(default)]
+    pub retain: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HubPort {
     pub id: u64,
@@ -122,6 +147,45 @@ pub struct HubPort {
     /// Center on the diagram, once the user has dragged this node.
     #[serde(default)]
     pub at: Option<[f32; 2]>,
+    /// MQTT connection id from the MQTT panel. Many Input/Output nodes may share one.
+    #[serde(default)]
+    pub mqtt_connection: String,
+    /// Input binds (sources with protocol MQTT). Overlap across nodes is OK.
+    #[serde(default)]
+    pub mqtt_inputs: Vec<MqttInputBind>,
+    /// Output binds (outputs with protocol MQTT).
+    #[serde(default)]
+    pub mqtt_outputs: Vec<MqttOutputBind>,
+    /// Ephemeral inspector drafts — not persisted.
+    #[serde(skip)]
+    pub draft_mqtt_topic: String,
+    #[serde(skip)]
+    pub draft_mqtt_path: String,
+    #[serde(skip)]
+    pub draft_mqtt_point: String,
+    #[serde(skip)]
+    pub draft_mqtt_out_point: String,
+    #[serde(skip)]
+    pub draft_mqtt_out_topic: String,
+}
+
+impl HubPort {
+    pub fn new(id: u64, protocol: HubProto, label: impl Into<String>) -> Self {
+        Self {
+            id,
+            protocol,
+            label: label.into(),
+            at: None,
+            mqtt_connection: String::new(),
+            mqtt_inputs: Vec::new(),
+            mqtt_outputs: Vec::new(),
+            draft_mqtt_topic: String::new(),
+            draft_mqtt_path: String::new(),
+            draft_mqtt_point: String::new(),
+            draft_mqtt_out_point: String::new(),
+            draft_mqtt_out_topic: String::new(),
+        }
+    }
 }
 
 /// Aggregate or calculation step on a hub edge (source↔hub or hub↔output).
@@ -257,32 +321,12 @@ impl HubModel {
                     name: "Plant".into(),
                     protocol: HubProto::Modbus,
                     sources: vec![
-                        HubPort {
-                            id: 2,
-                            protocol: HubProto::Modbus,
-                            label: "RTU line".into(),
-                            at: None,
-                        },
-                        HubPort {
-                            id: 3,
-                            protocol: HubProto::Streams,
-                            label: "Serial A".into(),
-                            at: None,
-                        },
+                        HubPort::new(2, HubProto::Modbus, "RTU line"),
+                        HubPort::new(3, HubProto::Streams, "Serial A"),
                     ],
                     outputs: vec![
-                        HubPort {
-                            id: 4,
-                            protocol: HubProto::Mqtt,
-                            label: "Plant topics".into(),
-                            at: None,
-                        },
-                        HubPort {
-                            id: 5,
-                            protocol: HubProto::OpcUa,
-                            label: "SCADA".into(),
-                            at: None,
-                        },
+                        HubPort::new(4, HubProto::Mqtt, "Plant topics"),
+                        HubPort::new(5, HubProto::OpcUa, "SCADA"),
                     ],
                     aggregators: vec![],
                     calculations: vec![],
@@ -292,17 +336,15 @@ impl HubModel {
                     id: 6,
                     name: "Edge".into(),
                     protocol: HubProto::Mqtt,
-                    sources: vec![HubPort {
-                        id: 7,
-                        protocol: HubProto::Mqtt,
-                        label: "Local broker".into(),
-                        at: None,
+                    sources: vec![{
+                        let mut p = HubPort::new(7, HubProto::Mqtt, "Local broker");
+                        p.mqtt_connection = "local".into();
+                        p
                     }],
-                    outputs: vec![HubPort {
-                        id: 8,
-                        protocol: HubProto::Mqtt,
-                        label: "Upstream".into(),
-                        at: None,
+                    outputs: vec![{
+                        let mut p = HubPort::new(8, HubProto::Mqtt, "Upstream");
+                        p.mqtt_connection = "local".into();
+                        p
                     }],
                     aggregators: vec![],
                     calculations: vec![],
@@ -566,18 +608,8 @@ impl HubModel {
             id,
             name,
             protocol: HubProto::Modbus,
-            sources: vec![HubPort {
-                id: source,
-                protocol: HubProto::Modbus,
-                label: "Source".into(),
-                at: None,
-            }],
-            outputs: vec![HubPort {
-                id: output,
-                protocol: HubProto::Mqtt,
-                label: "Output".into(),
-                at: None,
-            }],
+            sources: vec![HubPort::new(source, HubProto::Modbus, "Input")],
+            outputs: vec![HubPort::new(output, HubProto::Mqtt, "Output")],
             aggregators: vec![],
             calculations: vec![],
             at: None,
@@ -624,12 +656,7 @@ impl HubModel {
         let Some(hub) = self.hub_mut(hub_id) else {
             return None;
         };
-        let port = HubPort {
-            id,
-            protocol: proto,
-            label: if source { "Source" } else { "Output" }.into(),
-            at: None,
-        };
+        let port = HubPort::new(id, proto, if source { "Input" } else { "Output" });
         if source {
             hub.sources.push(port);
         } else {
@@ -683,6 +710,146 @@ impl HubModel {
         }
         if self.selected_link == Some(port_id) {
             self.selected_link = None;
+        }
+    }
+
+    /// Collect Input/Output MQTT binds for one connection id.
+    /// Many nodes may share the connection; each node's binds are included (overlap OK).
+    pub fn mqtt_binds_for_connection(
+        &self,
+        conn_id: &str,
+    ) -> (
+        Vec<MqttInputBind>,
+        Vec<MqttOutputBind>,
+        Vec<String>,
+    ) {
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        let mut topics = Vec::new();
+        if conn_id.is_empty() {
+            return (inputs, outputs, topics);
+        }
+        for hub in &self.hubs {
+            for port in &hub.sources {
+                if port.protocol != HubProto::Mqtt || port.mqtt_connection != conn_id {
+                    continue;
+                }
+                for bind in &port.mqtt_inputs {
+                    if bind.topic.trim().is_empty() {
+                        continue;
+                    }
+                    let topic = bind.topic.trim().to_string();
+                    if !topics.iter().any(|t| t == &topic) {
+                        topics.push(topic.clone());
+                    }
+                    inputs.push(MqttInputBind {
+                        topic,
+                        path: bind.path.trim().to_string(),
+                        point: bind.point.trim().to_string(),
+                    });
+                }
+            }
+            for port in &hub.outputs {
+                if port.protocol != HubProto::Mqtt || port.mqtt_connection != conn_id {
+                    continue;
+                }
+                for bind in &port.mqtt_outputs {
+                    if bind.point.trim().is_empty() || bind.topic.trim().is_empty() {
+                        continue;
+                    }
+                    outputs.push(MqttOutputBind {
+                        point: bind.point.trim().to_string(),
+                        topic: bind.topic.trim().to_string(),
+                        qos: bind.qos,
+                        retain: bind.retain,
+                    });
+                }
+            }
+        }
+        (inputs, outputs, topics)
+    }
+
+    /// Move legacy client-level parse_rules / outputs onto MQTT Input/Output nodes.
+    pub fn adopt_legacy_mqtt_client_binds(
+        &mut self,
+        client_id: &str,
+        parse_rules: &[MqttInputBind],
+        outputs: &[MqttOutputBind],
+    ) {
+        if parse_rules.is_empty() && outputs.is_empty() {
+            return;
+        }
+        if !parse_rules.is_empty() {
+            let port_id = self
+                .hubs
+                .iter()
+                .flat_map(|h| h.sources.iter())
+                .find(|p| {
+                    p.protocol == HubProto::Mqtt
+                        && (p.mqtt_connection.is_empty() || p.mqtt_connection == client_id)
+                        && p.mqtt_inputs.is_empty()
+                })
+                .map(|p| p.id);
+            let port_id = port_id.or_else(|| {
+                let hub_id = self.hubs.first().map(|h| h.id)?;
+                self.add_port(hub_id, true).map(|id| {
+                    if let Some(p) = self.port_mut(hub_id, id) {
+                        p.protocol = HubProto::Mqtt;
+                        p.label = format!("{client_id} in");
+                    }
+                    id
+                })
+            });
+            if let Some(port_id) = port_id {
+                for hub in &mut self.hubs {
+                    if let Some(port) = hub.sources.iter_mut().find(|p| p.id == port_id) {
+                        port.protocol = HubProto::Mqtt;
+                        port.mqtt_connection = client_id.to_string();
+                        for rule in parse_rules {
+                            if !port.mqtt_inputs.iter().any(|b| b == rule) {
+                                port.mqtt_inputs.push(rule.clone());
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if !outputs.is_empty() {
+            let port_id = self
+                .hubs
+                .iter()
+                .flat_map(|h| h.outputs.iter())
+                .find(|p| {
+                    p.protocol == HubProto::Mqtt
+                        && (p.mqtt_connection.is_empty() || p.mqtt_connection == client_id)
+                        && p.mqtt_outputs.is_empty()
+                })
+                .map(|p| p.id);
+            let port_id = port_id.or_else(|| {
+                let hub_id = self.hubs.first().map(|h| h.id)?;
+                self.add_port(hub_id, false).map(|id| {
+                    if let Some(p) = self.port_mut(hub_id, id) {
+                        p.protocol = HubProto::Mqtt;
+                        p.label = format!("{client_id} out");
+                    }
+                    id
+                })
+            });
+            if let Some(port_id) = port_id {
+                for hub in &mut self.hubs {
+                    if let Some(port) = hub.outputs.iter_mut().find(|p| p.id == port_id) {
+                        port.protocol = HubProto::Mqtt;
+                        port.mqtt_connection = client_id.to_string();
+                        for out in outputs {
+                            if !port.mqtt_outputs.iter().any(|b| b == out) {
+                                port.mqtt_outputs.push(out.clone());
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -1051,7 +1218,12 @@ impl HubChange {
 }
 
 /// Draw the diagram and the editor.
-pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
+pub fn paint(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    p: &ThemePalette,
+    mqtt_connections: &[(String, String)],
+) -> HubChange {
     let mut change = HubChange::quiet();
     // The dock column zeros item spacing, and that style is inherited here.
     // Restore the chrome gap (10×6) so toolbar buttons match the rest of the shell.
@@ -1107,7 +1279,7 @@ pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
                 }
                 SplitCmd::Idle => {}
             }
-            change = change.join(inspector(ui, model, inspect_w, height, p));
+            change = change.join(inspector(ui, model, inspect_w, height, p, mqtt_connections));
         });
     } else {
         let height = (ui.available_height() * 0.58).clamp(180.0, 420.0);
@@ -1119,6 +1291,7 @@ pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
             ui.available_width(),
             ui.available_height().max(120.0),
             p,
+            mqtt_connections,
         ));
     }
     change
@@ -2016,6 +2189,7 @@ fn inspector(
     width: f32,
     height: f32,
     p: &ThemePalette,
+    mqtt_connections: &[(String, String)],
 ) -> HubChange {
     let (rect, _) = ui.allocate_exact_size(vec2(width.max(1.0), height.max(1.0)), Sense::hover());
     ui.painter()
@@ -2038,12 +2212,17 @@ fn inspector(
             // Overlay scrollbar sits on the right; keep Add / × / row edges clear of it.
             let width = (ui.available_width() - INSPECT_SCROLL_GUTTER).max(1.0);
             ui.set_width(width);
-            change = change.join(edit_selected(ui, model, p));
+            change = change.join(edit_selected(ui, model, p, mqtt_connections));
         });
     change
 }
 
-fn edit_selected(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
+fn edit_selected(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    p: &ThemePalette,
+    mqtt_connections: &[(String, String)],
+) -> HubChange {
     // Item-specific properties only when exactly one canvas node is selected.
     if model.multi_selected() {
         ui.label(
@@ -2077,7 +2256,7 @@ fn edit_selected(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChan
         {
             return edit_step(ui, model, p);
         }
-        return edit_port(ui, model, p);
+        return edit_port(ui, model, p, mqtt_connections);
     }
     edit_hub(ui, model, p)
 }
@@ -2147,7 +2326,12 @@ fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
     change
 }
 
-fn edit_port(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
+fn edit_port(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    p: &ThemePalette,
+    mqtt_connections: &[(String, String)],
+) -> HubChange {
     let Some(hub_id) = model.selected else {
         return HubChange::quiet();
     };
@@ -2166,7 +2350,7 @@ fn edit_port(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
         .map(|hub| hub.name.clone())
         .unwrap_or_default();
     let mut change = HubChange::quiet();
-    let kind = if incoming { "SOURCE" } else { "OUTPUT" };
+    let kind = if incoming { "INPUT" } else { "OUTPUT" };
     ui.label(
         egui::RichText::new(format!("{kind}  ·  {}", proto.label()))
             .font(font_ui(10.5))
@@ -2197,6 +2381,18 @@ fn edit_port(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
             }
         }
     });
+    if proto == HubProto::Mqtt {
+        ui.add_space(12.0);
+        change = change.join(edit_mqtt_port_binds(
+            ui,
+            model,
+            hub_id,
+            port_id,
+            incoming,
+            mqtt_connections,
+            p,
+        ));
+    }
     ui.add_space(10.0);
     if text_button(ui, &format!("Open {} panel", proto.label()), true, p).clicked() {
         change.open = Some(proto.pane());
@@ -2213,6 +2409,196 @@ fn edit_port(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
         }
     });
     change
+}
+
+fn edit_mqtt_port_binds(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    hub_id: u64,
+    port_id: u64,
+    incoming: bool,
+    mqtt_connections: &[(String, String)],
+    p: &ThemePalette,
+) -> HubChange {
+    let mut change = HubChange::quiet();
+    ui.label(
+        egui::RichText::new("MQTT CONNECTION")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(
+            "Many Input nodes may share one connection; each owns its own topic/field → point binds (overlap OK).",
+        )
+        .font(font_ui(11.0))
+        .color(p.muted),
+    );
+    ui.add_space(4.0);
+    let current = port_field(model, hub_id, port_id).mqtt_connection.clone();
+    let current_label = mqtt_connections
+        .iter()
+        .find(|(id, _)| id == &current)
+        .map(|(_, label)| label.as_str())
+        .unwrap_or(if current.is_empty() {
+            "(pick connection)"
+        } else {
+            current.as_str()
+        });
+    let mut next = current.clone();
+    egui::ComboBox::from_id_salt(("pb_hub_mqtt_conn", port_id))
+        .selected_text(current_label)
+        .width((ui.available_width()).min(240.0).max(120.0))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut next, String::new(), "(none)");
+            for (id, label) in mqtt_connections {
+                ui.selectable_value(&mut next, id.clone(), format!("{label} ({id})"));
+            }
+        });
+    if next != current {
+        port_field(model, hub_id, port_id).mqtt_connection = next;
+        change.dirty = true;
+    }
+
+    if incoming {
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new("INPUT BINDS — topic / field → point")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(4.0);
+        let mut remove = None;
+        let mut add = false;
+        {
+            let port = port_field(model, hub_id, port_id);
+            for (i, bind) in port.mqtt_inputs.iter().enumerate() {
+                let label = if bind.path.is_empty() {
+                    if bind.point.is_empty() {
+                        format!("{} → (auto)", bind.topic)
+                    } else {
+                        format!("{} → {}", bind.topic, bind.point)
+                    }
+                } else if bind.point.is_empty() {
+                    format!("{}::{} → (auto)", bind.topic, bind.path)
+                } else {
+                    format!("{}::{} → {}", bind.topic, bind.path, bind.point)
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(label)
+                            .font(font_ui(12.0))
+                            .color(p.text),
+                    );
+                    if text_button(ui, "×", false, p).clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            inspect_field(ui, "Topic", &mut port.draft_mqtt_topic, p);
+            inspect_field(ui, "JSON path", &mut port.draft_mqtt_path, p);
+            inspect_field(ui, "Point id", &mut port.draft_mqtt_point, p);
+            ui.label(
+                egui::RichText::new("Path optional (whole payload). Point id optional → next mqtt_N.")
+                    .font(font_ui(11.0))
+                    .color(p.muted),
+            );
+            if text_button(ui, "Add bind", false, p).clicked() {
+                add = true;
+            }
+        }
+        if let Some(i) = remove {
+            port_field(model, hub_id, port_id).mqtt_inputs.remove(i);
+            change.dirty = true;
+        }
+        if add {
+            let port = port_field(model, hub_id, port_id);
+            let topic = port.draft_mqtt_topic.trim().to_string();
+            if !topic.is_empty() {
+                let bind = MqttInputBind {
+                    topic,
+                    path: port.draft_mqtt_path.trim().to_string(),
+                    point: port.draft_mqtt_point.trim().to_string(),
+                };
+                if !port.mqtt_inputs.iter().any(|b| b == &bind) {
+                    port.mqtt_inputs.push(bind);
+                }
+                port.draft_mqtt_topic.clear();
+                port.draft_mqtt_path.clear();
+                port.draft_mqtt_point.clear();
+                change.dirty = true;
+            }
+        }
+    } else {
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new("OUTPUT BINDS — point → publish topic")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(4.0);
+        let mut remove = None;
+        let mut add = false;
+        {
+            let port = port_field(model, hub_id, port_id);
+            for (i, bind) in port.mqtt_outputs.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} → {}", bind.point, bind.topic))
+                            .font(font_ui(12.0))
+                            .color(p.text),
+                    );
+                    if text_button(ui, "×", false, p).clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            inspect_field(ui, "Point", &mut port.draft_mqtt_out_point, p);
+            inspect_field(ui, "Topic", &mut port.draft_mqtt_out_topic, p);
+            if text_button(ui, "Add bind", false, p).clicked() {
+                add = true;
+            }
+        }
+        if let Some(i) = remove {
+            port_field(model, hub_id, port_id).mqtt_outputs.remove(i);
+            change.dirty = true;
+        }
+        if add {
+            let port = port_field(model, hub_id, port_id);
+            let point = port.draft_mqtt_out_point.trim().to_string();
+            let topic = port.draft_mqtt_out_topic.trim().to_string();
+            if !point.is_empty() && !topic.is_empty() {
+                let bind = MqttOutputBind {
+                    point,
+                    topic,
+                    qos: 0,
+                    retain: false,
+                };
+                if !port.mqtt_outputs.iter().any(|b| b == &bind) {
+                    port.mqtt_outputs.push(bind);
+                }
+                port.draft_mqtt_out_point.clear();
+                port.draft_mqtt_out_topic.clear();
+                change.dirty = true;
+            }
+        }
+    }
+    change
+}
+
+fn inspect_field(ui: &mut Ui, label: &str, value: &mut String, p: &ThemePalette) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [72.0, 20.0],
+            egui::Label::new(
+                egui::RichText::new(label)
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            ),
+        );
+        ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+    });
+    ui.add_space(2.0);
 }
 
 fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {

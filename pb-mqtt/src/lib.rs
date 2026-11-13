@@ -316,37 +316,42 @@ impl PackState {
                 self.log(PB_LOG_INFO, &format!("[{id}] {detail}"));
             }
             SessionEvent::Message { topic, payload } => {
-                // Long address — host allocates/reuses short `mqtt_xxxx` id.
-                let address = point_id_for_client_topic(id, &topic);
-                let good = !rt.quality_bad;
-                let text = match std::str::from_utf8(&payload) {
-                    Ok(text) => {
-                        self.upsert_string(&address, "mqtt", text, good);
-                        Some(text.to_string())
+                // Only hub Input (parse_rules) paths become points — wide subscribe
+                // may be broad for traffic/bring-up without promoting every message.
+                let rules = rt.config.parse_rules.clone();
+                let conn = rt.config.id.clone();
+                let bad = rt.quality_bad;
+                let text = std::str::from_utf8(&payload).ok().map(|s| s.to_string());
+                for rule in rules {
+                    if !topic_matches(&rule.topic, &topic) {
+                        continue;
                     }
-                    Err(_) => {
-                        self.upsert_bytes(&address, "mqtt", &payload, good);
-                        None
-                    }
-                };
-                if let Some(text) = text.as_deref() {
-                    let rt = self.clients.get(id).unwrap();
-                    let rules = rt.config.parse_rules.clone();
-                    let conn = rt.config.id.clone();
-                    let bad = rt.quality_bad;
-                    for rule in rules {
-                        let path = rule.path.trim();
-                        if path.is_empty() || !topic_matches(&rule.topic, &topic) {
-                            continue;
-                        }
-                        if let Some(value) = extract_path_value(text, path) {
-                            let field_addr = point_id_for_client_field(&conn, &topic, path);
+                    let path = rule.path.trim();
+                    if path.is_empty() {
+                        // Whole-payload bind.
+                        let address = point_id_for_client_topic(&conn, &topic);
+                        if let Some(text) = text.as_deref() {
                             if rule.point.trim().is_empty() {
-                                self.upsert_string(&field_addr, "mqtt", &value, !bad);
+                                self.upsert_string(&address, "mqtt", text, !bad);
                             } else {
-                                // Explicit short id; address stays source metadata.
-                                self.upsert_string(rule.point.trim(), &field_addr, &value, !bad);
+                                self.upsert_string(rule.point.trim(), &address, text, !bad);
                             }
+                        } else if rule.point.trim().is_empty() {
+                            self.upsert_bytes(&address, "mqtt", &payload, !bad);
+                        } else {
+                            self.upsert_bytes(rule.point.trim(), &address, &payload, !bad);
+                        }
+                        continue;
+                    }
+                    let Some(text) = text.as_deref() else {
+                        continue;
+                    };
+                    if let Some(value) = extract_path_value(text, path) {
+                        let field_addr = point_id_for_client_field(&conn, &topic, path);
+                        if rule.point.trim().is_empty() {
+                            self.upsert_string(&field_addr, "mqtt", &value, !bad);
+                        } else {
+                            self.upsert_string(rule.point.trim(), &field_addr, &value, !bad);
                         }
                     }
                 }

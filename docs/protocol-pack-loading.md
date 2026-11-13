@@ -39,15 +39,19 @@ PB_MODULES="$PWD/modules" DISPLAY=:0 cargo run -p pb-ui
 PB_MODULES="$PWD/modules" cargo run -p pb-service
 ```
 
-If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use the MQTT panel (or smoke script) to subscribe and publish. Subscribe payloads land as sequential short host point ids (`mqtt_1`, `mqtt_2`, … — never reused in a project); the broker/topic (and optional JSON `::path`) is kept as **source** metadata. Bindings persist in `project.json` under `points`.
+If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use the MQTT panel for connections and hub **Input** / **Output** nodes for point binds (or the smoke script). Only hub Input–defined topic/field paths become host points (sequential short ids `mqtt_1`, `mqtt_2`, … — never reused in a project); the broker/topic (and optional JSON `::path`) is kept as **source** metadata. Bindings persist in `project.json` under `points`. Wide subscribe on a connection is optional traffic / bring-up — it does not promote every message.
 
-### Project JSON (multi-client MQTT)
+### Project JSON (MQTT connections + hub binds)
 
-Editable wire config (not layout). Default path: `…/ProtocolBench/project.json` (via `directories`). File → Open / Save as project uses a path dialog (non-blocking). MQTT panel changes autosave here.
+Editable wire config (not dock layout). Default path: `…/ProtocolBench/project.json` (via `directories`). File → Open / Save as project uses a path dialog (non-blocking). MQTT panel and hub Input/Output bind changes autosave here.
+
+- **MQTT panel** = connections (broker, client id, optional wide subscribe).
+- **Hub Input/Output nodes** = point promotion. Many Inputs may share one connection; each owns its own binds (overlap OK).
+- **`hubs`** in `project.json` holds the diagram + MQTT binds (v4+). Older files without `hubs` keep the diagram from `ui.toml` until the next save.
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "points": [
     { "id": "mqtt_1", "source": "mqtt/local/pb/in" },
     { "id": "mqtt_2", "source": "mqtt/local/pb/in::temp" }
@@ -67,16 +71,46 @@ Editable wire config (not layout). Default path: `…/ProtocolBench/project.json
         "password": "",
         "transport": "tcp",
         "subscriptions": ["pb/#"],
-        "parse_rules": [{ "topic": "pb/#", "path": "temp", "point": "mqtt_2" }],
-        "outputs": [{ "point": "mqtt_1", "topic": "out/x", "qos": 0, "retain": false }],
         "auto_connect": true
+      }
+    ]
+  },
+  "hubs": {
+    "hubs": [
+      {
+        "id": 6,
+        "name": "Edge",
+        "protocol": "Mqtt",
+        "sources": [
+          {
+            "id": 7,
+            "protocol": "Mqtt",
+            "label": "Local broker",
+            "mqtt_connection": "local",
+            "mqtt_inputs": [
+              { "topic": "pb/in", "path": "", "point": "mqtt_1" },
+              { "topic": "pb/in", "path": "temp", "point": "mqtt_2" }
+            ]
+          }
+        ],
+        "outputs": [
+          {
+            "id": 8,
+            "protocol": "Mqtt",
+            "label": "Upstream",
+            "mqtt_connection": "local",
+            "mqtt_outputs": [
+              { "point": "mqtt_1", "topic": "out/x", "qos": 0, "retain": false }
+            ]
+          }
+        ]
       }
     ]
   }
 }
 ```
 
-`ui.toml` remains layout/theme only. Password is stored in the project JSON for now (no keyring).
+Legacy client-level `parse_rules` / `outputs` on MQTT clients migrate onto hub Input/Output nodes on load. `ui.toml` remains layout/theme (and a hub fallback until project v4 hubs are saved). Password is stored in the project JSON for now (no keyring).
 
 ## Option A — in-process `cdylib` + fixed C ABI — **settled**
 

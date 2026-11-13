@@ -1,5 +1,5 @@
 //! Pane bodies. Tables are empty on purpose: this build does not read or write a link.
-//! MQTT lives in `mqtt_panel` (multi-client Inputs / Outputs).
+//! MQTT lives in `mqtt_panel` (connections); hub Input/Output nodes own point binds.
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
 use pb_engine::{EngineHandle, HostSnapshot, PointSnapshot};
@@ -49,9 +49,12 @@ pub fn paint(
 ) -> crate::hubs::HubChange {
     match pane {
         DockPane::Project => project_panel(ui, hubs, p),
-        DockPane::Hubs => crate::hubs::paint(ui, hubs, p),
+        DockPane::Hubs => {
+            let conns = mqtt.connection_choices();
+            crate::hubs::paint(ui, hubs, p, &conns)
+        }
         DockPane::Mqtt => {
-            mqtt_panel::paint(ui, host, p, engine, mqtt);
+            mqtt_panel::paint(ui, host, p, engine, mqtt, hubs);
             crate::hubs::HubChange::quiet()
         }
         DockPane::Points => {

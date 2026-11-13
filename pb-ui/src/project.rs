@@ -1,15 +1,17 @@
-//! Protocol Bench project file (JSON) — multi-client MQTT + point id bindings.
+//! Protocol Bench project file (JSON) — MQTT connections, hub Input/Output binds,
+//! and point id bindings.
 //!
 //! Default path: `directories` → `…/ProtocolBench/project.json`
-//! Layout/theme stay in `ui.toml`.
+//! Layout/theme stay in `ui.toml` (hub diagram also mirrored here when saved).
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::hubs::{HubModel, MqttInputBind, MqttOutputBind};
 use crate::mqtt_panel::{MqttClient, MqttOutput, MqttPanelState, MqttParseRule};
 use pb_points::{is_address_path, is_short_point_id, PointBinding, PointStore};
 
-pub const PROJECT_VERSION: u32 = 3;
+pub const PROJECT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectFile {
@@ -23,6 +25,9 @@ pub struct ProjectFile {
     pub next_point_seq: u64,
     #[serde(default)]
     pub mqtt: MqttProject,
+    /// Hub diagram + Input/Output MQTT binds. Absent on older files → keep ui.toml hubs.
+    #[serde(default)]
+    pub hubs: Option<HubModel>,
 }
 
 fn default_next_point_seq() -> u64 {
@@ -40,6 +45,7 @@ impl Default for ProjectFile {
             points: Vec::new(),
             next_point_seq: 1,
             mqtt: MqttProject::default(),
+            hubs: None,
         }
     }
 }
@@ -241,11 +247,6 @@ impl MqttClientSerde {
                 .collect(),
             auto_connect: self.auto_connect,
             draft_sub: String::new(),
-            draft_path_topic: String::new(),
-            draft_path: String::new(),
-            draft_path_point: String::new(),
-            draft_out_point: String::new(),
-            draft_out_topic: String::new(),
         }
     }
 }
@@ -297,6 +298,37 @@ pub fn migrate_panel_point_refs(state: &mut MqttPanelState, store: &mut PointSto
         for out in &mut client.outputs {
             out.point = resolve_point_ref(&out.point, &known, &client.id, store);
         }
+    }
+}
+
+/// Move client-level Inputs/Outputs onto hub nodes, then clear the client copies.
+pub fn migrate_client_binds_to_hubs(state: &mut MqttPanelState, hubs: &mut HubModel) {
+    for client in &mut state.clients {
+        let inputs: Vec<MqttInputBind> = client
+            .parse_rules
+            .iter()
+            .map(|r| MqttInputBind {
+                topic: r.topic.clone(),
+                path: r.path.clone(),
+                point: r.point.clone(),
+            })
+            .collect();
+        let outputs: Vec<MqttOutputBind> = client
+            .outputs
+            .iter()
+            .map(|o| MqttOutputBind {
+                point: o.point.clone(),
+                topic: o.topic.clone(),
+                qos: o.qos,
+                retain: o.retain,
+            })
+            .collect();
+        if inputs.is_empty() && outputs.is_empty() {
+            continue;
+        }
+        hubs.adopt_legacy_mqtt_client_binds(&client.id, &inputs, &outputs);
+        client.parse_rules.clear();
+        client.outputs.clear();
     }
 }
 
@@ -412,6 +444,7 @@ pub fn load(path: &Path) -> Result<ProjectFile, String> {
                 selected_id: client.id.clone(),
                 clients: vec![client],
             },
+            hubs: None,
         });
     }
     let mut project: ProjectFile = serde_json::from_value(value).map_err(|e| e.to_string())?;
@@ -477,6 +510,7 @@ mod tests {
             }],
             next_point_seq: 2,
             mqtt: MqttProject::from_panel(&panel),
+            hubs: None,
         };
         let text = serde_json::to_string_pretty(&project).unwrap();
         let back: ProjectFile = serde_json::from_str(&text).unwrap();

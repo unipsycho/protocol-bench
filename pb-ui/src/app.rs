@@ -45,10 +45,12 @@ pub struct ProtocolBenchApp {
     last_save: Instant,
     mqtt: MqttPanelState,
     points: PointsPanelState,
-    /// Current JSON project path (MQTT wire config).
+    /// Current JSON project path (MQTT + hubs + points).
     project_path: PathBuf,
     /// Last MQTT snapshot written to the project file.
     mqtt_saved: MqttProject,
+    /// Last hubs snapshot written to the project file.
+    hubs_saved: crate::hubs::HubModel,
     last_project_save: Instant,
     project_dialog: Option<ProjectDialog>,
 }
@@ -98,10 +100,14 @@ impl ProtocolBenchApp {
         let mut mqtt_saved = MqttProject::default();
         let mut status = "Ready".into();
         let engine = EngineHandle::spawn();
+        let mut ui_state = ui_state;
         if project_path.is_file() {
             match project::load(&project_path) {
                 Ok(file) => {
                     file.mqtt.apply_to_panel(&mut mqtt);
+                    if let Some(hubs) = file.hubs {
+                        ui_state.hubs = hubs;
+                    }
                     if let Ok(mut store) = engine.points().lock() {
                         project::import_bindings_to_store(
                             &mut store,
@@ -110,8 +116,9 @@ impl ProtocolBenchApp {
                         );
                         project::migrate_panel_point_refs(&mut mqtt, &mut store);
                     }
-                    mqtt_saved = file.mqtt.clone();
-                    mqtt_panel::apply_mqtt_session(&engine, &mut mqtt);
+                    project::migrate_client_binds_to_hubs(&mut mqtt, &mut ui_state.hubs);
+                    mqtt_saved = MqttProject::from_panel(&mqtt);
+                    mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &ui_state.hubs);
                     status = format!("Loaded project {}", project_path.display());
                 }
                 Err(err) => {
@@ -119,6 +126,7 @@ impl ProtocolBenchApp {
                 }
             }
         }
+        let hubs_saved = ui_state.hubs.clone();
         Self {
             engine,
             ui_state,
@@ -138,6 +146,7 @@ impl ProtocolBenchApp {
             points: PointsPanelState::default(),
             project_path,
             mqtt_saved,
+            hubs_saved,
             last_project_save: Instant::now(),
             project_dialog: None,
         }
@@ -163,7 +172,8 @@ impl ProtocolBenchApp {
     fn autosave_project(&mut self, _host: &pb_engine::HostSnapshot) {
         let current = MqttProject::from_panel(&self.mqtt);
         let mqtt_dirty = current != self.mqtt_saved;
-        let min_age = if mqtt_dirty {
+        let hubs_dirty = self.ui_state.hubs != self.hubs_saved;
+        let min_age = if mqtt_dirty || hubs_dirty {
             Duration::from_millis(500)
         } else {
             // Flush new short-id bindings from live traffic.
@@ -196,9 +206,11 @@ impl ProtocolBenchApp {
             points,
             next_point_seq,
             mqtt: mqtt.clone(),
+            hubs: Some(self.ui_state.hubs.clone()),
         };
         project::save(&self.project_path, &file)?;
         self.mqtt_saved = mqtt;
+        self.hubs_saved = self.ui_state.hubs.clone();
         self.last_project_save = Instant::now();
         Ok(())
     }
@@ -206,13 +218,18 @@ impl ProtocolBenchApp {
     fn load_project_from_path(&mut self, path: PathBuf) -> Result<(), String> {
         let file = project::load(&path)?;
         file.mqtt.apply_to_panel(&mut self.mqtt);
+        if let Some(hubs) = file.hubs {
+            self.ui_state.hubs = hubs;
+        }
         if let Ok(mut store) = self.engine.points().lock() {
             project::import_bindings_to_store(&mut store, &file.points, file.next_point_seq);
             project::migrate_panel_point_refs(&mut self.mqtt, &mut store);
         }
-        self.mqtt_saved = file.mqtt.clone();
+        project::migrate_client_binds_to_hubs(&mut self.mqtt, &mut self.ui_state.hubs);
+        self.mqtt_saved = MqttProject::from_panel(&self.mqtt);
+        self.hubs_saved = self.ui_state.hubs.clone();
         self.project_path = path;
-        mqtt_panel::apply_mqtt_session(&self.engine, &mut self.mqtt);
+        mqtt_panel::apply_mqtt_session(&self.engine, &mut self.mqtt, &self.ui_state.hubs);
         self.status = format!("Opened {}", self.project_path.display());
         Ok(())
     }
@@ -240,7 +257,7 @@ impl ProtocolBenchApp {
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new(
-                        "JSON project (multi-client MQTT: brokers, creds, subscriptions, parse paths, outputs). Path entry avoids Hyprland file-dialog stalls.",
+                        "JSON project (MQTT connections, hub Input/Output binds, points). Path entry avoids Hyprland file-dialog stalls.",
                     )
                     .font(font_ui(12.0))
                     .color(p.muted),
@@ -1241,6 +1258,12 @@ impl ProtocolBenchApp {
             );
             if hub_change.dirty {
                 self.mark_dirty();
+                // Hub Input/Output MQTT binds feed the pack session.
+                mqtt_panel::apply_mqtt_session(
+                    &self.engine,
+                    &mut self.mqtt,
+                    &self.ui_state.hubs,
+                );
             }
             if let Some(pane) = hub_change.open {
                 self.ui_state.reveal_pane(pane);

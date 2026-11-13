@@ -49,16 +49,23 @@ Each protocol engine owns its work on a thread the UI does not block. `pb-engine
 
 ## Hubs
 
-A **hub** is the main protocol conversion / routing point. It is always **one protocol**, and only **server-capable** protocols can be hubs (Modbus server, MQTT broker / server-oriented, OPC UA server). Sources and outputs may use other protocols. Optional **aggregators** and **calculations** sit **on the edges** (the data path between nodes), not as free-floating peers of the hub. Flow: sources → optional transforms on edges → hub → optional transforms on edges → outputs (and multi-hub as before). A diagram shows what converts to what.
+A **hub** is the main protocol conversion / routing point. It is always **one protocol**, and only **server-capable** protocols can be hubs (Modbus server, MQTT broker / server-oriented, OPC UA server). **Input** (source) and **Output** nodes may use other protocols. Optional **aggregators** and **calculations** sit **on the edges** (the data path between nodes), not as free-floating peers of the hub. Flow: Inputs → optional transforms on edges → hub → optional transforms on edges → Outputs (and multi-hub as before). A diagram shows what converts to what.
 
 - More than one hub when there are multiple conversion points. Many projects use a single hub. There is no Split hub type.
 - Arrange the diagram: drag nodes, click a node or connection for details, open the matching protocol panel from a protocol node.
 - Add aggregator / Add calculation attaches to a **selected link/edge** (or a right-clicked connection), rendered on that line.
 - Sample hubs ship for framing (Plant Modbus + Edge MQTT, MQTT link between them) — configuration only, not a live bridge.
 
+### MQTT connections vs hub Input/Output binds
+
+- The **MQTT panel** owns **connections only** (broker, client id, credentials, transport, optional wide subscribe for traffic / bring-up).
+- **Point promotion** lives on hub **Input** / **Output** nodes: an Input picks a connection + topic/field → creates points; an Output picks a connection + topic + points to publish.
+- Many Input nodes may **share one MQTT connection**; each node owns its own topic/field → point binds. Overlap across nodes is OK (different graph uses).
+- Broker subscribe may be broad; **only node-defined paths become points**. Bindings + hubs persist in `project.json`.
+
 ## What runs today, and what does not
 
-Today: the window, layout, themes, the hub diagram, the engine thread boundary, host point store (`pb-points`), pack loader, headless `pb-service`, and the **MQTT client pack** (subscribe → points, publish / point-write → publish; TCP / TLS / WS / WSS).
+Today: the window, layout, themes, the hub diagram (Input/Output MQTT binds), the engine thread boundary, host point store (`pb-points`), pack loader, headless `pb-service`, and the **MQTT client pack** (connection + hub-node binds → points / publish; TCP / TLS / WS / WSS).
 
 Not yet: embedded MQTT broker (hub role), other protocol packs, Sparkplug, license signing enforcement, MSI, full UI↔service IPC / MCP. No file requester in this build. When one is added, it must not block the UI thread (blocking dialogs / vsync stalls on another Hyprland workspace trip “not responding”).
 
