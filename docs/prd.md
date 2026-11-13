@@ -49,7 +49,7 @@ Each protocol engine owns its work on a thread the UI does not block. `pb-engine
 
 ## Hubs
 
-A hub is a conversion point. Sources come in. Outputs leave. A diagram shows what converts to what.
+A hub is a conversion point. Sources come in. Aggregators and calculations sit between the hub and its outputs. Outputs leave. A diagram shows what converts to what.
 
 - More than one hub; a hub can be split across protocols or locked to one.
 - Arrange the diagram: drag nodes, click for details, open the matching protocol panel from a protocol node.
