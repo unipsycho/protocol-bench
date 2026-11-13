@@ -1,4 +1,4 @@
-//! Protocol Bench project file (JSON) — multi-client MQTT wire config.
+//! Protocol Bench project file (JSON) — multi-client MQTT + point id bindings.
 //!
 //! Default path: `directories` → `…/ProtocolBench/project.json`
 //! Layout/theme stay in `ui.toml`.
@@ -7,43 +7,26 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::mqtt_panel::{MqttClient, MqttOutput, MqttPanelState, MqttParseRule};
+use pb_points::{is_address_path, is_short_point_id, PointBinding, PointStore};
 
-/// Rewrite legacy `mqtt/<topic>` point ids to `mqtt/<client>/<topic>`.
-fn migrate_point_name(name: &str, known_clients: &[String], default_client: &str) -> String {
-    // Keep logic local so UI does not depend on the pack crate.
-    let name = name.trim();
-    if name.is_empty() || !name.starts_with("mqtt/") {
-        return name.to_string();
-    }
-    let rest = &name["mqtt/".len()..];
-    let (body, path) = match rest.split_once("::") {
-        Some((b, p)) if !p.is_empty() => (b, Some(p)),
-        _ => (rest, None),
-    };
-    if let Some((first, topic)) = body.split_once('/') {
-        if !topic.is_empty() && known_clients.iter().any(|c| c == first) {
-            return name.to_string();
-        }
-    }
-    let client = if default_client.is_empty() {
-        "default"
-    } else {
-        default_client
-    };
-    match path {
-        Some(p) => format!("mqtt/{client}/{body}::{p}"),
-        None => format!("mqtt/{client}/{body}"),
-    }
-}
-
-pub const PROJECT_VERSION: u32 = 2;
+pub const PROJECT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectFile {
     #[serde(default = "default_version")]
     pub version: u32,
+    /// Short id ↔ source address bindings (`mqtt_1` → `mqtt/local/topic`).
+    #[serde(default)]
+    pub points: Vec<PointBindingSerde>,
+    /// Next `mqtt_N` number to issue (never reuse within a project).
+    #[serde(default = "default_next_point_seq")]
+    pub next_point_seq: u64,
     #[serde(default)]
     pub mqtt: MqttProject,
+}
+
+fn default_next_point_seq() -> u64 {
+    1
 }
 
 fn default_version() -> u32 {
@@ -54,12 +37,38 @@ impl Default for ProjectFile {
     fn default() -> Self {
         Self {
             version: PROJECT_VERSION,
+            points: Vec::new(),
+            next_point_seq: 1,
             mqtt: MqttProject::default(),
         }
     }
 }
 
-/// Multi-client MQTT section (v2). v1 single-client files migrate on load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PointBindingSerde {
+    pub id: String,
+    pub source: String,
+}
+
+impl From<&PointBinding> for PointBindingSerde {
+    fn from(b: &PointBinding) -> Self {
+        Self {
+            id: b.id.clone(),
+            source: b.source.clone(),
+        }
+    }
+}
+
+impl PointBindingSerde {
+    pub fn to_binding(&self) -> PointBinding {
+        PointBinding {
+            id: self.id.clone(),
+            source: self.source.clone(),
+        }
+    }
+}
+
+/// Multi-client MQTT section (v2+). v1 single-client files migrate on load.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MqttProject {
     #[serde(default)]
@@ -257,22 +266,71 @@ impl MqttProject {
         if state.clients.is_empty() {
             state.clients.push(MqttClient::default_local());
         }
-        let known: Vec<String> = state.clients.iter().map(|c| c.id.clone()).collect();
-        for client in &mut state.clients {
-            for rule in &mut client.parse_rules {
-                if !rule.point.is_empty() {
-                    rule.point = migrate_point_name(&rule.point, &known, &client.id);
-                }
-            }
-            for out in &mut client.outputs {
-                out.point = migrate_point_name(&out.point, &known, &client.id);
-            }
-        }
         state.selected = state
             .clients
             .iter()
             .position(|c| c.id == self.selected_id)
             .unwrap_or(0);
+    }
+}
+
+/// Rewrite legacy long-path point refs to short ids via the host store.
+pub fn migrate_panel_point_refs(state: &mut MqttPanelState, store: &mut PointStore) {
+    let known: Vec<String> = state.clients.iter().map(|c| c.id.clone()).collect();
+    for client in &mut state.clients {
+        for rule in &mut client.parse_rules {
+            if !rule.point.is_empty() {
+                rule.point = resolve_point_ref(&rule.point, &known, &client.id, store);
+            }
+        }
+        for out in &mut client.outputs {
+            out.point = resolve_point_ref(&out.point, &known, &client.id, store);
+        }
+    }
+}
+
+fn resolve_point_ref(
+    raw: &str,
+    known_clients: &[String],
+    default_client: &str,
+    store: &mut PointStore,
+) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() || is_short_point_id(raw) {
+        return raw.to_string();
+    }
+    let address = if is_address_path(raw) {
+        migrate_address(raw, known_clients, default_client)
+    } else {
+        return raw.to_string();
+    };
+    store.ensure_id("mqtt", &address)
+}
+
+/// Rewrite legacy `mqtt/<topic>` → `mqtt/<client>/<topic>`.
+fn migrate_address(name: &str, known_clients: &[String], default_client: &str) -> String {
+    let name = name.trim();
+    if !name.starts_with("mqtt/") {
+        return name.to_string();
+    }
+    let rest = &name["mqtt/".len()..];
+    let (body, path) = match rest.split_once("::") {
+        Some((b, p)) if !p.is_empty() => (b, Some(p)),
+        _ => (rest, None),
+    };
+    if let Some((first, topic)) = body.split_once('/') {
+        if !topic.is_empty() && known_clients.iter().any(|c| c == first) {
+            return name.to_string();
+        }
+    }
+    let client = if default_client.is_empty() {
+        "default"
+    } else {
+        default_client
+    };
+    match path {
+        Some(p) => format!("mqtt/{client}/{body}::{p}"),
+        None => format!("mqtt/{client}/{body}"),
     }
 }
 
@@ -337,6 +395,8 @@ pub fn load(path: &Path) -> Result<ProjectFile, String> {
             .unwrap_or(false);
         return Ok(ProjectFile {
             version: PROJECT_VERSION,
+            points: Vec::new(),
+            next_point_seq: 1,
             mqtt: MqttProject {
                 selected_id: client.id.clone(),
                 clients: vec![client],
@@ -350,6 +410,15 @@ pub fn load(path: &Path) -> Result<ProjectFile, String> {
     if project.mqtt.clients.is_empty() {
         project.mqtt = MqttProject::default();
     }
+    if project.next_point_seq == 0 {
+        project.next_point_seq = 1;
+    }
+    // High-water mark from any persisted ids.
+    for b in &project.points {
+        if let Some(n) = b.id.rsplit_once('_').and_then(|(_, s)| s.parse::<u64>().ok()) {
+            project.next_point_seq = project.next_point_seq.max(n.saturating_add(1));
+        }
+    }
     project.version = PROJECT_VERSION;
     Ok(project)
 }
@@ -362,6 +431,25 @@ pub fn save(path: &Path, project: &ProjectFile) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| e.to_string())
 }
 
+/// Snapshot point bindings from the live host store for project.json.
+pub fn bindings_from_store(store: &PointStore) -> Vec<PointBindingSerde> {
+    store
+        .export_bindings()
+        .iter()
+        .map(PointBindingSerde::from)
+        .collect()
+}
+
+pub fn import_bindings_to_store(
+    store: &mut PointStore,
+    bindings: &[PointBindingSerde],
+    next_point_seq: u64,
+) {
+    let list: Vec<PointBinding> = bindings.iter().map(|b| b.to_binding()).collect();
+    store.import_bindings(&list);
+    store.set_next_seq_at_least(next_point_seq.max(1));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,10 +460,32 @@ mod tests {
         panel.clients[0].host = "broker.local".into();
         let project = ProjectFile {
             version: PROJECT_VERSION,
+            points: vec![PointBindingSerde {
+                id: "mqtt_1".into(),
+                source: "mqtt/local/pb/in".into(),
+            }],
+            next_point_seq: 2,
             mqtt: MqttProject::from_panel(&panel),
         };
         let text = serde_json::to_string_pretty(&project).unwrap();
         let back: ProjectFile = serde_json::from_str(&text).unwrap();
         assert_eq!(back.mqtt.clients[0].host, "broker.local");
+        assert_eq!(back.points[0].id, "mqtt_1");
+    }
+
+    #[test]
+    fn migrates_long_path_output_to_short_id() {
+        let mut panel = MqttPanelState::default();
+        panel.clients[0].outputs.push(MqttOutput {
+            point: "mqtt/local/pb/out".into(),
+            topic: "pb/out".into(),
+            qos: 0,
+            retain: false,
+        });
+        let mut store = PointStore::new();
+        migrate_panel_point_refs(&mut panel, &mut store);
+        let id = &panel.clients[0].outputs[0].point;
+        assert!(is_short_point_id(id), "{id}");
+        assert_eq!(store.source_for_id(id), Some("mqtt/local/pb/out"));
     }
 }

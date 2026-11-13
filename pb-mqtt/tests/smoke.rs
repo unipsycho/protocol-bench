@@ -87,7 +87,7 @@ fn subscribe_point_and_publish() {
 
     let topic = "pb/smoke/in";
     let cfg = format!(
-        r#"{{"clients":[{{"id":"smoke","label":"smoke","host":"{host}","port":{port},"client_id":"pb-smoke","transport":"tcp","subscriptions":["{topic}"],"auto_connect":true}}]}}"#
+        r#"{{"clients":[{{"id":"smoke","label":"smoke","host":"{host}","port":{port},"client_id":"pb-smoke","transport":"tcp","subscriptions":["{topic}"],"outputs":[{{"point":"mqtt_1","topic":"pb/smoke/write","qos":0,"retain":false}}],"auto_connect":true}}]}}"#
     );
     let configure = api.configure.expect("configure");
     assert_eq!(unsafe { configure(handle, cfg.as_ptr() as *const c_char, cfg.len()) }, 0);
@@ -122,8 +122,10 @@ fn subscribe_point_and_publish() {
     assert!(status.success());
 
     let got = deadline_points(&captured, poll, handle, "smoke-payload", deadline);
+    // Pack upserts the long address; the real host remaps to `mqtt_xxxx`.
     assert!(
-        got.iter().any(|(n, v)| n.contains(topic) && v == "smoke-payload"),
+        got.iter()
+            .any(|(n, v)| n.contains(topic) && v == "smoke-payload"),
         "subscribe did not upsert point: {got:?}"
     );
 
@@ -145,9 +147,9 @@ fn subscribe_point_and_publish() {
         0
     );
 
-    // Point write → publish path.
+    // Point write → publish path (short id bound in outputs).
     let write_point = api.write_point.expect("write_point");
-    let point_name = std::ffi::CString::new("mqtt/smoke/pb/smoke/write").unwrap();
+    let point_name = std::ffi::CString::new("mqtt_1").unwrap();
     let body = b"via-point";
     assert_eq!(
         unsafe {

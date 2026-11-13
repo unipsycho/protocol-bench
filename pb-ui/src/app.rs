@@ -100,6 +100,14 @@ impl ProtocolBenchApp {
             match project::load(&project_path) {
                 Ok(file) => {
                     file.mqtt.apply_to_panel(&mut mqtt);
+                    if let Ok(mut store) = engine.points().lock() {
+                        project::import_bindings_to_store(
+                            &mut store,
+                            &file.points,
+                            file.next_point_seq,
+                        );
+                        project::migrate_panel_point_refs(&mut mqtt, &mut store);
+                    }
                     mqtt_saved = file.mqtt.clone();
                     mqtt_panel::apply_mqtt_session(&engine, &mqtt);
                     status = format!("Loaded project {}", project_path.display());
@@ -151,10 +159,14 @@ impl ProtocolBenchApp {
 
     fn autosave_project(&mut self, _host: &pb_engine::HostSnapshot) {
         let current = MqttProject::from_panel(&self.mqtt);
-        if current == self.mqtt_saved {
-            return;
-        }
-        if self.last_project_save.elapsed() < Duration::from_millis(500) {
+        let mqtt_dirty = current != self.mqtt_saved;
+        let min_age = if mqtt_dirty {
+            Duration::from_millis(500)
+        } else {
+            // Flush new short-id bindings from live traffic.
+            Duration::from_secs(2)
+        };
+        if self.last_project_save.elapsed() < min_age {
             return;
         }
         match self.save_project_now() {
@@ -165,8 +177,21 @@ impl ProtocolBenchApp {
 
     fn save_project_now(&mut self) -> Result<(), String> {
         let mqtt = MqttProject::from_panel(&self.mqtt);
+        let (points, next_point_seq) = self
+            .engine
+            .points()
+            .lock()
+            .map(|store| {
+                (
+                    project::bindings_from_store(&store),
+                    store.next_seq(),
+                )
+            })
+            .unwrap_or_else(|_| (Vec::new(), 1));
         let file = ProjectFile {
             version: project::PROJECT_VERSION,
+            points,
+            next_point_seq,
             mqtt: mqtt.clone(),
         };
         project::save(&self.project_path, &file)?;
@@ -178,6 +203,10 @@ impl ProtocolBenchApp {
     fn load_project_from_path(&mut self, path: PathBuf) -> Result<(), String> {
         let file = project::load(&path)?;
         file.mqtt.apply_to_panel(&mut self.mqtt);
+        if let Ok(mut store) = self.engine.points().lock() {
+            project::import_bindings_to_store(&mut store, &file.points, file.next_point_seq);
+            project::migrate_panel_point_refs(&mut self.mqtt, &mut store);
+        }
         self.mqtt_saved = file.mqtt.clone();
         self.project_path = path;
         mqtt_panel::apply_mqtt_session(&self.engine, &self.mqtt);

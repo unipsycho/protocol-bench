@@ -17,7 +17,7 @@ Entitlements are license-driven: **no fixed free protocol list** — the license
 | `pb-abi` | C ABI: `pb_pack_abi_version`, `pb_pack_register`, opaque handles, host callbacks (point upsert + log); host refuses load on ABI skew |
 | `pb-points` | Host-owned typed point store; packs upsert only through ABI callbacks |
 | `pb-engine` | `libloading` modules-dir loader, verify stub (signature later), wrap pack as `ProtocolEngine`; commands: configure / connect / disconnect / subscribe / publish / write_point |
-| `pb-mqtt` | Connect / disconnect / reconnect; last error + quality; subscribe → points (`mqtt/<client_name>/<topic>`); JSON parse paths → field points (`mqtt/<client_name>/<topic>::<path>`); point write / publish → broker; TLS / WSS; password in JSON config (no keyring) |
+| `pb-mqtt` | Connect / disconnect / reconnect; last error + quality; subscribe → sequential short point ids (`mqtt_1`, `mqtt_2`, …; never reused) with source metadata `mqtt/<client_name>/<topic>` (JSON fields `…::path`); point write / publish → broker; TLS / WSS; password in JSON config (no keyring) |
 | `pb-service` | Headless binary: load `modules/`, run host |
 | UI MQTT panel | Live snapshot (connected, topics, last error) + fields to connect one client |
 
@@ -39,7 +39,7 @@ PB_MODULES="$PWD/modules" DISPLAY=:0 cargo run -p pb-ui
 PB_MODULES="$PWD/modules" cargo run -p pb-service
 ```
 
-If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use the MQTT panel (or smoke script) to subscribe and publish. Subscribe payloads land as host points named `mqtt/<client_name>/<topic>` (JSON fields: `mqtt/<client_name>/<topic>::<path>`). Legacy `mqtt/<topic>` ids are migrated on configure / project load.
+If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use the MQTT panel (or smoke script) to subscribe and publish. Subscribe payloads land as sequential short host point ids (`mqtt_1`, `mqtt_2`, … — never reused in a project); the broker/topic (and optional JSON `::path`) is kept as **source** metadata. Bindings persist in `project.json` under `points`.
 
 ### Project JSON (multi-client MQTT)
 
@@ -47,7 +47,12 @@ Editable wire config (not layout). Default path: `…/ProtocolBench/project.json
 
 ```json
 {
-  "version": 2,
+  "version": 3,
+  "points": [
+    { "id": "mqtt_1", "source": "mqtt/local/pb/in" },
+    { "id": "mqtt_2", "source": "mqtt/local/pb/in::temp" }
+  ],
+  "next_point_seq": 3,
   "mqtt": {
     "selected_id": "local",
     "clients": [
@@ -61,8 +66,8 @@ Editable wire config (not layout). Default path: `…/ProtocolBench/project.json
         "password": "",
         "transport": "tcp",
         "subscriptions": ["pb/#"],
-        "parse_rules": [{ "topic": "pb/#", "path": "temp", "point": "" }],
-        "outputs": [{ "point": "some/point", "topic": "out/x", "qos": 0, "retain": false }],
+        "parse_rules": [{ "topic": "pb/#", "path": "temp", "point": "mqtt_2" }],
+        "outputs": [{ "point": "mqtt_1", "topic": "out/x", "qos": 0, "retain": false }],
         "auto_connect": true
       }
     ]

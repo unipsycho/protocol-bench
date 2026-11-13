@@ -41,7 +41,7 @@ pub fn paint(
 fn points_panel(ui: &mut egui::Ui, host: &HostSnapshot, p: &ThemePalette) {
     ui.label(
         egui::RichText::new(
-            "Host points bus — MQTT subscriptions (and later other inputs) land here for mapping/hub conversion.",
+            "Host points bus — sequential ids (`mqtt_1`, …); SOURCE holds broker/topic/field metadata.",
         )
         .font(font_ui(12.5))
         .color(p.muted),

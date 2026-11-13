@@ -165,16 +165,16 @@ pub fn paint(
     state: &mut MqttPanelState,
 ) {
     state.ensure_selection();
+    // Pad without wrapping in a horizontal row (that collapses available height).
     ui.add_space(4.0);
+    let width = (ui.available_width() - 16.0).max(1.0);
     ui.horizontal(|ui| {
         ui.add_space(8.0);
-        let width = (ui.available_width() - 8.0).max(1.0);
         ui.allocate_ui_with_layout(
             Vec2::new(width, ui.available_height()),
             egui::Layout::top_down(egui::Align::Min),
             |ui| paint_body(ui, host, p, engine, state),
         );
-        ui.add_space(8.0);
     });
 }
 
@@ -201,40 +201,48 @@ fn paint_body(
     clients_bar(ui, state, engine, p);
     ui.add_space(10.0);
 
-    let side_by_side = ui.available_width() >= SIDE_BY_SIDE_MIN;
+    // Capture remaining pane size before nested layouts eat the height budget.
+    let rem = ui.available_size();
+    let side_by_side = rem.x >= SIDE_BY_SIDE_MIN;
     if side_by_side {
-        let total = ui.available_width();
         let gap = 16.0;
-        let left_w = (total * 0.55).clamp(340.0, total - 260.0);
-        let right_w = (total - left_w - gap).max(220.0);
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(
-                Vec2::new(left_w, ui.available_height()),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("pb_mqtt_cfg")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            selected_client_editor(ui, host, state, engine, p);
-                        });
-                },
-            );
-            ui.add_space(gap);
-            ui.allocate_ui_with_layout(
-                Vec2::new(right_w, ui.available_height()),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| live_values(ui, host, state, p, true),
-            );
-        });
+        let left_w = (rem.x * 0.55).clamp(340.0, rem.x - 260.0);
+        let right_w = (rem.x - left_w - gap).max(220.0);
+        let col_h = rem.y.max(120.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(rem.x, col_h),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(left_w, col_h),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("pb_mqtt_cfg")
+                            .max_height(col_h)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                selected_client_editor(ui, host, state, engine, p);
+                            });
+                    },
+                );
+                ui.add_space(gap);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(right_w, col_h),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| live_values(ui, host, state, p, true, col_h),
+                );
+            },
+        );
     } else {
         egui::ScrollArea::vertical()
             .id_salt("pb_mqtt_stack")
+            .max_height(rem.y.max(120.0))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                live_values(ui, host, state, p, false);
+                ui.set_min_width(ui.available_width());
+                live_values(ui, host, state, p, false, 220.0);
                 ui.add_space(12.0);
                 selected_client_editor(ui, host, state, engine, p);
             });
@@ -351,7 +359,7 @@ fn inputs_section(
     section(ui, "INPUTS — subscribe → points", p);
     ui.label(
         egui::RichText::new(
-            "Subscriptions create host points `mqtt/<client_name>/<topic>`. JSON paths create field points `mqtt/<client_name>/<topic>::<path>`.",
+            "Subscriptions create sequential point ids (`mqtt_1`, `mqtt_2`, …); broker/topic (and JSON `::path`) stay as source metadata.",
         )
         .font(font_ui(12.0))
         .color(p.muted),
@@ -408,7 +416,7 @@ fn inputs_section(
         field(ui, "JSON path", &mut c.draft_path, p);
         field(ui, "Point id", &mut c.draft_path_point, p);
         ui.label(
-            egui::RichText::new("Point id optional — default mqtt/<client_name>/<topic>::<path>")
+            egui::RichText::new("Point id optional — leave blank to auto-assign the next `mqtt_N`")
                 .font(font_ui(11.0))
                 .color(p.muted),
         );
@@ -552,13 +560,14 @@ fn live_values(
     state: &MqttPanelState,
     p: &ThemePalette,
     side: bool,
+    col_h: f32,
 ) {
     section(ui, "LIVE VALUES", p);
     let client_id = state.selected().map(|c| c.id.as_str()).unwrap_or("");
-    let prefix = format!("mqtt/{client_id}/");
+    let addr_prefix = format!("mqtt/{client_id}/");
     let points: Vec<_> = host
         .points_for_source("mqtt")
-        .filter(|pt| client_id.is_empty() || pt.name.starts_with(&prefix))
+        .filter(|pt| client_id.is_empty() || pt.source.starts_with(&addr_prefix))
         .collect();
     if points.is_empty() {
         ui.label(
@@ -569,9 +578,9 @@ fn live_values(
         return;
     }
     let height = if side {
-        ui.available_height().max(120.0)
+        (col_h - 28.0).max(80.0)
     } else {
-        ((points.len() as f32) * 22.0 + 28.0).clamp(72.0, 220.0)
+        ((points.len() as f32) * 22.0 + 28.0).clamp(72.0, col_h.min(220.0))
     };
     egui::ScrollArea::vertical()
         .id_salt("pb_mqtt_live")
@@ -592,15 +601,12 @@ fn live_values(
                     }
                     ui.end_row();
                     for pt in points {
-                        let name = pt
-                            .name
-                            .strip_prefix(&prefix)
-                            .unwrap_or(pt.name.as_str());
                         ui.label(
-                            egui::RichText::new(name)
+                            egui::RichText::new(&pt.name)
                                 .font(font_ui(12.0))
                                 .color(p.text),
-                        );
+                        )
+                        .on_hover_text(&pt.source);
                         ui.label(
                             egui::RichText::new(truncate(&pt.value, 48))
                                 .font(font_ui(12.0))

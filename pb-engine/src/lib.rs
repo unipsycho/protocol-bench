@@ -232,12 +232,16 @@ impl HostSnapshot {
         self.slots.iter().find(|slot| slot.id == id)
     }
 
-    /// Points owned by one protocol channel (e.g. `"mqtt"`).
+    /// Points for one protocol (short id `mqtt_*` or address `mqtt/…`).
     pub fn points_for_source<'a>(
         &'a self,
-        source: &'a str,
+        proto: &'a str,
     ) -> impl Iterator<Item = &'a PointSnapshot> + 'a {
-        self.points.iter().filter(move |p| p.source == source)
+        let prefix_id = format!("{proto}_");
+        let prefix_addr = format!("{proto}/");
+        self.points.iter().filter(move |p| {
+            p.name.starts_with(&prefix_id) || p.source.starts_with(&prefix_addr)
+        })
     }
 }
 

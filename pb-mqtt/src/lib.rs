@@ -171,14 +171,16 @@ impl PackState {
         }
     }
 
-    fn upsert_string(&self, name: &str, value: &str, good: bool) {
+    /// Upsert a host point. `name` is a short id or long address; `source` is
+    /// protocol (`mqtt`) when `name` is an address, or the address when `name` is short.
+    fn upsert_string(&self, name: &str, source: &str, value: &str, good: bool) {
         let Some(upsert) = self.host.upsert_point else {
             return;
         };
         let Ok(c_name) = std::ffi::CString::new(name) else {
             return;
         };
-        let Ok(c_src) = std::ffi::CString::new("mqtt") else {
+        let Ok(c_src) = std::ffi::CString::new(source) else {
             return;
         };
         let bytes = value.as_bytes();
@@ -199,14 +201,14 @@ impl PackState {
         }
     }
 
-    fn upsert_bytes(&self, name: &str, value: &[u8], good: bool) {
+    fn upsert_bytes(&self, name: &str, source: &str, value: &[u8], good: bool) {
         let Some(upsert) = self.host.upsert_point else {
             return;
         };
         let Ok(c_name) = std::ffi::CString::new(name) else {
             return;
         };
-        let Ok(c_src) = std::ffi::CString::new("mqtt") else {
+        let Ok(c_src) = std::ffi::CString::new(source) else {
             return;
         };
         unsafe {
@@ -290,15 +292,16 @@ impl PackState {
                 self.log(PB_LOG_INFO, &format!("[{id}] {detail}"));
             }
             SessionEvent::Message { topic, payload } => {
-                let point_name = point_id_for_client_topic(id, &topic);
+                // Long address — host allocates/reuses short `mqtt_xxxx` id.
+                let address = point_id_for_client_topic(id, &topic);
                 let good = !rt.quality_bad;
                 let text = match std::str::from_utf8(&payload) {
                     Ok(text) => {
-                        self.upsert_string(&point_name, text, good);
+                        self.upsert_string(&address, "mqtt", text, good);
                         Some(text.to_string())
                     }
                     Err(_) => {
-                        self.upsert_bytes(&point_name, &payload, good);
+                        self.upsert_bytes(&address, "mqtt", &payload, good);
                         None
                     }
                 };
@@ -313,12 +316,13 @@ impl PackState {
                             continue;
                         }
                         if let Some(value) = extract_path_value(text, path) {
-                            let name = if rule.point.trim().is_empty() {
-                                point_id_for_client_field(&conn, &topic, path)
+                            let field_addr = point_id_for_client_field(&conn, &topic, path);
+                            if rule.point.trim().is_empty() {
+                                self.upsert_string(&field_addr, "mqtt", &value, !bad);
                             } else {
-                                rule.point.trim().to_string()
-                            };
-                            self.upsert_string(&name, &value, !bad);
+                                // Explicit short id; address stays source metadata.
+                                self.upsert_string(rule.point.trim(), &field_addr, &value, !bad);
+                            }
                         }
                     }
                 }

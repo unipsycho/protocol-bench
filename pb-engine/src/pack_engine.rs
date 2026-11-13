@@ -343,7 +343,8 @@ pub unsafe extern "C" fn host_upsert_point(
         _ => Quality::Uncertain,
     };
     if let Ok(mut store) = bridge.points.lock() {
-        store.upsert(name, point_value, q, source);
+        // Packs may pass a long address as `name`; host owns short `XXXX_yyyy` ids.
+        store.upsert_from_pack(&name, point_value, q, &source);
     }
 }
 

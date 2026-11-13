@@ -2531,6 +2531,7 @@ dependencies = [
  "egui",
  "image",
  "pb-engine",
+ "pb-points",
  "serde",
  "serde_json",
  "toml",
