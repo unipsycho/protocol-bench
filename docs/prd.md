@@ -8,9 +8,9 @@ Checkout: `/home/mike/Documents/AAI-Projects/protocol bench` (workspace `pb-ui` 
 
 ## Product
 
-Protocol Bench is a native Rust bench for moving values between industrial and oilfield links. One process holds the points. A value that arrives on one protocol can leave on another. The screen and the converter live in the same project.
+Protocol Bench is a native Rust product for moving values between industrial and oilfield links. An always-on **service** holds the points and runs the converter; a separate **UI** configures and monitors it. A value that arrives on one protocol can leave on another. There is no dual-mode single-process bench (no “optional headless in the same binary”).
 
-This build is the shell. Live protocol I/O comes later, on the engine threads. The window is egui (`eframe`), not a web UI. Interaction follows Modbus Bench, with a Protocol Bench look.
+This build is still the shell. Live protocol I/O comes later, on the engine threads in the service. The window is egui (`eframe`), not a web UI. Interaction follows Modbus Bench, with a Protocol Bench look. Local IPC between UI and service is follow-on design (not specified here).
 
 Protocol Bench is a **new product**, separate from Modbus Bench. Modbus Bench remains the Modbus-only workbench; Protocol Bench can be tested against it.
 
@@ -35,7 +35,7 @@ Moving a value between a serial instrument, a Modbus device, a growing CSV, an M
 
 ## Engines
 
-Each protocol engine owns its work on a thread the UI does not block. `pb-engine` is that boundary: the UI takes a snapshot and submits commands. The five slots that exist now (Streams, Modbus, MQTT, OPC UA, File follow) are idle — they do not open a serial port, a socket, or a file.
+Each protocol engine owns its work on a thread the UI does not block. `pb-engine` lives in the **service**; the UI takes a snapshot and submits commands (IPC details follow-on). The five slots that exist now (Streams, Modbus, MQTT, OPC UA, File follow) are idle — they do not open a serial port, a socket, or a file.
 
 ## Hubs
 
@@ -111,11 +111,12 @@ Embedded MQTT broker (and similar in-process server ideas, e.g. OPC UA) are **pl
 
 ## Market position
 
-Short version (detail in the landscape doc): Neuron, Kepware, and DataHub are plant connectivity servers; HighByte and HiveMQ Edge assume OPC/MQTT-shaped data; Node-RED / Telegraf / PLC4X are glue. Protocol Bench takes serial + Modbus + MQTT + OPC UA + file follow (and oilfield LAS/WITS) as one native Rust process with the bench and converter in the same project.
+Short version (detail in the landscape doc): Neuron, Kepware, and DataHub are plant connectivity servers; HighByte and HiveMQ Edge assume OPC/MQTT-shaped data; Node-RED / Telegraf / PLC4X are glue. Protocol Bench takes serial + Modbus + MQTT + OPC UA + file follow (and oilfield LAS/WITS) as a native Rust always-on service with a separate config/monitor UI, packs loaded in the service.
 
 ## Runtime
 
-- Language: Rust end to end. Workspace: `pb-ui` (egui/eframe), `pb-engine`.
+- Language: **Rust** for the Protocol Bench **service** and **UI** (workspace today: `pb-ui` egui/eframe, `pb-engine`; service/UI split is the settled process shape — see Settled #1).
+- Online **license server** can also be Rust. Cloudflare Workers supports Rust via [workers-rs](https://github.com/cloudflare/workers-rs) (first-class language). That fit is viable for a license API on Workers with D1 / KV / R2. Workers is not a long-running tokio process — use Containers or a VPS if that model is required. Hosting is not over-specified here; CF Workers + Rust is noted as a viable option only.
 - Candidate crates (spikes, not defaults): `serialport`, `tokio-modbus`, `rumqttc` (or equivalent), [async-opcua](https://github.com/FreeOpcUa/async-opcua) (MPL-2.0 subset).
 - Adjacent product: Modbus Bench remains Modbus-only; Protocol Bench is separate and can be tested with it.
 
@@ -123,6 +124,7 @@ Short version (detail in the landscape doc): Neuron, Kepware, and DataHub are pl
 
 Recorded 2026-11-13 from Mike’s answers (numbering matches the former Open decisions list):
 
+1. **Process shape** — **service always + separate UI**. The service is the always-on converter; the UI is for config and monitoring only. No dual-mode single-process bench. Protocol packs load in the **service**. Local IPC between UI and service is follow-on design.
 2. **UI toolkit** — egui / eframe (already in the shell).
 3. **Raw serial** — both transparent byte pipe and delimited frames in the first build.
 4. **MQTT** — client required; embedded broker / in-process server capability planned for hub scenarios (MQTT first; consider OPC UA for similar hub concepts). Some hub designs will use protocols already suited to that role.
@@ -130,15 +132,14 @@ Recorded 2026-11-13 from Mike’s answers (numbering matches the former Open dec
 6. **Platforms** — Linux **and** Windows in the first build.
 7. **Mappings** — type-preserving copy only at first (no scale / endian / word-swap yet).
 8. **Testing** — scripts → hub store → outputs, then a second hub importing those outputs; many-to-many and multi-hub with bi-directional protocols (see [Multi-hub test approach](#multi-hub-test-approach)).
-9. **Pack architecture (licensing / source isolation)** — free core loads **signed protocol packs** via a **stable C-style plugin ABI** into `pb-engine` (in-process `cdylib` packs). Packs download from the **license server** after purchase / entitlement. Free install ships only a couple of simple protocols (exact list still TBD — #12). Paid protocol source stays in packs, not in the free binary. This is the settled product path for licensing and protocol source management — **not** sidecar processes, **not** an all-in-one license-gated binary. Details: [free-vs-paid-isolation.md](free-vs-paid-isolation.md), [protocol-pack-loading.md](protocol-pack-loading.md).
+9. **Pack architecture + entitlements** — core loads **signed protocol packs** via a **stable C-style plugin ABI** into `pb-engine` (in-process `cdylib` packs) inside the **service**. Packs download from the **license server** after purchase / entitlement. **No fixed free protocol list** — the license is entitlement-driven and defines which protocols/packs the customer gets. Offline grace is about **~7 days** (phone-home to the license server; not a strict check on every operation). Paid protocol source stays in packs, not in the free/core binary. This is the settled product path for licensing and protocol source management — **not** sidecar processes, **not** an all-in-one license-gated binary. Details: [free-vs-paid-isolation.md](free-vs-paid-isolation.md), [protocol-pack-loading.md](protocol-pack-loading.md).
 10. **Modbus Bench** — Protocol Bench is a new, separate product; can be tested with Modbus Bench.
 11. **File parsers** — CSV and JSON lines stay the first-build set.
+12. **Language** — Protocol Bench service + UI remain Rust. Online license server can also be Rust; Cloudflare Workers + workers-rs is a viable host for a license API (see [Runtime](#runtime)).
 
 ## Still open
 
-1. **Process shape** — one binary with optional headless mode, vs a service plus a separate bench UI. Still discussing; not decided.
-9. **License / packs — remaining details** — architecture is settled as plugin ABI packs (see Settled #9). Still open: free protocol list (#12), license-server / installer / auto-updater details, and offline grace. Do not implement packaging or license-server code until those details land.
-12. **Which protocols are free vs paid** — TBD (free ships only a couple of simple protocols; exact list open).
+9. **License / packs — remaining details** — architecture, entitlements, and ~7-day offline grace are settled (see Settled #1, #9, #12). Still open: **installer** and **auto-updater** details (and any further license-server product details beyond the Runtime note). Do not implement packaging or license-server code until those land.
 
 ## Polish still in front of us
 
