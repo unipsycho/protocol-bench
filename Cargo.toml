@@ -35,3 +35,4 @@ libloading = "0.8"
 # websocket = MQTT over WS/WSS; use-rustls is rumqttc default (TLS + WSS).
 rumqttc = { version = "0.24", features = ["websocket", "use-rustls"] }
 ctrlc = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

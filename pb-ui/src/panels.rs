@@ -577,9 +577,56 @@ fn format_updated(updated_ms: u64) -> String {
     if updated_ms == 0 {
         return "—".into();
     }
-    // Epoch ms → compact local-ish display (seconds since epoch is enough for live bench).
-    let secs = updated_ms / 1000;
-    format!("{secs}")
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(updated_ms);
+    let age_secs = now_ms.saturating_sub(updated_ms) / 1000;
+
+    // Fresh samples read as live.
+    if age_secs < 5 {
+        return "just now".into();
+    }
+
+    const WEEK_SECS: u64 = 7 * 24 * 3600;
+    if age_secs < WEEK_SECS {
+        if age_secs < 60 {
+            return format!(
+                "{} second{} ago",
+                age_secs,
+                if age_secs == 1 { "" } else { "s" }
+            );
+        }
+        let minutes = age_secs / 60;
+        if minutes < 60 {
+            return format!(
+                "{} minute{} ago",
+                minutes,
+                if minutes == 1 { "" } else { "s" }
+            );
+        }
+        // ≥1h and <1 week: hours only (including multi-day ages).
+        let hours = age_secs / 3600;
+        return format!(
+            "{} hour{} ago",
+            hours,
+            if hours == 1 { "" } else { "s" }
+        );
+    }
+
+    // Older than a week: local date + time to the minute.
+    format_absolute_minutes(updated_ms)
+}
+
+fn format_absolute_minutes(updated_ms: u64) -> String {
+    let secs = (updated_ms / 1000) as i64;
+    match chrono::DateTime::from_timestamp(secs, 0) {
+        Some(utc) => utc
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string(),
+        None => "—".into(),
+    }
 }
 
 const FIELD_LABEL_W: f32 = 100.0;
