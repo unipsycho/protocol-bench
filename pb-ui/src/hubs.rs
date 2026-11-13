@@ -2387,35 +2387,61 @@ fn edit_port(
     let mut change = HubChange::quiet();
     let kind = if incoming { "INPUT" } else { "OUTPUT" };
     ui.label(
-        egui::RichText::new(format!("{kind}  ·  {}", proto.label()))
+        egui::RichText::new(format!("{kind}  ·  hub {hub_name}"))
             .font(font_ui(10.5))
             .color(proto.ink(p.is_light)),
     );
-    ui.label(
-        egui::RichText::new(format!("On hub {hub_name}"))
-            .font(font_ui(12.0))
-            .color(p.muted),
-    );
     ui.add_space(6.0);
-    let label = &mut port_field(model, hub_id, port_id).label;
-    if ui
-        .add(egui::TextEdit::singleline(label).desired_width(f32::INFINITY))
-        .changed()
-    {
-        change.dirty = true;
-    }
-    // Sources/outputs always pick their own protocol (hub is separately one server protocol).
-    ui.add_space(6.0);
-    let current = port_field(model, hub_id, port_id).protocol;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-        for next in HubProto::ALL {
-            if text_button(ui, next.label(), next == current, p).clicked() && next != current {
-                port_field(model, hub_id, port_id).protocol = next;
-                change.dirty = true;
-            }
+    // Protocol dropdown first; Name label + field on the same row (theme control heights).
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.set_min_height(PORT_ROW_H);
+        let current = port_field(model, hub_id, port_id).protocol;
+        let mut next = current;
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size = vec2(PORT_PROTO_W, PORT_ROW_H);
+            egui::ComboBox::from_id_salt(("pb_inspect_proto", port_id))
+                .selected_text(current.label())
+                .width(PORT_PROTO_W)
+                .show_ui(ui, |ui| {
+                    for proto in HubProto::ALL {
+                        ui.selectable_value(&mut next, proto, proto.label());
+                    }
+                });
+        });
+        if next != current {
+            port_field(model, hub_id, port_id).protocol = next;
+            change.dirty = true;
+        }
+        ui.label(
+            egui::RichText::new("Name")
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        let name_w = (ui.available_width() - 4.0).max(80.0);
+        let label = &mut port_field(model, hub_id, port_id).label;
+        if ui
+            .add_sized(
+                vec2(name_w, PORT_ROW_H),
+                egui::TextEdit::singleline(label)
+                    .desired_width(name_w)
+                    .margin(egui::Margin::symmetric(6.0, 4.0)),
+            )
+            .changed()
+        {
+            change.dirty = true;
         }
     });
+    if incoming {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Many Inputs can share one connection.")
+                .font(font_ui(11.0))
+                .color(p.muted),
+        );
+    }
+    // Re-read protocol after possible dropdown change.
+    let proto = port_field(model, hub_id, port_id).protocol;
     if proto == HubProto::Mqtt {
         ui.add_space(12.0);
         change = change.join(edit_mqtt_port_binds(
@@ -2465,14 +2491,6 @@ fn edit_mqtt_port_binds(
         egui::RichText::new("MQTT CONNECTION")
             .font(font_ui(10.5))
             .color(p.muted),
-    );
-    ui.add_space(2.0);
-    ui.label(
-        egui::RichText::new(
-            "Many Input nodes may share one connection; each owns its own topic/field → point binds (overlap OK).",
-        )
-        .font(font_ui(11.0))
-        .color(p.muted),
     );
     ui.add_space(4.0);
     let current = port_field(model, hub_id, port_id).mqtt_connection.clone();
