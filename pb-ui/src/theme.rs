@@ -69,13 +69,20 @@ pub mod scope {
 }
 
 /// Scope blue mixed into the theme background for hub / protocol diagram wells.
-/// Light themes stay mostly the theme bg (clearly lighter); dark themes keep the half-blend.
+/// Dark themes keep the half-blend. Cool light (Frost) stays near bg; warm light
+/// (Daylight) lifts toward the cream surface first so the well is clearly brighter.
 pub fn blend_scope(theme_bg: Color32, is_light: bool) -> Color32 {
-    if is_light {
-        // ~12% scope blue — cool tint without a dark slate well on Frost/Daylight.
-        mix(theme_bg, scope::BG, 0.12)
+    if !is_light {
+        return mix(theme_bg, scope::BG, 0.5);
+    }
+    let warm = (theme_bg.r() as i16) - (theme_bg.b() as i16) > 8;
+    if warm {
+        // Daylight cream → lift, then a whisper of scope (less darkening than Frost).
+        let lifted = mix(theme_bg, Color32::from_rgb(0xff, 0xfd, 0xfb), 0.55);
+        mix(lifted, scope::BG, 0.04)
     } else {
-        mix(theme_bg, scope::BG, 0.5)
+        // Frost: quiet cool well (~12% scope).
+        mix(theme_bg, scope::BG, 0.12)
     }
 }
 
@@ -506,6 +513,20 @@ mod tests {
         assert!(luma(well) > luma(frost_bg) * 8 / 10);
         assert_ne!(well, frost_bg);
         assert_ne!(well, scope::BG);
+    }
+
+    #[test]
+    fn daylight_wells_are_lighter_than_frost_relative_to_bg() {
+        let luma = |c: Color32| c.r() as u16 + c.g() as u16 + c.b() as u16;
+        let frost = AppTheme::Frost.palette();
+        let day = AppTheme::Daylight.palette();
+        let frost_well = blend_scope(frost.bg, true);
+        let day_well = blend_scope(day.bg, true);
+        // Daylight well should gain more lift above its bg than Frost does.
+        let frost_gain = luma(frost_well) as i32 - luma(frost.bg) as i32;
+        let day_gain = luma(day_well) as i32 - luma(day.bg) as i32;
+        assert!(day_gain > frost_gain);
+        assert!(luma(day_well) > luma(day.bg));
     }
 
     #[test]
