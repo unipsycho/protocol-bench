@@ -346,20 +346,19 @@ pub fn paint_full_row(
     p: &ThemePalette,
     bind_index: Option<usize>,
 ) -> PointRowAction {
-    let sense = if bind_index.is_some() {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(cols.row_w, ROW_H), sense);
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, Rounding::same(4.0), tint(p.accent, 12));
-        if bind_index.is_some() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-    }
+    // Reserve space first; bind-row click is registered last so it wins cell hovers.
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(cols.row_w, ROW_H), Sense::hover());
     let (dot_r, name_r, value_r, source_r, updated_r, remove_r) = cols.cell_rects(rect);
+    let click_rect = match (bind_index, remove_r) {
+        (Some(_), Some(rm)) => Rect::from_min_max(rect.min, Pos2::new(rm.min.x, rect.max.y)),
+        (Some(_), None) => rect,
+        _ => Rect::NOTHING,
+    };
+    // Wash under text when the bind row is hot.
+    if bind_index.is_some() && ui.rect_contains_pointer(click_rect) {
+        ui.painter()
+            .rect_filled(click_rect, Rounding::same(4.0), tint(p.accent, 12));
+    }
 
     if let Some(quality) = row.quality {
         paint_quality_dot(ui, dot_r, quality, row.id, p);
@@ -403,11 +402,20 @@ pub fn paint_full_row(
             action.remove_clicked = true;
         }
         click.on_hover_cursor(egui::CursorIcon::PointingHand);
-    } else if bind_index.is_some() && resp.clicked() {
-        action.row_clicked = true;
-        resp.clone().on_hover_text("Edit topic in Manual");
     }
-    if bind_index.is_some() && !action.remove_clicked {
+    // Bind rows: click anywhere except × → Manual edit.
+    if let Some(bi) = bind_index {
+        let resp = ui.interact(
+            click_rect,
+            ui.id().with(("bind_row", bi, row.id, row.source)),
+            Sense::click(),
+        );
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() && !action.remove_clicked {
+            action.row_clicked = true;
+        }
         resp.on_hover_text("Click to edit topic in Manual");
     }
     action
