@@ -2,7 +2,7 @@
 
 Date: 2026-11-13. Status: living draft.
 
-Research: [competitive-landscape.md](competitive-landscape.md) (store). Free vs paid isolation: [free-vs-paid-isolation.md](free-vs-paid-isolation.md). Protocol notes: [protocol-options.md](protocol-options.md).
+Research: [competitive-landscape.md](competitive-landscape.md) (store). Free vs paid isolation: [free-vs-paid-isolation.md](free-vs-paid-isolation.md). Pack loading: [protocol-pack-loading.md](protocol-pack-loading.md). Protocol notes: [protocol-options.md](protocol-options.md).
 
 Checkout: `/home/mike/Documents/AAI-Projects/protocol bench` (workspace `pb-ui` + `pb-engine`, egui shell).
 
@@ -130,14 +130,15 @@ Recorded 2026-11-13 from Mike’s answers (numbering matches the former Open dec
 6. **Platforms** — Linux **and** Windows in the first build.
 7. **Mappings** — type-preserving copy only at first (no scale / endian / word-swap yet).
 8. **Testing** — scripts → hub store → outputs, then a second hub importing those outputs; many-to-many and multi-hub with bi-directional protocols (see [Multi-hub test approach](#multi-hub-test-approach)).
+9. **Pack architecture (licensing / source isolation)** — free core loads **signed protocol packs** via a **stable C-style plugin ABI** into `pb-engine` (in-process `cdylib` packs). Packs download from the **license server** after purchase / entitlement. Free install ships only a couple of simple protocols (exact list still TBD — #12). Paid protocol source stays in packs, not in the free binary. This is the settled product path for licensing and protocol source management — **not** sidecar processes, **not** an all-in-one license-gated binary. Details: [free-vs-paid-isolation.md](free-vs-paid-isolation.md), [protocol-pack-loading.md](protocol-pack-loading.md).
 10. **Modbus Bench** — Protocol Bench is a new, separate product; can be tested with Modbus Bench.
 11. **File parsers** — CSV and JSON lines stay the first-build set.
 
 ## Still open
 
 1. **Process shape** — one binary with optional headless mode, vs a service plus a separate bench UI. Still discussing; not decided.
-9. **License / free vs paid isolation** — wants a free option that is **not easily reverse-engineered**. Preferred lean (not final): base product ships only a couple of simple free protocols; **added protocols come as separate file packs** customers buy and license. Design must also cover: **proper installer**, **auto-updater**, free/pro options, and a **central license server** (PC transfers, enterprise usage accounts). Closer to isolation options **B/D** (packs) plus a license server. Details: [free-vs-paid-isolation.md](free-vs-paid-isolation.md). Not a final product choice yet — needs further design. Do not implement packaging or license-server code until that design lands.
-12. **Which protocols are free vs paid** — TBD (depends on #9).
+9. **License / packs — remaining details** — architecture is settled as plugin ABI packs (see Settled #9). Still open: free protocol list (#12), license-server / installer / auto-updater details, and offline grace. Do not implement packaging or license-server code until those details land.
+12. **Which protocols are free vs paid** — TBD (free ships only a couple of simple protocols; exact list open).
 
 ## Polish still in front of us
 

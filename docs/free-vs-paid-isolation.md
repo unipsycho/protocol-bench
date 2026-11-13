@@ -1,26 +1,24 @@
 # Protocol Bench — free vs paid isolation (options)
 
-Date: 2026-11-13. Status: **preferred lean recorded — not a final decision**. Complements [prd.md](prd.md). TopicBench OSS / Pro is cited only as a comparable pattern Mike already ships; this design is for Protocol Bench.
+Date: 2026-11-13. Status: **decision — plugin packs (B/D via ABI)**. Complements [prd.md](prd.md) and [protocol-pack-loading.md](protocol-pack-loading.md). TopicBench OSS / Pro is cited only as a comparable pattern Mike already ships; this design is for Protocol Bench.
 
-## Mike’s lean (2026-11-13)
+## Decision (2026-11-13)
 
-Preferred direction (still open; needs design work — **docs only**, no packaging/license-server code yet):
+**Settled product choice:** free core + **signed protocol packs** loaded in-process through a **stable C-style plugin ABI** into `pb-engine` (isolation options **B/D via ABI**). Packs download from the license server after purchase / entitlement. Paid protocol source stays in packs, not in the free binary.
 
-- **Free base** with only a couple of simple free protocols so the free app is useful alone.
-- **Paid protocol packs** as **separate files** customers buy and license — not a single binary that ships every paid engine unlocked by a thin gate (anti-RE: free option should not be easily reverse-engineered).
-- Closer to options **B** (modules/packs) and **D** (free core + paid remainder) than pure **C** (everything in one binary + license unlock).
-- Packaging / commercial goals folded into this same design work (not separate settled product choices yet):
+- **Free base** with only a couple of simple free protocols so the free app is useful alone (exact list TBD — PRD #12).
+- **Paid protocol packs** as signed `cdylib` files — **not** sidecar processes, **not** an all-in-one license-gated binary (Option C rejected for paid IP).
+- Architecture is settled; remaining design work (docs only until decided):
   - Proper **installer**
   - **Auto-updater**
-  - Free / Pro options
-  - **Central license server** (PC transfers, enterprise usage accounts)
-- **Still TBD:** exactly which protocols are free vs paid (PRD still-open #12).
-
-See PRD still-open #9.
+  - Free / Pro options details
+  - **Central license server** details (PC transfers, enterprise usage accounts)
+  - **Offline grace**
+- See PRD Settled #9; Still open #9 is residual details only. Pack mechanics: [protocol-pack-loading.md](protocol-pack-loading.md).
 
 ## Why this note
 
-The shell already names Streams, Modbus, MQTT, OPC UA, and File follow, with a longer product list (ASCII lines, REST, WebSocket, Sparkplug B, DNP3, SNMP, CAN, LAS, WITS). Competitors often gate by driver, tag count, or northbound feature. Protocol Bench still has an open license decision (PRD § Still open #9), with the lean above. The hard product question is how free and paid **protocol modules** isolate — in the binary, on disk, and in Linux packaging.
+The shell already names Streams, Modbus, MQTT, OPC UA, and File follow, with a longer product list (ASCII lines, REST, WebSocket, Sparkplug B, DNP3, SNMP, CAN, LAS, WITS). Competitors often gate by driver, tag count, or northbound feature. Pack architecture is settled (PRD Settled #9); residual license/installer/grace details remain under Still open #9. This note records the options considered and the chosen isolation path.
 
 ## Protocol shortlist (for placement talk)
 
@@ -95,9 +93,9 @@ Strong when the paid set is large or license-sensitive (OPC UA, DNP3, LAS/WITS).
 
 ---
 
-## B. Single app + paid protocol modules (plugins / dylibs)
+## B. Single app + paid protocol modules (plugins / dylibs) — **chosen path (with D)**
 
-One shell binary; paid protocols load as dynamic libraries (or separate plugin files) beside the app.
+One shell binary; paid protocols load as dynamic libraries (or separate plugin files) beside the app. **Settled as the paid-IP mechanism** (in-process signed `cdylib` + fixed C ABI — see [protocol-pack-loading.md](protocol-pack-loading.md)).
 
 ### How it works
 
@@ -148,16 +146,16 @@ Best when protocols are sold **individually** or in small packs (e.g. Oilfield P
 
 ### Open questions for Mike
 
-1. À la carte protocols, packs, or always-all-paid-modules?
-2. Willing to invest in a versioned plugin ABI before engines are even live?
-3. Must plugins work offline forever after purchase (typical for plant PCs)?
+1. À la carte protocols, packs, or always-all-paid-modules? → Packs settled; granularity (single vs bundled packs) still open.
+2. ~~Willing to invest in a versioned plugin ABI before engines are even live?~~ → **Yes — settled.**
+3. Must plugins work offline forever after purchase (typical for plant PCs)? → Offline grace TBD.
 4. Sign modules with the same key story as TopicBench licenses, or separate?
 
 ---
 
-## C. Single binary + license unlock
+## C. Single binary + license unlock — **rejected for paid IP**
 
-All protocol code ships in one binary; a signed license (or entitlement list) enables paid engines at runtime.
+All protocol code ships in one binary; a signed license (or entitlement list) enables paid engines at runtime. **Rejected** as Protocol Bench’s paid-IP path (paid source must not sit on every free disk).
 
 ### How it works
 
@@ -213,19 +211,19 @@ Strong default while the product is early: ship everything gated, decide free/pa
 
 ---
 
-## D. Hybrid — free core protocols + paid modules or Pro for the rest
+## D. Hybrid — free core protocols + paid modules or Pro for the rest — **chosen with B**
 
-Free binary includes a useful core (e.g. Streams + File follow + maybe MQTT **or** Modbus). Everything else is either a Pro unlock (C-style), separate Pro build (A), or loadable modules (B).
+Free binary includes a useful core (a couple of simple protocols — list TBD). Everything else is loadable signed packs (**D+B**). Other hybrids below are historical contrast only.
 
 ### How it works
 
-Pick a free floor that makes the app worth installing alone, then apply A, B, or C only to the paid remainder.
+Pick a free floor that makes the app worth installing alone, then apply B to the paid remainder.
 
 Example hybrids:
 
-- **D+C:** free engines compiled in and always on; paid engines compiled in but license-gated.
-- **D+A:** free public binary; Pro binary adds oilfield + OPC UA + … 
-- **D+B:** free engines built-in; paid engines as signed `.so` packs.
+- **D+C:** free engines compiled in and always on; paid engines compiled in but license-gated — **not chosen**.
+- **D+A:** free public binary; Pro binary adds oilfield + OPC UA + … — **not chosen**.
+- **D+B:** free engines built-in; paid engines as signed `.so` packs — **settled**.
 
 ### Pros
 
@@ -235,7 +233,7 @@ Example hybrids:
 
 ### Cons
 
-- Still must choose the paid isolation mechanism (A/B/C) — hybrid is a **product split**, not a packaging answer by itself.
+- ~~Still must choose the paid isolation mechanism~~ — **chosen: B (plugin ABI packs).**
 - Boundary debates: is MQTT free (expectation for “edge”) or paid (high value)? Is Modbus free because Modbus Bench exists?
 - Support matrix: “which protocols does free include in v0.x?” must be documented and kept.
 
@@ -264,10 +262,10 @@ Same as the underlying A/B/C choice. Document that free-core projects remain ope
 
 ### Open questions for Mike
 
-1. What is the **minimum free** set that still feels like Protocol Bench, not a hollow shell?
+1. What is the **minimum free** set that still feels like Protocol Bench, not a hollow shell? (PRD #12)
 2. Does free MQTT or free Modbus hurt Modbus Bench or TopicBench positioning?
 3. Oilfield (LAS/WITS): always Pro, or a separate “Oilfield Pack”?
-4. Which paid isolation (A, B, or C) should hybrid sit on for v1?
+4. ~~Which paid isolation (A, B, or C) should hybrid sit on for v1?~~ → **D+B (plugin ABI) settled.**
 
 ---
 
@@ -300,27 +298,30 @@ No packaging code is implied yet; only that the engine boundary should not assum
 
 ---
 
-## Top tradeoffs (no winner)
+## Top tradeoffs (winner recorded)
 
-1. **IP / crate license separation vs ship speed** — A/B keep paid code off free disks; C is fastest while engines are stubs.
-2. **One update train vs à la carte** — C wins on ops; B wins on selling protocols like drivers; A wins on clean product split.
-3. **Rust plugin ABI cost** — B’s real price; avoid unless à la carte modules are a firm product goal.
-4. **Free tier honesty** — D forces an explicit free protocol floor; A/C can still ship a hollow free app if the free set is too thin.
-5. **Debian / apt** — B maps naturally to module packages; C maps to one package; A needs careful naming.
+1. **IP / crate license separation vs ship speed** — **Chose A/B-style separation:** paid code off free disks (via D+B packs). C rejected for paid IP.
+2. **One update train vs à la carte** — **Chose B:** sell protocols like driver packs; shell updates separately from packs.
+3. **Rust plugin ABI cost** — **Accepted:** stable C-style plugin ABI is the product path (see pack-loading note).
+4. **Free tier honesty** — **D:** explicit free protocol floor (couple of simple protocols; list TBD #12).
+5. **Debian / apt** — B maps naturally to module packages; installer / channel details still open.
 
 ## Suggested decision inputs for Mike (checklist)
 
-- [ ] Open-source free edition? (If yes, prefer A or D+A for paid source containment, or private crates behind C release builds.)
-- [x] Sell all-or-nothing Pro, protocol packs, or single protocols? → **Lean: protocol packs as separate licensed files** (plus free/pro); not final.
-- [x] Accept paid code inside the free binary? (Legal + commercial) → **Lean: no** — prefer packs so free is not easily reverse-engineered; not final.
-- [ ] Canonical Linux install: bare binary (TopicBench-like), Debian, or both? → Lean wants a **proper installer** + **auto-updater**; exact channel TBD.
-- [ ] Free protocol floor (Streams / File / MQTT / Modbus / …)? → Lean: **only a couple of simple free protocols**; exact list TBD (#12).
+- [ ] Open-source free edition? (Paid source stays in packs either way.)
+- [x] Sell all-or-nothing Pro, protocol packs, or single protocols? → **Decision: protocol packs** (signed `cdylib`s via plugin ABI; free/pro options remain).
+- [x] Accept paid code inside the free binary? (Legal + commercial) → **No** — paid source in packs only (Option C rejected for paid IP).
+- [x] Pack loading mechanism? → **Settled: in-process signed packs + stable C-style plugin ABI** (not sidecar, not license-gated all-in-one).
+- [ ] Canonical Linux install: bare binary (TopicBench-like), Debian, or both? → Needs a **proper installer** + **auto-updater**; exact channel TBD.
+- [ ] Free protocol floor (Streams / File / MQTT / Modbus / …)? → **Only a couple of simple free protocols**; exact list TBD (#12).
 - [x] Relationship to Modbus Bench and TopicBench pricing stories? → Protocol Bench is a **new separate product** (can test with Modbus Bench). TopicBench scheme is comparable only, not copied by default.
-- [ ] Reuse TopicBench license machinery (keys, machine id, portal) for Protocol Bench? → Lean wants a **central license server** (PC transfers, enterprise accounts); whether it reuses TopicBench machinery is TBD.
+- [ ] Reuse TopicBench license machinery (keys, machine id, portal) for Protocol Bench? → Needs a **central license server** (PC transfers, enterprise accounts); whether it reuses TopicBench machinery is TBD.
+- [ ] Offline grace after entitlement expiry / without phone-home?
 
 ## Related paths
 
 - Repo PRD: `/home/mike/Documents/AAI-Projects/protocol bench/docs/prd.md`
+- Pack loading: [protocol-pack-loading.md](protocol-pack-loading.md) (repo + store)
 - Store PRD: [prd.md](prd.md)
 - Landscape: [competitive-landscape.md](competitive-landscape.md)
 - In-repo protocol notes: `/home/mike/Documents/AAI-Projects/protocol bench/docs/protocol-options.md`
