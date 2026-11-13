@@ -17,10 +17,7 @@ pub fn paint(
     hubs: &mut HubModel,
 ) -> crate::hubs::HubChange {
     match pane {
-        DockPane::Project => {
-            project_panel(ui, hubs, p);
-            crate::hubs::HubChange::quiet()
-        }
+        DockPane::Project => project_panel(ui, hubs, p),
         DockPane::Hubs => crate::hubs::paint(ui, hubs, p),
         _ => {
             scaffold_panel(ui, pane, host, p);
@@ -51,7 +48,7 @@ fn blurb(pane: DockPane, host: &HostSnapshot) -> &'static str {
         }
     }
     match pane {
-        DockPane::Project => "Hubs, endpoints, points, mappings, and edge transforms for this project.",
+        DockPane::Project => "Hubs, inputs, outputs, and edge transforms for this project.",
         DockPane::Points => "One value, quality, and timestamp for every named point.",
         DockPane::Mappings => "A point that arrives on one link can leave on another.",
         DockPane::Traffic => "Bytes and frames from every link, when capture exists.",
@@ -214,46 +211,77 @@ fn empty_message(pane: DockPane) -> &'static str {
     }
 }
 
-fn project_panel(ui: &mut egui::Ui, hubs: &HubModel, p: &ThemePalette) {
+fn project_panel(
+    ui: &mut egui::Ui,
+    hubs: &HubModel,
+    p: &ThemePalette,
+) -> crate::hubs::HubChange {
+    let mut change = crate::hubs::HubChange::quiet();
     egui::ScrollArea::vertical()
         .id_salt("pb_project_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             title_row(ui, p);
             ui.add_space(10.0);
+            // Jump to existing panels — Project does not list points/mappings itself.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if panel_jump(ui, "Points", DockPane::Points.ink(p.is_light), p).clicked() {
+                    change.open = Some(DockPane::Points);
+                }
+                if panel_jump(ui, "Mappings", DockPane::Mappings.ink(p.is_light), p).clicked() {
+                    change.open = Some(DockPane::Mappings);
+                }
+            });
+            ui.add_space(12.0);
             stat_row(ui, hubs, p);
             ui.add_space(14.0);
+            list_section(
+                ui,
+                "INPUTS",
+                &port_names(hubs, true),
+                DockPane::Streams.ink(p.is_light),
+                p,
+            );
+            ui.add_space(10.0);
+            list_section(
+                ui,
+                "OUTPUTS",
+                &port_names(hubs, false),
+                DockPane::Mqtt.ink(p.is_light),
+                p,
+            );
+            ui.add_space(10.0);
             list_section(ui, "HUBS", &hub_names(hubs), DockPane::Hubs.ink(p.is_light), p);
             ui.add_space(10.0);
-            list_section(
-                ui,
-                "AGGREGATORS",
-                &step_names(hubs, true),
-                p.accent,
-                p,
-            );
+            list_section(ui, "AGGREGATORS", &step_names(hubs, true), p.accent, p);
             ui.add_space(10.0);
-            list_section(
-                ui,
-                "CALCULATIONS",
-                &step_names(hubs, false),
-                p.accent,
-                p,
-            );
+            list_section(ui, "CALCULATIONS", &step_names(hubs, false), p.accent, p);
         });
+    change
 }
 
 fn hub_names(hubs: &HubModel) -> Vec<String> {
     hubs.hubs
         .iter()
-        .map(|hub| {
-            let proto = hub
-                .protocol
-                .map(|p| p.label())
-                .unwrap_or("Split");
-            format!("{} ({})", hub.name, proto)
-        })
+        .map(|hub| format!("{} ({})", hub.name, hub.protocol.label()))
         .collect()
+}
+
+fn port_names(hubs: &HubModel, inputs: bool) -> Vec<String> {
+    let mut names = Vec::new();
+    for hub in &hubs.hubs {
+        let list = if inputs { &hub.sources } else { &hub.outputs };
+        for port in list {
+            names.push(format!(
+                "{} ({}) · {}",
+                port.label,
+                port.protocol.label(),
+                hub.name
+            ));
+        }
+    }
+    names
 }
 
 fn step_names(hubs: &HubModel, aggregator: bool) -> Vec<String> {
@@ -278,11 +306,12 @@ fn step_names(hubs: &HubModel, aggregator: bool) -> Vec<String> {
     names
 }
 
-fn endpoint_count(hubs: &HubModel) -> usize {
-    hubs.hubs
-        .iter()
-        .map(|hub| hub.sources.len() + hub.outputs.len())
-        .sum()
+fn input_count(hubs: &HubModel) -> usize {
+    hubs.hubs.iter().map(|hub| hub.sources.len()).sum()
+}
+
+fn output_count(hubs: &HubModel) -> usize {
+    hubs.hubs.iter().map(|hub| hub.outputs.len()).sum()
 }
 
 fn aggregator_count(hubs: &HubModel) -> usize {
@@ -313,6 +342,35 @@ fn title_row(ui: &mut egui::Ui, p: &ThemePalette) {
     });
 }
 
+fn panel_jump(ui: &mut egui::Ui, label: &str, ink: Color32, p: &ThemePalette) -> egui::Response {
+    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(label.to_owned(), font_ui(12.0), p.text));
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + Vec2::new(18.0, 10.0), Sense::click());
+    let fill = if resp.hovered() {
+        tint(ink, 36)
+    } else {
+        p.control
+    };
+    ui.painter().rect_filled(rect, Rounding::same(5.0), fill);
+    ui.painter()
+        .rect_stroke(rect, Rounding::same(5.0), Stroke::new(1.0, p.line));
+    ui.painter().rect_filled(
+        Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
+        Rounding {
+            nw: 5.0,
+            ne: 0.0,
+            sw: 5.0,
+            se: 0.0,
+        },
+        ink,
+    );
+    ui.painter().galley(
+        rect.center() - galley.size() * 0.5 + Vec2::new(1.0, 0.0),
+        galley,
+        p.text,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 fn stat_row(ui: &mut egui::Ui, hubs: &HubModel, p: &ThemePalette) {
     let gap = 8.0;
     let width = ((ui.available_width() - gap * 2.0) / 3.0).max(48.0);
@@ -321,32 +379,19 @@ fn stat_row(ui: &mut egui::Ui, hubs: &HubModel, p: &ThemePalette) {
         stat_tile(
             ui,
             width,
-            "ENDPOINTS",
-            &endpoint_count(hubs).to_string(),
+            "INPUTS",
+            &input_count(hubs).to_string(),
             DockPane::Streams.ink(p.is_light),
             p,
         );
-        // Points / mappings stay zero until live stores land.
         stat_tile(
             ui,
             width,
-            "POINTS",
-            "0",
-            DockPane::Points.ink(p.is_light),
+            "OUTPUTS",
+            &output_count(hubs).to_string(),
+            DockPane::Mqtt.ink(p.is_light),
             p,
         );
-        stat_tile(
-            ui,
-            width,
-            "MAPPINGS",
-            "0",
-            DockPane::Mappings.ink(p.is_light),
-            p,
-        );
-    });
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
         stat_tile(
             ui,
             width,
@@ -355,6 +400,10 @@ fn stat_row(ui: &mut egui::Ui, hubs: &HubModel, p: &ThemePalette) {
             DockPane::Hubs.ink(p.is_light),
             p,
         );
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
         stat_tile(
             ui,
             width,

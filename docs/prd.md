@@ -49,12 +49,12 @@ Each protocol engine owns its work on a thread the UI does not block. `pb-engine
 
 ## Hubs
 
-A **hub** is the main protocol conversion / routing point. Sources come in. Optional **aggregators** and **calculations** sit **on the edges** (the data path between nodes), not as free-floating peers of the hub. Outputs leave. Flow: sources → optional transforms on edges → hub → optional transforms on edges → outputs (and multi-hub as before). A diagram shows what converts to what.
+A **hub** is the main protocol conversion / routing point. It is always **one protocol**, and only **server-capable** protocols can be hubs (Modbus server, MQTT broker / server-oriented, OPC UA server). Sources and outputs may use other protocols. Optional **aggregators** and **calculations** sit **on the edges** (the data path between nodes), not as free-floating peers of the hub. Flow: sources → optional transforms on edges → hub → optional transforms on edges → outputs (and multi-hub as before). A diagram shows what converts to what.
 
-- More than one hub when there are multiple conversion points; a hub can be split across protocols or locked to one. Many projects use a single hub.
+- More than one hub when there are multiple conversion points. Many projects use a single hub. There is no Split hub type.
 - Arrange the diagram: drag nodes, click a node or connection for details, open the matching protocol panel from a protocol node.
 - Add aggregator / Add calculation attaches to a **selected link/edge** (or a right-clicked connection), rendered on that line.
-- Sample hubs ship for framing (Plant split + Edge single-protocol, MQTT link between them) — configuration only, not a live bridge.
+- Sample hubs ship for framing (Plant Modbus + Edge MQTT, MQTT link between them) — configuration only, not a live bridge.
 
 ## What runs today, and what does not
 
@@ -150,6 +150,7 @@ Recorded 2026-11-13 from Mike’s answers (numbering matches the former Open dec
 13. **Windows installer** — **MSI via WiX**, driven from the Rust repo with **`cargo-wix`** (not Inno Setup). Chosen for IT-friendly deploys (GPO / SCCM / silent install, standard Add/Remove Programs). Layout installs **service + UI + module dir**; upgrades must **preserve config, licenses, and packs**. Product **updates** stay on the Rust **license server** path (manifest + signed downloads) — the installer choice does not replace that. **Linux installer** is later / TBD and is not blocking.
 14. **MCP on the service** — the always-on **service** hosts an **MCP server** so an agent can manage setup (channels, points, mappings, hubs, and related product actions). Not in the UI process. High-level product intent only; no tool schema yet (see [MCP server on the service](#mcp-server-on-the-service)).
 15. **Hub graph model** — **Hub** = conversion / routing point (multiple hubs allowed for multiple conversion points). **Aggregator** and **Calculation** are edge transforms on the data path between nodes (sources → optional edge transforms → hub → optional edge transforms → outputs), not independent sibling hub-step nodes. UI adds them on a selected / right-clicked connection.
+16. **Hub protocol** — every hub is **one protocol**; **Split** hubs are removed. Only **server-capable** protocols may be hubs (Modbus server, MQTT broker/server-oriented, OPC UA server). Sources and outputs define other protocols on the diagram.
 
 ## Still open
 

@@ -5,6 +5,7 @@ use egui::{
     pos2, vec2, Align2, Color32, CursorIcon, Id, Layout, Pos2, Rect, Rounding, ScrollArea, Sense,
     Shape, Stroke, Ui, Vec2,
 };
+use serde::Deserialize;
 
 use crate::dock::DockPane;
 use crate::theme::{blend_scope, divider_bar, font_semi, font_ui, tint, ThemePalette, SEP};
@@ -58,6 +59,9 @@ impl HubProto {
         HubProto::Files,
     ];
 
+    /// Protocols that can own a hub (server / broker role).
+    pub const HUBS: [HubProto; 3] = [HubProto::Modbus, HubProto::Mqtt, HubProto::OpcUa];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Streams => "Streams",
@@ -78,9 +82,30 @@ impl HubProto {
         }
     }
 
+    /// True for Modbus server, MQTT broker, OPC UA server (hub-capable).
+    pub fn hub_capable(self) -> bool {
+        matches!(self, Self::Modbus | Self::Mqtt | Self::OpcUa)
+    }
+
     fn ink(self, light: bool) -> Color32 {
         self.pane().ink(light)
     }
+}
+
+fn default_hub_protocol() -> HubProto {
+    HubProto::Modbus
+}
+
+/// Accept legacy `null` / non-hub protocols from older saves as Modbus.
+fn deserialize_hub_protocol<'de, D>(deserializer: D) -> Result<HubProto, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<HubProto>::deserialize(deserializer)?;
+    Ok(match raw {
+        Some(proto) if proto.hub_capable() => proto,
+        _ => HubProto::Modbus,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -111,8 +136,12 @@ pub struct HubStep {
 pub struct Hub {
     pub id: u64,
     pub name: String,
-    /// Set when the hub is one protocol. None means the hub is split across its links.
-    pub protocol: Option<HubProto>,
+    /// Always one server-capable protocol. Sources/outputs may use other protocols.
+    #[serde(
+        default = "default_hub_protocol",
+        deserialize_with = "deserialize_hub_protocol"
+    )]
+    pub protocol: HubProto,
     pub sources: Vec<HubPort>,
     pub outputs: Vec<HubPort>,
     /// Transforms sitting on source→hub or hub→output edges.
@@ -127,10 +156,6 @@ pub struct Hub {
 }
 
 impl Hub {
-    pub fn split(&self) -> bool {
-        self.protocol.is_none()
-    }
-
     /// Source, output, aggregator, or calculation id on this hub.
     fn has_node(&self, id: u64) -> bool {
         self.sources.iter().any(|port| port.id == id)
@@ -205,7 +230,7 @@ impl Default for HubModel {
 }
 
 impl HubModel {
-    /// Two hubs so the diagram has a split conversion and a single-protocol hub.
+    /// Two hubs: Plant (Modbus server) with mixed-protocol links, Edge (MQTT broker).
     pub fn sample() -> Self {
         Self {
             next_id: 20,
@@ -219,7 +244,7 @@ impl HubModel {
                 Hub {
                     id: 1,
                     name: "Plant".into(),
-                    protocol: None,
+                    protocol: HubProto::Modbus,
                     sources: vec![
                         HubPort {
                             id: 2,
@@ -255,7 +280,7 @@ impl HubModel {
                 Hub {
                     id: 6,
                     name: "Edge".into(),
-                    protocol: Some(HubProto::Mqtt),
+                    protocol: HubProto::Mqtt,
                     sources: vec![HubPort {
                         id: 7,
                         protocol: HubProto::Mqtt,
@@ -293,10 +318,9 @@ impl HubModel {
             self.next_id = max_id + 1;
         }
         for hub in &mut self.hubs {
-            if let Some(proto) = hub.protocol {
-                for port in hub.sources.iter_mut().chain(hub.outputs.iter_mut()) {
-                    port.protocol = proto;
-                }
+            // Hubs are always one server-capable protocol; ports keep their own protocols.
+            if !hub.protocol.hub_capable() {
+                hub.protocol = HubProto::Modbus;
             }
             // Attach orphan transforms (older saves) to a real port edge.
             let ports: Vec<u64> = hub
@@ -527,7 +551,7 @@ impl HubModel {
         self.hubs.push(Hub {
             id,
             name,
-            protocol: None,
+            protocol: HubProto::Modbus,
             sources: vec![HubPort {
                 id: source,
                 protocol: HubProto::Modbus,
@@ -564,44 +588,24 @@ impl HubModel {
         self.keep_focus();
     }
 
-    pub fn set_split(&mut self, id: u64, split: bool) {
-        let Some(hub) = self.hub_mut(id) else {
-            return;
-        };
-        if split {
-            hub.protocol = None;
-            return;
-        }
-        let proto = hub
-            .protocol
-            .or_else(|| hub.sources.first().map(|port| port.protocol))
-            .unwrap_or(HubProto::Modbus);
-        hub.protocol = Some(proto);
-        for port in hub.sources.iter_mut().chain(hub.outputs.iter_mut()) {
-            port.protocol = proto;
-        }
-    }
-
     pub fn set_hub_protocol(&mut self, id: u64, proto: HubProto) {
+        if !proto.hub_capable() {
+            return;
+        }
         let Some(hub) = self.hub_mut(id) else {
             return;
         };
-        hub.protocol = Some(proto);
-        for port in hub.sources.iter_mut().chain(hub.outputs.iter_mut()) {
-            port.protocol = proto;
-        }
+        // Hub protocol only — sources/outputs keep their own protocols.
+        hub.protocol = proto;
     }
 
     /// Append a source or output and return its id.
     pub fn add_port(&mut self, hub_id: u64, source: bool) -> Option<u64> {
-        let proto = self
-            .hub(hub_id)
-            .and_then(|hub| hub.protocol)
-            .unwrap_or(if source {
-                HubProto::Modbus
-            } else {
-                HubProto::Mqtt
-            });
+        let proto = if source {
+            HubProto::Modbus
+        } else {
+            HubProto::Mqtt
+        };
         let id = self.alloc();
         let Some(hub) = self.hub_mut(hub_id) else {
             return None;
@@ -1753,10 +1757,7 @@ fn link_distance(from: Rect, to: Rect, pos: Pos2) -> Option<f32> {
 /// Protocol panel for this node, when the node is one protocol.
 fn open_target(model: &HubModel, node: &Placed) -> Option<DockPane> {
     match node.role {
-        Role::Hub => model
-            .hub(node.hub_id)
-            .and_then(|hub| hub.protocol)
-            .map(HubProto::pane),
+        Role::Hub => model.hub(node.hub_id).map(|hub| hub.protocol.pane()),
         Role::Source | Role::Output => {
             find_port(model, node.hub_id, node.port_id).map(|port| port.protocol.pane())
         }
@@ -1891,10 +1892,7 @@ fn paint_hub_node(
         return;
     };
     let z = zoom.max(0.35);
-    let ink = hub
-        .protocol
-        .map(|proto| proto.ink(p.is_light))
-        .unwrap_or(p.accent);
+    let ink = hub.protocol.ink(p.is_light);
     paint_card(painter, node.rect, ink, on, hot, p);
     paint_grip(painter, node.rect, if hot || on { ink } else { p.muted });
     let clip = Rect::from_min_max(
@@ -1908,11 +1906,10 @@ fn paint_hub_node(
         font_semi(14.0 * z),
         p.text,
     );
-    let mode = hub.protocol.map(HubProto::label).unwrap_or("Split");
     painter.with_clip_rect(clip).text(
         pos2(clip.min.x, node.rect.center().y + 10.0 * z),
         Align2::LEFT_CENTER,
-        mode,
+        hub.protocol.label(),
         font_ui(11.0 * z),
         if on { ink } else { p.muted },
     );
@@ -2237,21 +2234,18 @@ fn edit_port(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
     {
         change.dirty = true;
     }
-    let locked = model.hub(hub_id).and_then(|hub| hub.protocol).is_some();
-    if !locked {
-        ui.add_space(6.0);
-        let current = port_field(model, hub_id, port_id).protocol;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-            for proto in HubProto::ALL {
-                if text_button(ui, proto.label(), proto == current, p).clicked() && proto != current
-                {
-                    port_field(model, hub_id, port_id).protocol = proto;
-                    change.dirty = true;
-                }
+    // Sources/outputs always pick their own protocol (hub is separately one server protocol).
+    ui.add_space(6.0);
+    let current = port_field(model, hub_id, port_id).protocol;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+        for next in HubProto::ALL {
+            if text_button(ui, next.label(), next == current, p).clicked() && next != current {
+                port_field(model, hub_id, port_id).protocol = next;
+                change.dirty = true;
             }
-        });
-    }
+        }
+    });
     ui.add_space(10.0);
     if text_button(ui, &format!("Open {} panel", proto.label()), true, p).clicked() {
         change.open = Some(proto.pane());
@@ -2291,33 +2285,25 @@ fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
         change.dirty = true;
     }
     ui.add_space(8.0);
-    let split = model.hub(id).unwrap().split();
-    ui.horizontal(|ui| {
-        if text_button(ui, "Split", split, p).clicked() && !split {
-            model.set_split(id, true);
-            change.dirty = true;
-        }
-        if text_button(ui, "One protocol", !split, p).clicked() && split {
-            model.set_split(id, false);
-            change.dirty = true;
+    ui.label(
+        egui::RichText::new("HUB PROTOCOL")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(4.0);
+    let current = model.hub(id).unwrap().protocol;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+        for proto in HubProto::HUBS {
+            if text_button(ui, proto.label(), proto == current, p).clicked() && proto != current {
+                model.set_hub_protocol(id, proto);
+                change.dirty = true;
+            }
         }
     });
-    if let Some(current) = model.hub(id).unwrap().protocol {
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-            for proto in HubProto::ALL {
-                if text_button(ui, proto.label(), proto == current, p).clicked() && proto != current
-                {
-                    model.set_hub_protocol(id, proto);
-                    change.dirty = true;
-                }
-            }
-        });
-        ui.add_space(8.0);
-        if text_button(ui, &format!("Open {} panel", current.label()), true, p).clicked() {
-            change.open = Some(current.pane());
-        }
+    ui.add_space(8.0);
+    if text_button(ui, &format!("Open {} panel", current.label()), true, p).clicked() {
+        change.open = Some(current.pane());
     }
     ui.add_space(10.0);
     if port_section(ui, model, id, true, p) {
@@ -2372,7 +2358,6 @@ fn port_section(
             list.iter().map(|port| port.id).collect()
         })
         .unwrap_or_default();
-    let locked = model.hub(hub_id).and_then(|hub| hub.protocol).is_some();
     for port_id in ports {
         ui.add_space(4.0);
         // Place × first so it stays inside the panel, then the protocol, then the name in what remains.
@@ -2382,21 +2367,19 @@ fn port_section(
                     model.remove_port(hub_id, port_id);
                     dirty = true;
                 }
-                if !locked {
-                    let current = port_field(model, hub_id, port_id).protocol;
-                    let mut next = current;
-                    egui::ComboBox::from_id_salt(("pb_hub_proto", port_id))
-                        .selected_text(current.label())
-                        .width(88.0)
-                        .show_ui(ui, |ui| {
-                            for proto in HubProto::ALL {
-                                ui.selectable_value(&mut next, proto, proto.label());
-                            }
-                        });
-                    if next != current {
-                        port_field(model, hub_id, port_id).protocol = next;
-                        dirty = true;
-                    }
+                let current = port_field(model, hub_id, port_id).protocol;
+                let mut next = current;
+                egui::ComboBox::from_id_salt(("pb_hub_proto", port_id))
+                    .selected_text(current.label())
+                    .width(88.0)
+                    .show_ui(ui, |ui| {
+                        for proto in HubProto::ALL {
+                            ui.selectable_value(&mut next, proto, proto.label());
+                        }
+                    });
+                if next != current {
+                    port_field(model, hub_id, port_id).protocol = next;
+                    dirty = true;
                 }
                 let field_w = (ui.available_width() - 2.0).max(36.0);
                 let label = &mut port_field(model, hub_id, port_id).label;
@@ -2667,10 +2650,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sample_shows_a_split_hub_and_a_single_protocol_hub() {
+    fn sample_hubs_are_server_capable_with_mixed_ports() {
         let model = HubModel::sample();
-        assert!(model.hubs[0].split());
-        assert_eq!(model.hubs[1].protocol, Some(HubProto::Mqtt));
+        assert_eq!(model.hubs[0].protocol, HubProto::Modbus);
+        assert_eq!(model.hubs[1].protocol, HubProto::Mqtt);
+        assert!(model.hubs[0].protocol.hub_capable());
+        assert!(model.hubs[1].protocol.hub_capable());
         let mut kinds = Vec::new();
         for port in model.hubs[0]
             .sources
@@ -2682,6 +2667,8 @@ mod tests {
             }
         }
         assert!(kinds.len() > 1);
+        assert!(!HubProto::Streams.hub_capable());
+        assert!(!HubProto::Files.hub_capable());
     }
 
     #[test]
@@ -2694,15 +2681,29 @@ mod tests {
     }
 
     #[test]
-    fn one_protocol_rewrites_every_port() {
+    fn hub_protocol_change_does_not_rewrite_ports() {
         let mut model = HubModel::sample();
+        let before: Vec<_> = model
+            .hub(6)
+            .unwrap()
+            .sources
+            .iter()
+            .chain(model.hub(6).unwrap().outputs.iter())
+            .map(|port| port.protocol)
+            .collect();
         model.set_hub_protocol(6, HubProto::OpcUa);
         let hub = model.hub(6).unwrap();
-        assert!(hub
+        assert_eq!(hub.protocol, HubProto::OpcUa);
+        let after: Vec<_> = hub
             .sources
             .iter()
             .chain(hub.outputs.iter())
-            .all(|port| port.protocol == HubProto::OpcUa));
+            .map(|port| port.protocol)
+            .collect();
+        assert_eq!(before, after);
+        // Non-hub protocols are rejected.
+        model.set_hub_protocol(6, HubProto::Streams);
+        assert_eq!(model.hub(6).unwrap().protocol, HubProto::OpcUa);
     }
 
     #[test]
@@ -2815,7 +2816,7 @@ mod tests {
             .iter()
             .find(|node| node.role == Role::Hub && node.hub_id == 1)
             .unwrap();
-        assert!(open_target(&model, plant).is_none());
+        assert_eq!(open_target(&model, plant), Some(DockPane::Modbus));
         let edge = nodes
             .iter()
             .find(|node| node.role == Role::Hub && node.hub_id == 6)
