@@ -6,7 +6,7 @@ use egui::{
 };
 
 use crate::dock::DockPane;
-use crate::theme::{blend_scope, font_semi, font_ui, tint, ThemePalette};
+use crate::theme::{blend_scope, divider_bar, font_semi, font_ui, tint, ThemePalette, SEP};
 
 const PORT_W: f32 = 156.0;
 const PORT_H: f32 = 44.0;
@@ -18,7 +18,6 @@ const MARGIN: f32 = 40.0;
 const INSPECT_DEFAULT: f32 = 276.0;
 const INSPECT_MIN: f32 = 180.0;
 const DIAGRAM_MIN: f32 = 280.0;
-const INSPECT_SPLIT: f32 = 6.0;
 
 fn default_inspector_width() -> f32 {
     INSPECT_DEFAULT
@@ -838,7 +837,8 @@ pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
     ui.add_space(8.0);
     let wide = ui.available_width() > 760.0;
     if wide {
-        let gap = INSPECT_SPLIT;
+        // Same inter-panel gap as the dock chrome (`SEP`).
+        let gap = SEP;
         let total = ui.available_width();
         let height = ui.available_height().max(160.0);
         let max_inspect = (total - gap - DIAGRAM_MIN).max(INSPECT_MIN);
@@ -885,16 +885,17 @@ enum SplitCmd {
 }
 
 /// Vertical drag bar between the hub canvas and the properties panel.
+/// Hit area and paint match the dock `tile_splitter` chrome (SEP gap + inset divider).
 fn hub_inspect_splitter(ui: &mut Ui, height: f32, gap: f32, p: &ThemePalette) -> SplitCmd {
     let (rect, resp) = ui.allocate_exact_size(vec2(gap, height), Sense::click_and_drag());
     let fill = if resp.hovered() || resp.dragged() {
         p.accent
     } else {
+        // About 40% transparent — same as dock panel dividers.
         tint(p.line, 153)
     };
-    let bar = Rect::from_center_size(rect.center(), vec2(2.0, (height - 8.0).max(2.0)));
     ui.painter()
-        .rect_filled(bar, Rounding::same(1.0), fill);
+        .rect_filled(divider_bar(rect, true), Rounding::same(1.0), fill);
     if resp.hovered() || resp.dragged() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
     }

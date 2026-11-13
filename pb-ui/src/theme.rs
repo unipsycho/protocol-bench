@@ -1,6 +1,6 @@
 //! Protocol Bench palettes. Copper is the product theme; the others are alternates.
 
-use egui::{Color32, FontFamily, FontId, Rounding, Stroke, TextStyle, Visuals};
+use egui::{Color32, FontFamily, FontId, Rect, Rounding, Stroke, TextStyle, Vec2, Visuals};
 
 pub const MIN_PANE: f32 = 168.0;
 pub const SEP: f32 = 8.0;
@@ -12,6 +12,21 @@ pub const RAIL_W: f32 = 56.0;
 /// Edge band used when the pointer is not on a dock pad.
 pub const EDGE_BAND: f32 = 0.26;
 pub const DROP_THRESHOLD: f32 = 5.0;
+
+/// A 2px bar centered in the gap, pulled in from both ends so it misses the rounded corners.
+pub fn divider_bar(gap: Rect, vertical_bar: bool) -> Rect {
+    const THICK: f32 = 2.0;
+    const INSET: f32 = 24.0;
+    if vertical_bar {
+        let inset = INSET.min(((gap.height() - 16.0) * 0.5).max(0.0));
+        let length = (gap.height() - inset * 2.0).max(THICK);
+        Rect::from_center_size(gap.center(), Vec2::new(THICK, length))
+    } else {
+        let inset = INSET.min(((gap.width() - 16.0) * 0.5).max(0.0));
+        let length = (gap.width() - inset * 2.0).max(THICK);
+        Rect::from_center_size(gap.center(), Vec2::new(length, THICK))
+    }
+}
 
 /// Protocol inks. Core colors sit on the dark scope; deep colors sit on light panes.
 pub struct Proto;
