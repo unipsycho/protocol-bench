@@ -2287,15 +2287,21 @@ fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
     );
     ui.add_space(4.0);
     let current = model.hub(id).unwrap().protocol;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-        for proto in HubProto::HUBS {
-            if text_button(ui, proto.label(), proto == current, p).clicked() && proto != current {
-                model.set_hub_protocol(id, proto);
-                change.dirty = true;
+    // Selector (not action buttons): pick the hub's one server-capable protocol.
+    let mut next = current;
+    egui::ComboBox::from_id_salt(("pb_hub_protocol", id))
+        .selected_text(current.label())
+        .width((ui.available_width()).min(220.0).max(120.0))
+        .show_ui(ui, |ui| {
+            for proto in HubProto::HUBS {
+                ui.selectable_value(&mut next, proto, proto.label());
             }
-        }
-    });
+        });
+    if next != current {
+        model.set_hub_protocol(id, next);
+        change.dirty = true;
+    }
+    let current = model.hub(id).unwrap().protocol;
     ui.add_space(8.0);
     if text_button(ui, &format!("Open {} panel", current.label()), true, p).clicked() {
         change.open = Some(current.pane());
@@ -2353,6 +2359,8 @@ fn port_section(
             list.iter().map(|port| port.id).collect()
         })
         .unwrap_or_default();
+    // Match ComboBox button height (at least interact_size.y) so the name field lines up.
+    let row_h = ui.spacing().interact_size.y;
     for port_id in ports {
         ui.add_space(4.0);
         // Place × first so it stays inside the panel, then the protocol, then the name in what remains.
@@ -2379,7 +2387,11 @@ fn port_section(
                 let field_w = (ui.available_width() - 2.0).max(36.0);
                 let label = &mut port_field(model, hub_id, port_id).label;
                 if ui
-                    .add(egui::TextEdit::singleline(label).desired_width(field_w))
+                    .add(
+                        egui::TextEdit::singleline(label)
+                            .desired_width(field_w)
+                            .min_size(vec2(0.0, row_h)),
+                    )
                     .changed()
                 {
                     dirty = true;
