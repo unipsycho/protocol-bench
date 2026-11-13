@@ -931,10 +931,13 @@ fn push_id_spots(spots: &mut Vec<Spot>, ids: &[(u64, Role)], x: f32, mid: f32, h
 /// A bar is on only when a node rectangle falls outside the visible grid.
 /// Padding, the scrollbar's own thickness, and the current pan offset are not inputs.
 struct ScrollFit {
+    /// True when content overflows the view on that axis (used by layout tests).
+    #[allow(dead_code)]
     allow: [bool; 2],
     /// Content size. This stays the view size on an axis where every node already fits.
+    #[allow(dead_code)]
     size: Vec2,
-    /// Moves a node that starts before the grid origin into scrollable space.
+    /// Moves a node that starts before the grid origin into view / centers when it fits.
     shift: Vec2,
 }
 
