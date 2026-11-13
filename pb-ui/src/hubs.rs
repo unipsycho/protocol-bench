@@ -1,4 +1,5 @@
-//! Hub diagram. Each hub is a conversion point: sources in, then aggregate or calculate, outputs out. No protocol I/O.
+//! Hub diagram. Each hub is a conversion / routing point: sources in, optional
+//! aggregator or calculation transforms on the edges, outputs out. No protocol I/O.
 
 use egui::{
     pos2, vec2, Align2, Color32, CursorIcon, Id, Layout, Pos2, Rect, Rounding, ScrollArea, Sense,
@@ -92,12 +93,16 @@ pub struct HubPort {
     pub at: Option<[f32; 2]>,
 }
 
-/// Aggregate or calculation step on a hub. Not a protocol endpoint.
+/// Aggregate or calculation step on a hub edge (source↔hub or hub↔output).
+/// Not a free-floating peer of the hub — it sits on the data path.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HubStep {
     pub id: u64,
     pub label: String,
-    /// Center on the diagram, once the user has dragged this node.
+    /// Source or output port whose hub link carries this transform.
+    #[serde(default)]
+    pub edge_port: u64,
+    /// Center on the diagram, once the user has dragged this node off the edge.
     #[serde(default)]
     pub at: Option<[f32; 2]>,
 }
@@ -110,10 +115,10 @@ pub struct Hub {
     pub protocol: Option<HubProto>,
     pub sources: Vec<HubPort>,
     pub outputs: Vec<HubPort>,
-    /// After sources come in: roll values up before they leave.
+    /// Transforms sitting on source→hub or hub→output edges.
     #[serde(default)]
     pub aggregators: Vec<HubStep>,
-    /// After sources come in: derived values before they leave.
+    /// Transforms sitting on source→hub or hub→output edges.
     #[serde(default)]
     pub calculations: Vec<HubStep>,
     /// Center on the diagram, once the user has dragged this hub.
@@ -134,8 +139,27 @@ impl Hub {
             || self.calculations.iter().any(|step| step.id == id)
     }
 
-    fn process_count(&self) -> usize {
-        self.aggregators.len() + self.calculations.len()
+    fn has_port(&self, id: u64) -> bool {
+        self.sources.iter().any(|port| port.id == id)
+            || self.outputs.iter().any(|port| port.id == id)
+    }
+
+    /// Steps on one port's edge, aggregators then calculations (path order).
+    fn steps_on(&self, edge_port: u64) -> Vec<(u64, Role)> {
+        let mut ids = Vec::new();
+        ids.extend(
+            self.aggregators
+                .iter()
+                .filter(|step| step.edge_port == edge_port)
+                .map(|step| (step.id, Role::Aggregator)),
+        );
+        ids.extend(
+            self.calculations
+                .iter()
+                .filter(|step| step.edge_port == edge_port)
+                .map(|step| (step.id, Role::Calculation)),
+        );
+        ids
     }
 }
 
@@ -154,9 +178,12 @@ pub struct HubModel {
     pub hubs: Vec<Hub>,
     /// Hub whose details are open. A port selection also sets this.
     pub selected: Option<u64>,
-    /// Set when a source or output node is the one showing details.
+    /// Set when a source, output, or transform node is the one showing details.
     #[serde(default)]
     pub selected_port: Option<u64>,
+    /// Selected connection (source/output port id) for edge transforms.
+    #[serde(default)]
+    pub selected_link: Option<u64>,
     /// Width of the right-hand configure panel when the hubs view is wide enough.
     #[serde(default = "default_inspector_width")]
     pub inspector_width: f32,
@@ -180,6 +207,7 @@ impl HubModel {
             next_id: 20,
             selected: Some(1),
             selected_port: None,
+            selected_link: None,
             inspector_width: INSPECT_DEFAULT,
             zoom: ZOOM_MAX,
             hubs: vec![
@@ -265,10 +293,33 @@ impl HubModel {
                     port.protocol = proto;
                 }
             }
+            // Attach orphan transforms (older saves) to a real port edge.
+            let ports: Vec<u64> = hub
+                .sources
+                .iter()
+                .chain(hub.outputs.iter())
+                .map(|port| port.id)
+                .collect();
+            let fallback = ports.first().copied().unwrap_or(0);
+            if ports.is_empty() {
+                hub.aggregators.clear();
+                hub.calculations.clear();
+            } else {
+                for step in hub
+                    .aggregators
+                    .iter_mut()
+                    .chain(hub.calculations.iter_mut())
+                {
+                    if step.edge_port == 0 || !ports.contains(&step.edge_port) {
+                        step.edge_port = fallback;
+                    }
+                }
+            }
         }
         if self.selected.is_some_and(|id| self.hub(id).is_none()) {
             self.selected = self.hubs.first().map(|hub| hub.id);
             self.selected_port = None;
+            self.selected_link = None;
         }
         if !self.inspector_width.is_finite() || self.inspector_width < INSPECT_MIN {
             self.inspector_width = INSPECT_DEFAULT;
@@ -277,29 +328,73 @@ impl HubModel {
         self.keep_focus();
     }
 
-    /// Drop a port or step selection that no longer belongs to the open hub.
+    /// Drop a port, step, or link selection that no longer belongs to the open hub.
     fn keep_focus(&mut self) {
         let Some(hub_id) = self.selected else {
             self.selected_port = None;
+            self.selected_link = None;
             return;
         };
-        let Some(port_id) = self.selected_port else {
-            return;
-        };
-        let belongs = self.hub(hub_id).is_some_and(|hub| hub.has_node(port_id));
-        if !belongs {
-            self.selected_port = None;
+        if let Some(port_id) = self.selected_port {
+            let belongs = self.hub(hub_id).is_some_and(|hub| hub.has_node(port_id));
+            if !belongs {
+                self.selected_port = None;
+            }
+        }
+        if let Some(link) = self.selected_link {
+            let belongs = self.hub(hub_id).is_some_and(|hub| hub.has_port(link));
+            if !belongs {
+                self.selected_link = None;
+            }
         }
     }
 
     pub fn focus_hub(&mut self, id: u64) {
         self.selected = Some(id);
         self.selected_port = None;
+        self.selected_link = None;
     }
 
     pub fn focus_port(&mut self, hub_id: u64, port_id: u64) {
         self.selected = Some(hub_id);
         self.selected_port = Some(port_id);
+        // Port click selects its edge; step click keeps the step's edge selected.
+        if let Some(hub) = self.hub(hub_id) {
+            if hub.has_port(port_id) {
+                self.selected_link = Some(port_id);
+            } else if let Some(step) = hub
+                .aggregators
+                .iter()
+                .chain(hub.calculations.iter())
+                .find(|step| step.id == port_id)
+            {
+                self.selected_link = Some(step.edge_port);
+            }
+        }
+    }
+
+    /// Select the connection between a port and its hub (for edge transforms).
+    pub fn focus_link(&mut self, hub_id: u64, port_id: u64) {
+        self.selected = Some(hub_id);
+        self.selected_port = None;
+        self.selected_link = Some(port_id);
+    }
+
+    /// Hub + port edge currently targeted for Add aggregator / calculation.
+    pub fn transform_edge(&self) -> Option<(u64, u64)> {
+        let hub_id = self.selected?;
+        let hub = self.hub(hub_id)?;
+        if let Some(link) = self.selected_link {
+            if hub.has_port(link) {
+                return Some((hub_id, link));
+            }
+        }
+        let port_id = self.selected_port?;
+        if hub.has_port(port_id) {
+            Some((hub_id, port_id))
+        } else {
+            None
+        }
     }
 
     /// Remember a dragged center. `port_id` none moves the hub.
@@ -393,6 +488,7 @@ impl HubModel {
         });
         self.selected = Some(id);
         self.selected_port = None;
+        self.selected_link = None;
     }
 
     pub fn remove_hub(&mut self, id: u64) {
@@ -400,6 +496,7 @@ impl HubModel {
         if self.selected == Some(id) {
             self.selected = self.hubs.first().map(|hub| hub.id);
             self.selected_port = None;
+            self.selected_link = None;
         }
         self.keep_focus();
     }
@@ -460,8 +557,14 @@ impl HubModel {
         Some(id)
     }
 
-    /// Append an aggregator or calculation and return its id.
-    pub fn add_step(&mut self, hub_id: u64, aggregator: bool) -> Option<u64> {
+    /// Append an aggregator or calculation on a port's edge and return its id.
+    pub fn add_step(&mut self, hub_id: u64, aggregator: bool, edge_port: u64) -> Option<u64> {
+        {
+            let hub = self.hub(hub_id)?;
+            if !hub.has_port(edge_port) {
+                return None;
+            }
+        }
         let id = self.alloc();
         let Some(hub) = self.hub_mut(hub_id) else {
             return None;
@@ -473,6 +576,7 @@ impl HubModel {
             } else {
                 "Calculation".into()
             },
+            edge_port,
             at: None,
         };
         if aggregator {
@@ -487,11 +591,17 @@ impl HubModel {
         if let Some(hub) = self.hub_mut(hub_id) {
             hub.sources.retain(|port| port.id != port_id);
             hub.outputs.retain(|port| port.id != port_id);
-            hub.aggregators.retain(|step| step.id != port_id);
-            hub.calculations.retain(|step| step.id != port_id);
+            // Drop the node itself, or any transform that lived on that edge.
+            hub.aggregators
+                .retain(|step| step.id != port_id && step.edge_port != port_id);
+            hub.calculations
+                .retain(|step| step.id != port_id && step.edge_port != port_id);
         }
         if self.selected_port == Some(port_id) {
             self.selected_port = None;
+        }
+        if self.selected_link == Some(port_id) {
+            self.selected_link = None;
         }
     }
 
@@ -546,7 +656,8 @@ struct Spot {
     center: Pos2,
 }
 
-/// Compact columns. A saved drag wins; an undragged port stays beside its hub.
+/// Compact columns. Transforms sit on the source↔hub / hub↔output edges.
+/// A saved drag wins; an undragged port stays beside its hub.
 fn layout_nodes(hubs: &[Hub]) -> Vec<Placed> {
     let defaults = default_spots(hubs);
     let mut hub_default = Vec::new();
@@ -591,29 +702,54 @@ fn layout_nodes(hubs: &[Hub]) -> Vec<Placed> {
                 port.at,
             );
         }
-        for step in &hub.aggregators {
-            place_dragged(
-                &mut nodes,
-                &defaults,
-                origin,
-                center,
-                hub.id,
-                step.id,
-                Role::Aggregator,
-                step.at,
-            );
-        }
-        for step in &hub.calculations {
-            place_dragged(
-                &mut nodes,
-                &defaults,
-                origin,
-                center,
-                hub.id,
-                step.id,
-                Role::Calculation,
-                step.at,
-            );
+    }
+    // Edge transforms: evenly along the port↔hub segment unless dragged.
+    for hub in hubs {
+        let Some(hub_node) = nodes
+            .iter()
+            .find(|node| node.hub_id == hub.id && node.role == Role::Hub)
+            .copied()
+        else {
+            continue;
+        };
+        let edges: Vec<u64> = hub
+            .sources
+            .iter()
+            .chain(hub.outputs.iter())
+            .map(|port| port.id)
+            .collect();
+        for edge_port in edges {
+            let on_edge = hub.steps_on(edge_port);
+            if on_edge.is_empty() {
+                continue;
+            }
+            let Some(port_node) = nodes
+                .iter()
+                .find(|node| node.hub_id == hub.id && node.port_id == Some(edge_port))
+                .copied()
+            else {
+                continue;
+            };
+            let n = on_edge.len() as f32;
+            for (i, (id, role)) in on_edge.into_iter().enumerate() {
+                let at = hub
+                    .aggregators
+                    .iter()
+                    .chain(hub.calculations.iter())
+                    .find(|step| step.id == id)
+                    .and_then(|step| step.at);
+                let t = (i as f32 + 1.0) / (n + 1.0);
+                let mid =
+                    port_node.rect.center() + (hub_node.rect.center() - port_node.rect.center()) * t;
+                let center = at.map(|at| pos2(at[0], at[1])).unwrap_or(mid);
+                nodes.push(placed(
+                    hub.id,
+                    Some(id),
+                    role,
+                    center,
+                    vec2(PORT_W, PORT_H),
+                ));
+            }
         }
     }
     nodes
@@ -656,26 +792,14 @@ fn placed(hub_id: u64, port_id: Option<u64>, role: Role, center: Pos2, size: Vec
 fn default_spots(hubs: &[Hub]) -> Vec<Spot> {
     let src_x = MARGIN + PORT_W * 0.5;
     let hub_x = MARGIN + PORT_W + COL_GAP + HUB_W * 0.5;
+    let out_x = hub_x + HUB_W * 0.5 + COL_GAP + PORT_W * 0.5;
     let mut y = MARGIN;
     let mut spots = Vec::new();
     for hub in hubs {
-        let proc = hub.process_count();
-        let rows = hub
-            .sources
-            .len()
-            .max(hub.outputs.len())
-            .max(proc)
-            .max(1) as f32;
+        let rows = hub.sources.len().max(hub.outputs.len()).max(1) as f32;
         let stack = rows * PORT_H + (rows - 1.0).max(0.0) * GAP;
         let band = stack.max(HUB_H) + 36.0;
         let mid = y + band * 0.5;
-        // Process column only when this hub has aggregators or calculations.
-        let proc_x = hub_x + HUB_W * 0.5 + COL_GAP + PORT_W * 0.5;
-        let out_x = if proc > 0 {
-            proc_x + PORT_W * 0.5 + COL_GAP + PORT_W * 0.5
-        } else {
-            proc_x
-        };
         spots.push(Spot {
             hub_id: hub.id,
             port_id: None,
@@ -683,16 +807,6 @@ fn default_spots(hubs: &[Hub]) -> Vec<Spot> {
             center: pos2(hub_x, mid),
         });
         push_port_spots(&mut spots, &hub.sources, Role::Source, src_x, mid, hub.id);
-        if proc > 0 {
-            let mut ids = Vec::with_capacity(proc);
-            ids.extend(hub.aggregators.iter().map(|step| (step.id, Role::Aggregator)));
-            ids.extend(
-                hub.calculations
-                    .iter()
-                    .map(|step| (step.id, Role::Calculation)),
-            );
-            push_id_spots(&mut spots, &ids, proc_x, mid, hub.id);
-        }
         push_port_spots(&mut spots, &hub.outputs, Role::Output, out_x, mid, hub.id);
         y += band + 28.0;
     }
@@ -898,7 +1012,7 @@ pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
-                    "Drag a node to place it. Click for details. Right-click to add. Wheel zooms. Middle-drag or Space-drag pans.",
+                    "Drag a node to place it. Click a link or node for details. Right-click a connection to add aggregator/calculation. Wheel zooms. Middle-drag or Space-drag pans.",
                 )
                 .font(font_ui(12.0))
                 .color(p.muted),
@@ -1086,7 +1200,7 @@ fn diagram_view(
                 font_ui(14.0),
                 p.muted,
             );
-            if let Some(cmd) = canvas_menu(&canvas, None) {
+            if let Some(cmd) = canvas_menu(&canvas, None, None) {
                 apply_menu(model, cmd, &mut change);
             }
             return;
@@ -1100,7 +1214,23 @@ fn diagram_view(
                 ..*node
             })
             .collect();
-        let gesture = gesture_nodes(ui, model, &screen, pan.is_some());
+        let mut gesture = gesture_nodes(ui, model, &screen, pan.is_some());
+        // Links only when no node took the pointer (nodes sit on top of edges).
+        if gesture.hover.is_none()
+            && gesture.pick.is_none()
+            && gesture.menu.is_none()
+            && !pan.is_some()
+        {
+            if let Some((hub_id, port_id)) = hit_link(ui, model, &screen, zoom) {
+                gesture.hot_link = Some((hub_id, port_id));
+                gesture.hover = Some((hub_id, Some(port_id)));
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                if canvas.clicked() || canvas.secondary_clicked() {
+                    gesture.pick = Some((hub_id, Some(port_id)));
+                    gesture.link_pick = true;
+                }
+            }
+        }
         if let Some((hub_id, port_id, delta)) = gesture.drag {
             let center = screen
                 .iter()
@@ -1116,11 +1246,18 @@ fn diagram_view(
             }
         }
         if let Some((hub_id, port_id)) = gesture.pick {
-            match port_id {
-                Some(port_id) => model.focus_port(hub_id, port_id),
-                None => model.focus_hub(hub_id),
+            if gesture.link_pick {
+                if let Some(port_id) = port_id {
+                    model.focus_link(hub_id, port_id);
+                    change.dirty = true;
+                }
+            } else {
+                match port_id {
+                    Some(port_id) => model.focus_port(hub_id, port_id),
+                    None => model.focus_hub(hub_id),
+                }
+                change.dirty = true;
             }
-            change.dirty = true;
         }
         if let Some(pane) = gesture.open {
             change.open = Some(pane);
@@ -1128,7 +1265,11 @@ fn diagram_view(
         let target = model
             .selected
             .or_else(|| model.hubs.first().map(|hub| hub.id));
-        let menu = gesture.menu.or_else(|| canvas_menu(&canvas, target));
+        // Prefer the hovered connection; else the already-selected edge.
+        let edge = gesture.hot_link.or_else(|| model.transform_edge());
+        let menu = gesture
+            .menu
+            .or_else(|| canvas_menu(&canvas, target, edge));
         if let Some(cmd) = menu {
             apply_menu(model, cmd, &mut change);
         }
@@ -1140,7 +1281,20 @@ fn diagram_view(
                 ..*node
             })
             .collect();
-        paint_flow(ui.painter(), &screen, model, gesture.hover, zoom, p);
+        paint_flow(
+            ui.painter(),
+            &screen,
+            model,
+            gesture.hover,
+            gesture.hot_link.or(model.selected_link.map(|id| {
+                (
+                    model.selected.unwrap_or(0),
+                    id,
+                )
+            })),
+            zoom,
+            p,
+        );
     });
     if pan.is_some() {
         child.ctx().set_cursor_icon(egui::CursorIcon::AllScroll);
@@ -1177,8 +1331,8 @@ fn pan_scroll(offset: Vec2, delta: Vec2) -> Vec2 {
 }
 
 enum MenuCmd {
-    AddAggregator(u64),
-    AddCalculation(u64),
+    AddAggregator { hub_id: u64, edge_port: u64 },
+    AddCalculation { hub_id: u64, edge_port: u64 },
     AddSource(u64),
     AddOutput(u64),
     NewHub,
@@ -1186,14 +1340,14 @@ enum MenuCmd {
 
 fn apply_menu(model: &mut HubModel, cmd: MenuCmd, change: &mut HubChange) {
     match cmd {
-        MenuCmd::AddAggregator(hub_id) => {
-            if let Some(step_id) = model.add_step(hub_id, true) {
+        MenuCmd::AddAggregator { hub_id, edge_port } => {
+            if let Some(step_id) = model.add_step(hub_id, true, edge_port) {
                 model.focus_port(hub_id, step_id);
                 change.dirty = true;
             }
         }
-        MenuCmd::AddCalculation(hub_id) => {
-            if let Some(step_id) = model.add_step(hub_id, false) {
+        MenuCmd::AddCalculation { hub_id, edge_port } => {
+            if let Some(step_id) = model.add_step(hub_id, false, edge_port) {
                 model.focus_port(hub_id, step_id);
                 change.dirty = true;
             }
@@ -1217,16 +1371,20 @@ fn apply_menu(model: &mut HubModel, cmd: MenuCmd, change: &mut HubChange) {
     }
 }
 
-/// Shared top of every hubs context menu: aggregator and calculation first.
-fn hub_add_menu(ui: &mut Ui, hub_id: u64, cmd: &mut Option<MenuCmd>) {
+/// Edge transforms: only when a connection (or its port) is the target.
+fn edge_transform_menu(ui: &mut Ui, hub_id: u64, edge_port: u64, cmd: &mut Option<MenuCmd>) {
     if ui.button("Add aggregator").clicked() {
-        *cmd = Some(MenuCmd::AddAggregator(hub_id));
+        *cmd = Some(MenuCmd::AddAggregator { hub_id, edge_port });
         ui.close_menu();
     }
     if ui.button("Add calculation").clicked() {
-        *cmd = Some(MenuCmd::AddCalculation(hub_id));
+        *cmd = Some(MenuCmd::AddCalculation { hub_id, edge_port });
         ui.close_menu();
     }
+}
+
+/// Hub port adds (source / output).
+fn hub_port_menu(ui: &mut Ui, hub_id: u64, cmd: &mut Option<MenuCmd>) {
     if ui.button("Add source").clicked() {
         *cmd = Some(MenuCmd::AddSource(hub_id));
         ui.close_menu();
@@ -1237,13 +1395,21 @@ fn hub_add_menu(ui: &mut Ui, hub_id: u64, cmd: &mut Option<MenuCmd>) {
     }
 }
 
-/// Right-click the empty canvas. `hub_id` is who receives a new node.
-fn canvas_menu(resp: &egui::Response, hub_id: Option<u64>) -> Option<MenuCmd> {
+/// Right-click empty canvas. Transforms only when an edge is already selected.
+fn canvas_menu(
+    resp: &egui::Response,
+    hub_id: Option<u64>,
+    edge: Option<(u64, u64)>,
+) -> Option<MenuCmd> {
     let mut cmd = None;
     resp.context_menu(|ui| {
         ui.set_min_width(168.0);
+        if let Some((hub_id, edge_port)) = edge {
+            edge_transform_menu(ui, hub_id, edge_port, &mut cmd);
+            ui.separator();
+        }
         if let Some(hub_id) = hub_id {
-            hub_add_menu(ui, hub_id, &mut cmd);
+            hub_port_menu(ui, hub_id, &mut cmd);
             ui.separator();
         }
         if ui.button("New hub").clicked() {
@@ -1260,6 +1426,10 @@ struct Gesture {
     drag: Option<(u64, Option<u64>, Vec2)>,
     open: Option<DockPane>,
     menu: Option<MenuCmd>,
+    /// True when `pick` came from a connection, not a node.
+    link_pick: bool,
+    /// Hovered / menu-targeted link (hub_id, port_id).
+    hot_link: Option<(u64, u64)>,
 }
 
 fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool) -> Gesture {
@@ -1269,6 +1439,8 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
         drag: None,
         open: None,
         menu: None,
+        link_pick: false,
+        hot_link: None,
     };
     for node in nodes {
         let id = Id::new((
@@ -1278,10 +1450,14 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
             node.role as u8,
         ));
         let opens = open_target(model, node).is_some();
-        let tip = if opens {
-            "Drag to move. Click for details. Double-click opens the protocol panel. Right-click to add nodes."
-        } else {
-            "Drag to move. Click for details. Right-click to add nodes."
+        let tip = match node.role {
+            Role::Source | Role::Output => {
+                "Drag to move. Click for details. Right-click to add aggregator/calculation on this link."
+            }
+            _ if opens => {
+                "Drag to move. Click for details. Double-click opens the protocol panel. Right-click to add source/output."
+            }
+            _ => "Drag to move. Click for details. Right-click to add source/output.",
         };
         let resp = ui
             .interact(node.rect, id, Sense::click_and_drag())
@@ -1310,13 +1486,120 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
         let mut menu = None;
         resp.context_menu(|ui| {
             ui.set_min_width(168.0);
-            hub_add_menu(ui, node.hub_id, &mut menu);
+            match node.role {
+                Role::Source | Role::Output => {
+                    if let Some(port_id) = node.port_id {
+                        edge_transform_menu(ui, node.hub_id, port_id, &mut menu);
+                        ui.separator();
+                    }
+                    hub_port_menu(ui, node.hub_id, &mut menu);
+                }
+                Role::Aggregator | Role::Calculation => {
+                    if let Some(step) = find_step(model, node.hub_id, node.port_id) {
+                        edge_transform_menu(ui, node.hub_id, step.edge_port, &mut menu);
+                    }
+                }
+                Role::Hub => hub_port_menu(ui, node.hub_id, &mut menu),
+            }
         });
         if menu.is_some() {
             gesture.menu = menu;
         }
     }
     gesture
+}
+
+/// Nearest source↔hub / hub↔output connection under the pointer, if within hit slop.
+fn hit_link(ui: &Ui, model: &HubModel, nodes: &[Placed], zoom: f32) -> Option<(u64, u64)> {
+    let pointer = ui
+        .ctx()
+        .pointer_hover_pos()
+        .or_else(|| ui.ctx().pointer_interact_pos())?;
+    let thresh = (8.0 * zoom.max(0.35)).max(6.0);
+    let mut best: Option<(f32, u64, u64)> = None;
+    for node in nodes {
+        if node.role != Role::Source && node.role != Role::Output {
+            continue;
+        }
+        let Some(port_id) = node.port_id else {
+            continue;
+        };
+        let Some(hub) = find(nodes, node.hub_id, Role::Hub, None) else {
+            continue;
+        };
+        let chain = edge_chain(model, nodes, node, hub, port_id);
+        for pair in chain.windows(2) {
+            let Some(dist) = link_distance(pair[0], pair[1], pointer) else {
+                continue;
+            };
+            if dist > thresh {
+                continue;
+            }
+            let closer = best.map(|(d, _, _)| dist < d).unwrap_or(true);
+            if closer {
+                best = Some((dist, node.hub_id, port_id));
+            }
+        }
+    }
+    best.map(|(_, hub_id, port_id)| (hub_id, port_id))
+}
+
+/// Node rects along one port's path (port → transforms → hub, or hub → transforms → port).
+fn edge_chain(
+    model: &HubModel,
+    nodes: &[Placed],
+    port: &Placed,
+    hub: &Placed,
+    edge_port: u64,
+) -> Vec<Rect> {
+    let on_edge: Vec<u64> = model
+        .hub(port.hub_id)
+        .map(|h| h.steps_on(edge_port).into_iter().map(|(id, _)| id).collect())
+        .unwrap_or_default();
+    let mut steps: Vec<&Placed> = nodes
+        .iter()
+        .filter(|node| {
+            node.hub_id == port.hub_id
+                && matches!(node.role, Role::Aggregator | Role::Calculation)
+                && node.port_id.is_some_and(|id| on_edge.contains(&id))
+        })
+        .collect();
+    let origin = port.rect.center();
+    steps.sort_by(|a, b| {
+        let da = (a.rect.center() - origin).length_sq();
+        let db = (b.rect.center() - origin).length_sq();
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut chain = Vec::with_capacity(steps.len() + 2);
+    if port.role == Role::Source {
+        chain.push(port.rect);
+        chain.extend(steps.iter().map(|node| node.rect));
+        chain.push(hub.rect);
+    } else {
+        chain.push(hub.rect);
+        chain.extend(steps.iter().map(|node| node.rect));
+        chain.push(port.rect);
+    }
+    chain
+}
+
+/// Shortest distance from `pos` to the cubic link between two node rects.
+fn link_distance(from: Rect, to: Rect, pos: Pos2) -> Option<f32> {
+    let (start, end, dir) = facing(from, to);
+    let pull = ((end - start).length() * 0.42).clamp(28.0, 110.0);
+    let c1 = start + dir * pull;
+    let c2 = end - dir * pull;
+    let mut best = f32::MAX;
+    for step in 0..=24 {
+        let t = step as f32 / 24.0;
+        let point = cubic(start, c1, c2, end, t);
+        best = best.min((point - pos).length());
+    }
+    if best.is_finite() {
+        Some(best)
+    } else {
+        None
+    }
 }
 
 /// Protocol panel for this node, when the node is one protocol.
@@ -1358,42 +1641,28 @@ fn paint_flow(
     nodes: &[Placed],
     model: &HubModel,
     hover: Option<(u64, Option<u64>)>,
+    hot_link: Option<(u64, u64)>,
     zoom: f32,
     p: &ThemePalette,
 ) {
     for node in nodes {
-        if node.role != Role::Source {
+        if node.role != Role::Source && node.role != Role::Output {
             continue;
         }
+        let Some(port_id) = node.port_id else {
+            continue;
+        };
         let Some(hub) = find(nodes, node.hub_id, Role::Hub, None) else {
             continue;
         };
-        let hot = link_hot(node, hub, hover, model);
-        link_curve(
-            painter,
-            node.rect,
-            hub.rect,
-            port_proto(model, node.hub_id, node.port_id).ink(p.is_light),
-            false,
-            hot,
-        );
-    }
-    for node in nodes {
-        if node.role != Role::Output
-            && node.role != Role::Aggregator
-            && node.role != Role::Calculation
-        {
-            continue;
+        let chain = edge_chain(model, nodes, node, hub, port_id);
+        let ink = port_proto(model, node.hub_id, node.port_id).ink(p.is_light);
+        let link_selected = hot_link == Some((node.hub_id, port_id))
+            || model.selected_link == Some(port_id) && model.selected == Some(node.hub_id);
+        let hot = link_selected || link_hot(node, hub, hover, model);
+        for pair in chain.windows(2) {
+            link_curve(painter, pair[0], pair[1], ink, false, hot);
         }
-        let Some(hub) = find(nodes, node.hub_id, Role::Hub, None) else {
-            continue;
-        };
-        let hot = link_hot(hub, node, hover, model);
-        let ink = match node.role {
-            Role::Output => port_proto(model, node.hub_id, node.port_id).ink(p.is_light),
-            _ => p.accent,
-        };
-        link_curve(painter, hub.rect, node.rect, ink, false, hot);
     }
     for link in model.across() {
         let Some(from) = find(nodes, link.from_hub, Role::Output, Some(link.from_port)) else {
@@ -1408,7 +1677,11 @@ fn paint_flow(
     }
     for node in nodes {
         let hot = hovered(node, hover);
-        let on = selected_node(model, node);
+        let on = selected_node(model, node)
+            || (matches!(node.role, Role::Source | Role::Output)
+                && model.selected == Some(node.hub_id)
+                && model.selected_link == node.port_id
+                && model.selected_port.is_none());
         match node.role {
             Role::Hub => paint_hub_node(painter, node, model, on, hot, zoom, p),
             Role::Source | Role::Output => paint_port_node(painter, node, model, on, hot, zoom, p),
@@ -1691,6 +1964,21 @@ fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
         return HubChange::quiet();
     };
     let aggregator = hub.aggregators.iter().any(|step| step.id == step_id);
+    let edge_port = hub
+        .aggregators
+        .iter()
+        .chain(hub.calculations.iter())
+        .find(|step| step.id == step_id)
+        .map(|step| step.edge_port);
+    let edge_label = edge_port
+        .and_then(|port_id| {
+            hub.sources
+                .iter()
+                .chain(hub.outputs.iter())
+                .find(|port| port.id == port_id)
+                .map(|port| port.label.clone())
+        })
+        .unwrap_or_else(|| "connection".into());
     let hub_name = hub.name.clone();
     let mut change = HubChange::quiet();
     let kind = if aggregator {
@@ -1704,7 +1992,7 @@ fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
             .color(p.accent),
     );
     ui.label(
-        egui::RichText::new(format!("On hub {hub_name}"))
+        egui::RichText::new(format!("On edge · {edge_label} · hub {hub_name}"))
             .font(font_ui(12.0))
             .color(p.muted),
     );
@@ -1956,6 +2244,10 @@ fn step_section(
     } else {
         "CALCULATIONS"
     };
+    let edge = model
+        .transform_edge()
+        .filter(|(id, _)| *id == hub_id)
+        .map(|(_, port)| port);
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(title)
@@ -1963,13 +2255,28 @@ fn step_section(
                 .color(p.muted),
         );
         ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-            if text_button(ui, "Add", false, p).clicked() {
-                model.add_step(hub_id, aggregator);
-                dirty = true;
+            let can_add = edge.is_some();
+            let add = text_button(ui, "Add", false, p);
+            if !can_add {
+                add.on_hover_text("Select a connection first");
+            } else if add.clicked() {
+                if let Some(edge_port) = edge {
+                    if let Some(step_id) = model.add_step(hub_id, aggregator, edge_port) {
+                        model.focus_port(hub_id, step_id);
+                        dirty = true;
+                    }
+                }
             }
         });
     });
-    let steps: Vec<u64> = model
+    if edge.is_none() {
+        ui.label(
+            egui::RichText::new("Select a link to place on the path")
+                .font(font_ui(11.0))
+                .color(p.muted),
+        );
+    }
+    let steps: Vec<(u64, String)> = model
         .hub(hub_id)
         .map(|hub| {
             let list = if aggregator {
@@ -1977,10 +2284,21 @@ fn step_section(
             } else {
                 &hub.calculations
             };
-            list.iter().map(|step| step.id).collect()
+            list.iter()
+                .map(|step| {
+                    let edge_name = hub
+                        .sources
+                        .iter()
+                        .chain(hub.outputs.iter())
+                        .find(|port| port.id == step.edge_port)
+                        .map(|port| port.label.clone())
+                        .unwrap_or_else(|| "?".into());
+                    (step.id, edge_name)
+                })
+                .collect()
         })
         .unwrap_or_default();
-    for step_id in steps {
+    for (step_id, edge_name) in steps {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1988,6 +2306,11 @@ fn step_section(
                     model.remove_port(hub_id, step_id);
                     dirty = true;
                 }
+                ui.label(
+                    egui::RichText::new(edge_name)
+                        .font(font_ui(11.0))
+                        .color(p.muted),
+                );
                 let field_w = (ui.available_width() - 2.0).max(36.0);
                 let label = &mut step_field(model, hub_id, step_id).label;
                 if ui
@@ -2226,11 +2549,13 @@ mod tests {
     }
 
     #[test]
-    fn add_aggregator_and_calculation_create_canvas_nodes() {
+    fn add_aggregator_and_calculation_sit_on_the_selected_edge() {
         let mut model = HubModel::sample();
-        let agg = model.add_step(1, true).unwrap();
-        let calc = model.add_step(1, false).unwrap();
+        // Plant MQTT output (id 4) → hub edge.
+        let agg = model.add_step(1, true, 4).unwrap();
+        let calc = model.add_step(1, false, 4).unwrap();
         model.focus_port(1, agg);
+        assert_eq!(model.selected_link, Some(4));
         let nodes = layout_nodes(&model.hubs);
         let agg_node = nodes.iter().find(|node| node.port_id == Some(agg)).unwrap();
         let calc_node = nodes
@@ -2244,9 +2569,17 @@ mod tests {
         let output = nodes.iter().find(|node| node.port_id == Some(4)).unwrap();
         assert_eq!(agg_node.role, Role::Aggregator);
         assert_eq!(calc_node.role, Role::Calculation);
-        assert!(plant.rect.right() < agg_node.rect.left());
-        assert!(agg_node.rect.right() < output.rect.left());
+        assert_eq!(
+            model.hub(1).unwrap().aggregators[0].edge_port,
+            4
+        );
+        // Both transforms land between hub and that output on the edge.
+        let left = plant.rect.center().x.min(output.rect.center().x);
+        let right = plant.rect.center().x.max(output.rect.center().x);
+        assert!(agg_node.rect.center().x > left && agg_node.rect.center().x < right);
+        assert!(calc_node.rect.center().x > left && calc_node.rect.center().x < right);
         assert!(open_target(&model, agg_node).is_none());
+        assert!(model.add_step(1, true, 999).is_none());
     }
 
     #[test]

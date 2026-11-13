@@ -5,7 +5,8 @@ use pb_engine::HostSnapshot;
 
 use crate::art;
 use crate::dock::DockPane;
-use crate::theme::{font_mono, font_semi, font_ui, scope, tint, ThemePalette};
+use crate::hubs::HubModel;
+use crate::theme::{font_semi, font_ui, scope, tint, ThemePalette};
 
 /// Fill the pane body for one dock leaf.
 pub fn paint(
@@ -13,11 +14,11 @@ pub fn paint(
     pane: DockPane,
     host: &HostSnapshot,
     p: &ThemePalette,
-    hubs: &mut crate::hubs::HubModel,
+    hubs: &mut HubModel,
 ) -> crate::hubs::HubChange {
     match pane {
         DockPane::Project => {
-            project_panel(ui, host, p);
+            project_panel(ui, hubs, p);
             crate::hubs::HubChange::quiet()
         }
         DockPane::Hubs => crate::hubs::paint(ui, hubs, p),
@@ -50,7 +51,7 @@ fn blurb(pane: DockPane, host: &HostSnapshot) -> &'static str {
         }
     }
     match pane {
-        DockPane::Project => "Endpoints, mappings, and the engine host for this bench.",
+        DockPane::Project => "Hubs, endpoints, points, mappings, and edge transforms for this project.",
         DockPane::Points => "One value, quality, and timestamp for every named point.",
         DockPane::Mappings => "A point that arrives on one link can leave on another.",
         DockPane::Traffic => "Bytes and frames from every link, when capture exists.",
@@ -213,17 +214,74 @@ fn empty_message(pane: DockPane) -> &'static str {
     }
 }
 
-fn project_panel(ui: &mut egui::Ui, host: &HostSnapshot, p: &ThemePalette) {
+fn project_panel(ui: &mut egui::Ui, hubs: &HubModel, p: &ThemePalette) {
     egui::ScrollArea::vertical()
         .id_salt("pb_project_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             title_row(ui, p);
             ui.add_space(10.0);
-            stat_row(ui, p);
+            stat_row(ui, hubs, p);
             ui.add_space(14.0);
-            host_section(ui, host, p);
+            list_section(ui, "HUBS", &hub_names(hubs), DockPane::Hubs.ink(p.is_light), p);
+            ui.add_space(10.0);
+            list_section(
+                ui,
+                "AGGREGATORS",
+                &step_names(hubs, true),
+                p.accent,
+                p,
+            );
+            ui.add_space(10.0);
+            list_section(
+                ui,
+                "CALCULATIONS",
+                &step_names(hubs, false),
+                p.accent,
+                p,
+            );
         });
+}
+
+fn hub_names(hubs: &HubModel) -> Vec<String> {
+    hubs.hubs.iter().map(|hub| hub.name.clone()).collect()
+}
+
+fn step_names(hubs: &HubModel, aggregator: bool) -> Vec<String> {
+    let mut names = Vec::new();
+    for hub in &hubs.hubs {
+        let list = if aggregator {
+            &hub.aggregators
+        } else {
+            &hub.calculations
+        };
+        for step in list {
+            let edge = hub
+                .sources
+                .iter()
+                .chain(hub.outputs.iter())
+                .find(|port| port.id == step.edge_port)
+                .map(|port| port.label.as_str())
+                .unwrap_or("?");
+            names.push(format!("{} · {} · {}", step.label, edge, hub.name));
+        }
+    }
+    names
+}
+
+fn endpoint_count(hubs: &HubModel) -> usize {
+    hubs.hubs
+        .iter()
+        .map(|hub| hub.sources.len() + hub.outputs.len())
+        .sum()
+}
+
+fn aggregator_count(hubs: &HubModel) -> usize {
+    hubs.hubs.iter().map(|hub| hub.aggregators.len()).sum()
+}
+
+fn calculation_count(hubs: &HubModel) -> usize {
+    hubs.hubs.iter().map(|hub| hub.calculations.len()).sum()
 }
 
 fn title_row(ui: &mut egui::Ui, p: &ThemePalette) {
@@ -246,7 +304,7 @@ fn title_row(ui: &mut egui::Ui, p: &ThemePalette) {
     });
 }
 
-fn stat_row(ui: &mut egui::Ui, p: &ThemePalette) {
+fn stat_row(ui: &mut egui::Ui, hubs: &HubModel, p: &ThemePalette) {
     let gap = 8.0;
     let width = ((ui.available_width() - gap * 2.0) / 3.0).max(48.0);
     ui.horizontal(|ui| {
@@ -255,10 +313,11 @@ fn stat_row(ui: &mut egui::Ui, p: &ThemePalette) {
             ui,
             width,
             "ENDPOINTS",
-            "0",
+            &endpoint_count(hubs).to_string(),
             DockPane::Streams.ink(p.is_light),
             p,
         );
+        // Points / mappings stay zero until live stores land.
         stat_tile(
             ui,
             width,
@@ -273,6 +332,34 @@ fn stat_row(ui: &mut egui::Ui, p: &ThemePalette) {
             "MAPPINGS",
             "0",
             DockPane::Mappings.ink(p.is_light),
+            p,
+        );
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        stat_tile(
+            ui,
+            width,
+            "HUBS",
+            &hubs.hubs.len().to_string(),
+            DockPane::Hubs.ink(p.is_light),
+            p,
+        );
+        stat_tile(
+            ui,
+            width,
+            "AGGREGATORS",
+            &aggregator_count(hubs).to_string(),
+            p.accent,
+            p,
+        );
+        stat_tile(
+            ui,
+            width,
+            "CALCULATIONS",
+            &calculation_count(hubs).to_string(),
+            p.accent,
             p,
         );
     });
@@ -316,66 +403,38 @@ fn stat_tile(
     );
 }
 
-fn host_section(ui: &mut egui::Ui, host: &HostSnapshot, p: &ThemePalette) {
-    let alive = if host.alive {
-        "thread up"
-    } else {
-        "thread stopped"
-    };
-    let ink = if host.alive { p.ok } else { p.err };
-    ui.horizontal(|ui| {
-        let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-        ui.painter().circle_filled(dot.center(), 4.0, ink);
-        ui.label(
-            egui::RichText::new(format!(
-                "ENGINE HOST    {}    ·    up {}    ·    {}",
-                host.thread_name,
-                format_uptime(host.uptime_ms),
-                alive
-            ))
-            .font(font_mono(11.5))
+fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, p: &ThemePalette) {
+    ui.label(
+        egui::RichText::new(title)
+            .font(font_ui(10.5))
             .color(p.muted),
+    );
+    ui.add_space(4.0);
+    if names.is_empty() {
+        ui.label(
+            egui::RichText::new("None yet")
+                .font(font_ui(12.0))
+                .color(p.muted),
         );
-    });
-    ui.add_space(6.0);
-    for slot in &host.slots {
+        return;
+    }
+    for name in names {
         let width = ui.available_width();
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::hover());
-        if resp.hovered() {
-            ui.painter()
-                .rect_filled(rect, Rounding::same(5.0), tint(p.accent, 18));
-        }
-        let row_ink = DockPane::from_engine(slot.id).ink(p.is_light);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::hover());
         ui.painter()
-            .circle_filled(Pos2::new(rect.min.x + 12.0, rect.center().y), 4.0, row_ink);
-        let title_clip = Rect::from_min_max(
-            Pos2::new(rect.min.x + 24.0, rect.min.y),
-            Pos2::new(rect.max.x - 48.0, rect.max.y),
+            .circle_filled(Pos2::new(rect.min.x + 10.0, rect.center().y), 3.5, ink);
+        let clip = Rect::from_min_max(
+            Pos2::new(rect.min.x + 22.0, rect.min.y),
+            Pos2::new(rect.max.x - 6.0, rect.max.y),
         );
-        ui.painter().with_clip_rect(title_clip).text(
-            Pos2::new(rect.min.x + 26.0, rect.center().y),
+        ui.painter().with_clip_rect(clip).text(
+            Pos2::new(clip.min.x, rect.center().y),
             Align2::LEFT_CENTER,
-            slot.title,
-            font_ui(13.0),
+            name,
+            font_ui(12.5),
             p.text,
         );
-        ui.painter().text(
-            Pos2::new(rect.max.x - 8.0, rect.center().y),
-            Align2::RIGHT_CENTER,
-            "idle",
-            font_mono(11.0),
-            p.muted,
-        );
-        resp.on_hover_text(slot.note);
     }
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new(
-            "The UI thread only reads this snapshot. Sockets and sessions stay on pb-engine.",
-        )
-        .font(font_ui(11.5))
-        .color(p.muted),
-    );
 }
 
 pub fn format_uptime(ms: u64) -> String {
