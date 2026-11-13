@@ -2299,6 +2299,7 @@ dependencies = [
  "directories",
  "eframe",
  "egui",
+ "image",
  "pb-engine",
  "serde",
  "toml",

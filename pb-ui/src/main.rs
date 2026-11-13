@@ -4,6 +4,7 @@
 
 mod app;
 mod art;
+mod brand_logo;
 mod dnd;
 mod dock;
 mod hubs;
@@ -18,10 +19,16 @@ fn main() -> eframe::Result<()> {
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1600.0, 980.0])
         .with_min_inner_size([1200.0, 760.0])
+        .with_app_id("protocol-bench")
         .with_title(format!("Protocol Bench  {}", env!("CARGO_PKG_VERSION")));
 
+    // Vsync swap waits on a Wayland frame callback. Hyprland does not send one
+    // for a window on another workspace, so the wait blocks the event loop and
+    // the compositor reports "not responding". Presentation is still paced by
+    // the compositor; this only stops the GL swap from stalling the thread.
     let options = eframe::NativeOptions {
         viewport,
+        vsync: false,
         ..Default::default()
     };
 

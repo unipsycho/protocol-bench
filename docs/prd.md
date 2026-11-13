@@ -30,8 +30,18 @@ Moving a value between a serial instrument, a Modbus device, a growing CSV, an M
 
 - Docked panels (drag titles, tab strips, edge splits). Top bar: File, View, Help, theme chip, settings. Side rail of panel icons.
 - Themes. Hub canvas and panel diagrams keep the scope blue mixed with the theme background.
-- Help → About: Agile Automation logo, “Protocol Bench” wordmark, version.
+- Help → About: centered “Protocol Bench” wordmark, slogan **“Your protocol hub for every stream.”**, version, Agile Automation logo at the bottom.
+- File menu: Open project, Save as project, Quit. View menu: panel toggles, Show all panels, Reset layout.
+- Status bar: left message + mock **service connection** (connected / disconnected) for the future always-on service — not a pb-engine host readout.
 - Panels: Project, Hubs, Points, Mappings, Traffic, Streams, Modbus, MQTT, OPC UA, File follow.
+
+## MCP server on the service
+
+**Settled lean (Mike):** the always-on Protocol Bench **service** exposes an **MCP server** so an agent can manage setup — add / connect / test channels, points, mappings, hubs, and the rest of product functionality through MCP tools.
+
+- Lives on the **service**, not in the UI process.
+- Scope is product-wide configuration and operation the service already owns (channels, points, mappings, hubs, project setup, and related actions) — agent-driven setup alongside the separate config/monitor UI.
+- Tool schema, transport, and auth are **not** specified yet; this is intent / direction only.
 
 ## Engines
 
@@ -137,6 +147,7 @@ Recorded 2026-11-13 from Mike’s answers (numbering matches the former Open dec
 11. **File parsers** — CSV and JSON lines stay the first-build set.
 12. **Language** — Protocol Bench service + UI remain Rust. Online license server can also be Rust; Cloudflare Workers + workers-rs is a viable host for a license API (see [Runtime](#runtime)).
 13. **Windows installer** — **MSI via WiX**, driven from the Rust repo with **`cargo-wix`** (not Inno Setup). Chosen for IT-friendly deploys (GPO / SCCM / silent install, standard Add/Remove Programs). Layout installs **service + UI + module dir**; upgrades must **preserve config, licenses, and packs**. Product **updates** stay on the Rust **license server** path (manifest + signed downloads) — the installer choice does not replace that. **Linux installer** is later / TBD and is not blocking.
+14. **MCP on the service** — the always-on **service** hosts an **MCP server** so an agent can manage setup (channels, points, mappings, hubs, and related product actions). Not in the UI process. High-level product intent only; no tool schema yet (see [MCP server on the service](#mcp-server-on-the-service)).
 
 ## Still open
 

@@ -8,6 +8,7 @@ use eframe::egui::{
 use pb_engine::EngineHandle;
 
 use crate::art::{self, ChromeIcon};
+use crate::brand_logo::AaLogoCache;
 use crate::dnd::{self, DropCommit, PaneHit};
 use crate::dock::DockPane;
 use crate::layout::{LayoutNode, SplitDir, TabGroup};
@@ -17,6 +18,10 @@ use crate::theme::{
     self, font_semi, font_ui, tint, AppTheme, ThemePalette, BAR_H, HEADER_H, MIN_PANE, RADIUS,
     RAIL_W, SEP, STATUS_H,
 };
+
+/// Product slogan from earlier shell About copy (stashed WIP).
+const PRODUCT_SLOGAN: &str = "Your protocol hub for every stream.";
+const COMPANY_URL: &str = "https://www.agileautomation.ca";
 
 pub struct ProtocolBenchApp {
     engine: EngineHandle,
@@ -29,6 +34,9 @@ pub struct ProtocolBenchApp {
     settings_open: bool,
     menu: Option<BarMenu>,
     status: String,
+    /// Mock always-on service link (UI ↔ service). Click status bar to flip.
+    service_connected: bool,
+    aa_logo: AaLogoCache,
     dirty: bool,
     last_save: Instant,
 }
@@ -42,6 +50,8 @@ enum BarMenu {
 }
 
 enum MenuAction {
+    OpenProject,
+    SaveAsProject,
     ResetLayout,
     Quit,
     About,
@@ -75,6 +85,8 @@ impl ProtocolBenchApp {
             settings_open: false,
             menu: None,
             status: "Ready".into(),
+            service_connected: true,
+            aa_logo: AaLogoCache::default(),
             dirty: false,
             last_save: Instant::now(),
         }
@@ -121,6 +133,12 @@ impl ProtocolBenchApp {
         self.menu = None;
         match action {
             MenuAction::Close => {}
+            MenuAction::OpenProject => {
+                self.status = "Open project — not wired yet".into();
+            }
+            MenuAction::SaveAsProject => {
+                self.status = "Save as project — not wired yet".into();
+            }
             MenuAction::ResetLayout => self.reset_layout(),
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             MenuAction::About => self.about_open = true,
@@ -172,7 +190,7 @@ impl eframe::App for ProtocolBenchApp {
         self.pane_hits.clear();
 
         self.app_bar(ctx, &p);
-        self.status_bar(ctx, &p, &host);
+        self.status_bar(ctx, &p);
         self.pane_rail(ctx, &p);
         self.settings_drawer(ctx, &p, &host);
         self.about_window(ctx, &p);
@@ -355,8 +373,11 @@ impl ProtocolBenchApp {
         action: &mut Option<MenuAction>,
     ) {
         self.popup(ctx, anchor, BarMenu::File, p, action, |ui, action| {
-            if menu_row(ui, "Reset layout", None, p).clicked() {
-                *action = Some(MenuAction::ResetLayout);
+            if menu_row(ui, "Open project", None, p).clicked() {
+                *action = Some(MenuAction::OpenProject);
+            }
+            if menu_row(ui, "Save as project", None, p).clicked() {
+                *action = Some(MenuAction::SaveAsProject);
             }
             menu_sep(ui, p);
             if menu_row(ui, "Quit", None, p).clicked() {
@@ -386,6 +407,9 @@ impl ProtocolBenchApp {
             menu_sep(ui, p);
             if menu_row(ui, "Show all panels", None, p).clicked() {
                 *action = Some(MenuAction::ShowAll);
+            }
+            if menu_row(ui, "Reset layout", None, p).clicked() {
+                *action = Some(MenuAction::ResetLayout);
             }
         });
     }
@@ -468,7 +492,7 @@ impl ProtocolBenchApp {
         }
     }
 
-    fn status_bar(&self, ctx: &egui::Context, p: &ThemePalette, host: &pb_engine::HostSnapshot) {
+    fn status_bar(&mut self, ctx: &egui::Context, p: &ThemePalette) {
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(STATUS_H)
             .frame(
@@ -478,7 +502,7 @@ impl ProtocolBenchApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    let cluster = 250.0;
+                    let cluster = 220.0;
                     let left = (ui.available_width() - cluster).max(40.0);
                     ui.add_sized(
                         Vec2::new(left, 18.0),
@@ -489,7 +513,15 @@ impl ProtocolBenchApp {
                         )
                         .truncate(),
                     );
-                    engine_cluster(ui, host, p);
+                    if service_connection_chip(ui, self.service_connected, p).clicked() {
+                        self.service_connected = !self.service_connected;
+                        let state = if self.service_connected {
+                            "connected"
+                        } else {
+                            "disconnected"
+                        };
+                        self.status = format!("Service connection mock → {state}");
+                    }
                 });
                 let clip = ui.clip_rect();
                 ui.painter().line_segment(
@@ -669,32 +701,43 @@ impl ProtocolBenchApp {
             .frame(frame)
             .show(ctx, |ui| {
                 ui.set_min_width(420.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                        if art::chrome_button(ui, ChromeIcon::Close, "Close", false, p, 26.0).clicked() {
-                            open = false;
-                        }
-                    });
-                });
-                let (band, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 84.0), Sense::hover());
-                let mark = Rect::from_center_size(band.center(), Vec2::splat(84.0));
-                art::paint_mark(ui.painter(), mark, p);
-                ui.add_space(12.0);
+                // Close X overlays the corner so the wordmark stays centered.
+                {
+                    let area = ui.available_rect_before_wrap();
+                    let btn = 26.0;
+                    let btn_rect = Rect::from_min_size(
+                        Pos2::new(area.right() - btn, area.top()),
+                        Vec2::splat(btn),
+                    );
+                    let mut btn_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(btn_rect)
+                            .layout(Layout::left_to_right(egui::Align::Center)),
+                    );
+                    if art::chrome_button(&mut btn_ui, ChromeIcon::Close, "Close", false, p, btn)
+                        .clicked()
+                    {
+                        open = false;
+                    }
+                }
                 ui.vertical_centered(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.label(egui::RichText::new("Protocol").font(font_semi(24.0)).color(p.text));
-                        ui.label(egui::RichText::new("Bench").font(font_semi(24.0)).color(p.accent));
-                    });
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).font(font_ui(13.0)).color(p.muted));
+                    let (band, _) =
+                        ui.allocate_exact_size(Vec2::new(ui.available_width(), 84.0), Sense::hover());
+                    let mark = Rect::from_center_size(band.center(), Vec2::splat(72.0));
+                    art::paint_mark(ui.painter(), mark, p);
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Agile Automation").font(font_ui(12.5)).color(p.muted));
+                    paint_about_wordmark(ui, p);
                     ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new("Serial, Modbus, MQTT, OPC UA, and file follow on one bench.")
+                        egui::RichText::new(PRODUCT_SLOGAN)
                             .font(font_ui(13.0))
                             .color(p.text),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                            .font(font_ui(13.0))
+                            .color(p.muted),
                     );
                 });
                 ui.add_space(14.0);
@@ -713,10 +756,31 @@ impl ProtocolBenchApp {
                 });
                 ui.add_space(14.0);
                 ui.label(
-                    egui::RichText::new("Protocol I/O will run on the pb-engine thread. This build does not open a link.")
-                        .font(font_ui(12.0))
-                        .color(p.muted),
+                    egui::RichText::new(
+                        "Protocol I/O will run in the always-on service. This build does not open a link.",
+                    )
+                    .font(font_ui(12.0))
+                    .color(p.muted),
                 );
+                ui.add_space(18.0);
+                // Company logo at the bottom of About.
+                ui.vertical_centered(|ui| {
+                    self.aa_logo
+                        .show(ui, ui.available_width().min(280.0), 64.0);
+                    ui.add_space(14.0);
+                    let site = ui
+                        .link(
+                            egui::RichText::new("www.agileautomation.ca")
+                                .font(font_ui(13.0))
+                                .color(Color32::from_rgb(74, 144, 226))
+                                .underline(),
+                        )
+                        .on_hover_text(COMPANY_URL)
+                        .on_hover_cursor(CursorIcon::PointingHand);
+                    if site.clicked() {
+                        open_in_browser(COMPANY_URL);
+                    }
+                });
             });
         self.about_open = open;
     }
@@ -1391,23 +1455,45 @@ fn rail_button(ui: &mut egui::Ui, pane: DockPane, on: bool, p: &ThemePalette) ->
         .on_hover_cursor(CursorIcon::PointingHand)
 }
 
-fn engine_cluster(ui: &mut egui::Ui, host: &pb_engine::HostSnapshot, p: &ThemePalette) {
-    ui.spacing_mut().item_spacing.x = 2.0;
-    for slot in &host.slots {
-        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
-        let ink = DockPane::from_engine(slot.id).ink(p.is_light);
-        ui.painter().circle_filled(rect.center(), 3.5, ink);
-        resp.on_hover_text(format!("{} · {}", slot.title, slot.note));
+fn service_connection_chip(ui: &mut egui::Ui, connected: bool, p: &ThemePalette) -> egui::Response {
+    let (label, ink) = if connected {
+        ("Service: Connected", p.ok)
+    } else {
+        ("Service: Disconnected", p.err)
+    };
+    let galley = ui.fonts(|fonts| {
+        fonts.layout_no_wrap(label.to_owned(), font_ui(12.0), p.text)
+    });
+    let size = Vec2::new(galley.size().x + 22.0, 22.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let hovered = resp.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, Rounding::same(4.0), tint(ink, if p.is_light { 24 } else { 36 }));
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
-    ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new(format!(
-            "{}  {}",
-            host.thread_name,
-            panels::format_uptime(host.uptime_ms)
-        ))
-        .font(theme::font_mono(11.5))
-        .color(p.muted),
+    let dot = Pos2::new(rect.min.x + 8.0, rect.center().y);
+    ui.painter().circle_filled(dot, 3.5, ink);
+    ui.painter()
+        .galley(Pos2::new(rect.min.x + 16.0, rect.center().y - galley.size().y * 0.5), galley, p.text);
+    resp.on_hover_text("Mock service connection — click to toggle")
+}
+
+fn paint_about_wordmark(ui: &mut egui::Ui, p: &ThemePalette) {
+    // Centered "Protocol" + accent "Bench" on the full row width.
+    let gap = 4.0;
+    let protocol = ui.fonts(|f| f.layout_no_wrap("Protocol".to_owned(), font_semi(24.0), p.text));
+    let bench = ui.fonts(|f| f.layout_no_wrap("Bench".to_owned(), font_semi(24.0), p.accent));
+    let width = protocol.size().x + gap + bench.size().x;
+    let height = protocol.size().y.max(bench.size().y);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+    let origin = Pos2::new(rect.center().x - width * 0.5, rect.center().y - height * 0.5);
+    let painter = ui.painter();
+    painter.galley(origin, protocol, p.text);
+    painter.galley(
+        Pos2::new(origin.x + width - bench.size().x, origin.y),
+        bench,
+        p.accent,
     );
 }
 
@@ -1419,6 +1505,21 @@ fn text_button(ui: &mut egui::Ui, label: &str, p: &ThemePalette) -> egui::Respon
             .rounding(Rounding::same(6.0))
             .stroke(Stroke::new(1.0, p.line)),
     )
+}
+
+/// A 2px bar centered in the gap, pulled in from both ends so it misses the rounded corners.
+fn divider_bar(gap: Rect, vertical_bar: bool) -> Rect {
+    const THICK: f32 = 2.0;
+    const INSET: f32 = 24.0;
+    if vertical_bar {
+        let inset = INSET.min(((gap.height() - 16.0) * 0.5).max(0.0));
+        let length = (gap.height() - inset * 2.0).max(THICK);
+        Rect::from_center_size(gap.center(), Vec2::new(THICK, length))
+    } else {
+        let inset = INSET.min(((gap.width() - 16.0) * 0.5).max(0.0));
+        let length = (gap.width() - inset * 2.0).max(THICK);
+        Rect::from_center_size(gap.center(), Vec2::new(length, THICK))
+    }
 }
 
 fn tile_splitter(
@@ -1436,15 +1537,18 @@ fn tile_splitter(
     } else {
         Vec2::new(cross, gap)
     };
+    // The hit area stays the full gap so the panels do not move. Only the bar is thin.
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
     let fill = if blocked {
         p.err
     } else if resp.hovered() || resp.dragged() {
         p.accent
     } else {
-        p.line
+        // About 40% transparent. The 2px bar and the gap around it stay as they are.
+        tint(p.line, 153)
     };
-    ui.painter().rect_filled(rect, Rounding::ZERO, fill);
+    ui.painter()
+        .rect_filled(divider_bar(rect, vertical_bar), Rounding::same(1.0), fill);
     if resp.hovered() || resp.dragged() {
         ui.ctx().set_cursor_icon(if vertical_bar {
             CursorIcon::ResizeHorizontal
@@ -1464,6 +1568,10 @@ fn tile_splitter(
         return Some((ratio + delta).clamp(0.08, 0.92));
     }
     None
+}
+
+fn open_in_browser(url: &str) {
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
 fn split_axis(total: f32, gap: f32, ratio: f32) -> (f32, f32, f32) {

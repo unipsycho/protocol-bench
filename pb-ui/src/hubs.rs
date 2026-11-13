@@ -347,7 +347,8 @@ impl HubModel {
         }
     }
 
-    pub fn add_port(&mut self, hub_id: u64, source: bool) {
+    /// Append a source or output and return its id.
+    pub fn add_port(&mut self, hub_id: u64, source: bool) -> Option<u64> {
         let proto = self
             .hub(hub_id)
             .and_then(|hub| hub.protocol)
@@ -358,7 +359,7 @@ impl HubModel {
             });
         let id = self.alloc();
         let Some(hub) = self.hub_mut(hub_id) else {
-            return;
+            return None;
         };
         let port = HubPort {
             id,
@@ -371,6 +372,7 @@ impl HubModel {
         } else {
             hub.outputs.push(port);
         }
+        Some(id)
     }
 
     pub fn remove_port(&mut self, hub_id: u64, port_id: u64) {
@@ -472,7 +474,13 @@ fn layout_nodes(hubs: &[Hub]) -> Vec<Placed> {
                 .map(|spot| center + (spot.center - origin))
                 .unwrap_or(center);
             let at = port.at.map(|at| pos2(at[0], at[1])).unwrap_or(fallback);
-            nodes.push(placed(hub.id, Some(port.id), role, at, vec2(PORT_W, PORT_H)));
+            nodes.push(placed(
+                hub.id,
+                Some(port.id),
+                role,
+                at,
+                vec2(PORT_W, PORT_H),
+            ));
         }
     }
     nodes
@@ -528,13 +536,75 @@ fn push_spots(spots: &mut Vec<Spot>, ports: &[HubPort], role: Role, x: f32, mid:
     }
 }
 
-fn content_size(nodes: &[Placed], min: Vec2) -> Vec2 {
-    let mut size = min.max(vec2(560.0, 220.0));
-    for node in nodes {
-        size.x = size.x.max(node.rect.max.x + 56.0);
-        size.y = size.y.max(node.rect.max.y + 56.0);
+/// Scroll decision for the hub grid.
+///
+/// A bar is on only when a node rectangle falls outside the visible grid.
+/// Padding, the scrollbar's own thickness, and the current pan offset are not inputs.
+struct ScrollFit {
+    allow: [bool; 2],
+    /// Content size. This stays the view size on an axis where every node already fits.
+    size: Vec2,
+    /// Moves a node that starts before the grid origin into scrollable space.
+    shift: Vec2,
+}
+
+fn scroll_fit(nodes: &[Placed], view: Vec2) -> ScrollFit {
+    let view = view.max(vec2(1.0, 1.0));
+    if nodes.is_empty() {
+        return ScrollFit {
+            allow: [false, false],
+            size: view,
+            shift: Vec2::ZERO,
+        };
     }
-    size
+    let mut min = nodes[0].rect.min;
+    let mut max = nodes[0].rect.max;
+    for node in nodes.iter().skip(1) {
+        min = min.min(node.rect.min);
+        max = max.max(node.rect.max);
+    }
+    // Half a pixel of slack so a node sitting on the grid edge is still inside.
+    // Overflow content keeps a small outer pad so nodes are not flush to the bar.
+    const PAD: f32 = 12.0;
+    let allow = [
+        min.x < -0.5 || max.x > view.x + 0.5,
+        min.y < -0.5 || max.y > view.y + 0.5,
+    ];
+    let mut size = view;
+    let mut shift = Vec2::ZERO;
+    if allow[0] {
+        let origin = (min.x - PAD).min(0.0);
+        shift.x = -origin;
+        size.x = (max.x + PAD - origin).max(view.x);
+    } else {
+        // Center the diagram on axes that already fit.
+        shift.x = (view.x - (max.x - min.x)) * 0.5 - min.x;
+    }
+    if allow[1] {
+        let origin = (min.y - PAD).min(0.0);
+        shift.y = -origin;
+        size.y = (max.y + PAD - origin).max(view.y);
+    } else {
+        shift.y = (view.y - (max.y - min.y)) * 0.5 - min.y;
+    }
+    ScrollFit { allow, size, shift }
+}
+
+/// Pan offset. An axis that already fits stays at zero so a stale scrollbar cannot shift the canvas.
+fn pinned_scroll(current: Vec2, pan: Option<Vec2>, allow: [bool; 2]) -> Option<Vec2> {
+    let mut offset = pan.unwrap_or(current);
+    if !allow[0] {
+        offset.x = 0.0;
+    }
+    if !allow[1] {
+        offset.y = 0.0;
+    }
+    let changed = (offset.x - current.x).abs() > 0.01 || (offset.y - current.y).abs() > 0.01;
+    if pan.is_some() || changed {
+        Some(offset)
+    } else {
+        None
+    }
 }
 
 /// What the hub panel changed this frame.
@@ -563,7 +633,11 @@ impl HubChange {
 /// Draw the diagram and the editor.
 pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
     let mut change = HubChange::quiet();
+    // The dock column zeros item spacing, and that style is inherited here.
+    // Restore the chrome gap (10×6) so toolbar buttons match the rest of the shell.
+    ui.spacing_mut().item_spacing = vec2(10.0, 6.0);
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
         if text_button(ui, "New hub", false, p).clicked() {
             model.add_hub();
             change.dirty = true;
@@ -573,14 +647,19 @@ pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
             change.dirty = true;
         }
         ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("Drag a node to place it. Click it for details.")
+        legend(ui, p);
+        ui.add_space(8.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Drag a node to place it. Click for details. Right-click to add. Middle-drag or Space-drag pans.",
+                )
                 .font(font_ui(12.0))
                 .color(p.muted),
+            )
+            .truncate(),
         );
     });
-    ui.add_space(4.0);
-    legend(ui, p);
     ui.add_space(8.0);
     let wide = ui.available_width() > 760.0;
     if wide {
@@ -609,11 +688,8 @@ pub fn paint(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
 }
 
 fn legend(ui: &mut Ui, p: &ThemePalette) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 14.0;
-        legend_swatch(ui, p.accent, false, "Through this hub", p);
-        legend_swatch(ui, p.live, true, "Continues into another hub", p);
-    });
+    legend_swatch(ui, p.accent, false, "Through this hub", p);
+    legend_swatch(ui, p.live, true, "Continues into another hub", p);
 }
 
 fn legend_swatch(ui: &mut Ui, color: Color32, dashed: bool, label: &str, p: &ThemePalette) {
@@ -621,12 +697,19 @@ fn legend_swatch(ui: &mut Ui, color: Color32, dashed: bool, label: &str, p: &The
     let y = rect.center().y;
     let stroke = Stroke::new(1.6, color);
     if dashed {
-        ui.painter().line_segment([pos2(rect.min.x, y), pos2(rect.min.x + 8.0, y)], stroke);
-        ui.painter().line_segment([pos2(rect.min.x + 12.0, y), pos2(rect.max.x, y)], stroke);
+        ui.painter()
+            .line_segment([pos2(rect.min.x, y), pos2(rect.min.x + 8.0, y)], stroke);
+        ui.painter()
+            .line_segment([pos2(rect.min.x + 12.0, y), pos2(rect.max.x, y)], stroke);
     } else {
-        ui.painter().line_segment([pos2(rect.min.x, y), pos2(rect.max.x, y)], stroke);
+        ui.painter()
+            .line_segment([pos2(rect.min.x, y), pos2(rect.max.x, y)], stroke);
     }
-    ui.label(egui::RichText::new(label).font(font_ui(11.0)).color(p.muted));
+    ui.label(
+        egui::RichText::new(label)
+            .font(font_ui(11.0))
+            .color(p.muted),
+    );
 }
 
 fn diagram_view(
@@ -645,72 +728,180 @@ fn diagram_view(
         Rounding::same(8.0),
         Stroke::new(1.0, tint(p.accent, 150)),
     );
+    // The scrollport is the visible grid. Insetting it would count chrome as overflow.
+    let grid = rect.shrink(1.0);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(rect.shrink(8.0))
+            .max_rect(grid)
             .layout(Layout::top_down(egui::Align::Min)),
     );
-    child.set_clip_rect(rect.shrink(1.0));
+    child.set_clip_rect(grid);
     let mut change = HubChange::quiet();
-    ScrollArea::both()
+    let scroll_id = child.make_persistent_id(Id::new("pb_hub_diagram"));
+    let pan = canvas_pan(&child, rect, scroll_id);
+    let fit = scroll_fit(&layout_nodes(&model.hubs), grid.size());
+    let allow = fit.allow;
+    let mut scroll = ScrollArea::both()
         .id_salt("pb_hub_diagram")
         .auto_shrink([false, false])
         .drag_to_scroll(false)
-        .show(&mut child, |ui| {
-            if model.hubs.is_empty() {
-                let (area, _) = ui.allocate_exact_size(vec2(width.max(240.0), height.max(80.0)), Sense::hover());
-                ui.painter().text(
-                    area.center(),
-                    Align2::CENTER_CENTER,
-                    "No hubs yet — use New hub",
-                    font_ui(14.0),
-                    p.muted,
-                );
-                return;
+        .scroll(allow);
+    if !allow[0] && !allow[1] {
+        scroll = scroll.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+    }
+    let stored = egui::scroll_area::State::load(child.ctx(), scroll_id)
+        .map(|state| state.offset)
+        .unwrap_or(Vec2::ZERO);
+    if let Some(offset) = pinned_scroll(stored, pan, allow) {
+        scroll = scroll.scroll_offset(offset);
+    }
+    let content_shift = fit.shift;
+    let content_size = fit.size;
+    scroll.show(&mut child, |ui| {
+        let (area, canvas) = ui.allocate_exact_size(content_size, Sense::click());
+        if model.hubs.is_empty() {
+            ui.painter().text(
+                area.center(),
+                Align2::CENTER_CENTER,
+                "No hubs yet — right-click or use New hub",
+                font_ui(14.0),
+                p.muted,
+            );
+            if let Some(cmd) = canvas_menu(&canvas, None) {
+                apply_menu(model, cmd, &mut change);
             }
-            let nodes = layout_nodes(&model.hubs);
-            let size = content_size(&nodes, vec2(ui.available_width().max(560.0), height - 16.0));
-            let (area, _) = ui.allocate_exact_size(size, Sense::hover());
-            let shift = area.min.to_vec2();
-            let screen: Vec<Placed> = nodes
+            return;
+        }
+        let nodes = layout_nodes(&model.hubs);
+        let shift = area.min.to_vec2() + content_shift;
+        let screen: Vec<Placed> = nodes
+            .iter()
+            .map(|node| Placed {
+                rect: node.rect.translate(shift),
+                ..*node
+            })
+            .collect();
+        let gesture = gesture_nodes(ui, model, &screen, pan.is_some());
+        if let Some((hub_id, port_id, delta)) = gesture.drag {
+            let center = screen
                 .iter()
-                .map(|node| Placed {
-                    rect: node.rect.translate(shift),
-                    ..*node
-                })
-                .collect();
-            let gesture = gesture_nodes(ui, model, &screen);
-            if let Some((hub_id, port_id, delta)) = gesture.drag {
-                let center = screen
-                    .iter()
-                    .find(|node| node.hub_id == hub_id && node.port_id == port_id)
-                    .map(|node| node.rect.center() - shift + delta);
-                if let Some(center) = center {
-                    model.set_center(hub_id, port_id, [center.x.max(24.0), center.y.max(24.0)]);
-                    change.dirty = true;
-                }
-            }
-            if let Some((hub_id, port_id)) = gesture.pick {
-                match port_id {
-                    Some(port_id) => model.focus_port(hub_id, port_id),
-                    None => model.focus_hub(hub_id),
-                }
+                .find(|node| node.hub_id == hub_id && node.port_id == port_id)
+                .map(|node| node.rect.center() - shift + delta);
+            if let Some(center) = center {
+                model.set_center(hub_id, port_id, [center.x.max(24.0), center.y.max(24.0)]);
                 change.dirty = true;
             }
-            if let Some(pane) = gesture.open {
-                change.open = Some(pane);
+        }
+        if let Some((hub_id, port_id)) = gesture.pick {
+            match port_id {
+                Some(port_id) => model.focus_port(hub_id, port_id),
+                None => model.focus_hub(hub_id),
             }
-            let nodes = layout_nodes(&model.hubs);
-            let screen: Vec<Placed> = nodes
-                .iter()
-                .map(|node| Placed {
-                    rect: node.rect.translate(shift),
-                    ..*node
-                })
-                .collect();
-            paint_flow(ui.painter(), &screen, model, gesture.hover, p);
-        });
+            change.dirty = true;
+        }
+        if let Some(pane) = gesture.open {
+            change.open = Some(pane);
+        }
+        let target = model
+            .selected
+            .or_else(|| model.hubs.first().map(|hub| hub.id));
+        let menu = gesture.menu.or_else(|| canvas_menu(&canvas, target));
+        if let Some(cmd) = menu {
+            apply_menu(model, cmd, &mut change);
+        }
+        let nodes = layout_nodes(&model.hubs);
+        let screen: Vec<Placed> = nodes
+            .iter()
+            .map(|node| Placed {
+                rect: node.rect.translate(shift),
+                ..*node
+            })
+            .collect();
+        paint_flow(ui.painter(), &screen, model, gesture.hover, p);
+    });
+    if pan.is_some() {
+        child.ctx().set_cursor_icon(egui::CursorIcon::AllScroll);
+    }
     change
+}
+
+/// Middle-drag, or Space+left-drag, pans like a Fusion node editor.
+/// Returns the scroll offset to apply this frame.
+fn canvas_pan(ui: &Ui, rect: Rect, scroll_id: Id) -> Option<Vec2> {
+    let typing = ui.ctx().wants_keyboard_input();
+    let delta = ui.ctx().input(|i| {
+        let over = i.pointer.hover_pos().is_some_and(|pos| rect.contains(pos));
+        if !over {
+            return None;
+        }
+        let middle = i.pointer.button_down(egui::PointerButton::Middle);
+        let space = i.key_down(egui::Key::Space) && !typing;
+        if middle || (space && i.pointer.primary_down()) {
+            Some(i.pointer.delta())
+        } else {
+            None
+        }
+    })?;
+    let current = egui::scroll_area::State::load(ui.ctx(), scroll_id)
+        .map(|state| state.offset)
+        .unwrap_or(Vec2::ZERO);
+    Some(pan_scroll(current, delta))
+}
+
+/// Drag the canvas with the pointer. Offset cannot go negative.
+fn pan_scroll(offset: Vec2, delta: Vec2) -> Vec2 {
+    Vec2::new((offset.x - delta.x).max(0.0), (offset.y - delta.y).max(0.0))
+}
+
+enum MenuCmd {
+    AddSource(u64),
+    AddOutput(u64),
+    NewHub,
+}
+
+fn apply_menu(model: &mut HubModel, cmd: MenuCmd, change: &mut HubChange) {
+    match cmd {
+        MenuCmd::AddSource(hub_id) => {
+            if let Some(port_id) = model.add_port(hub_id, true) {
+                model.focus_port(hub_id, port_id);
+                change.dirty = true;
+            }
+        }
+        MenuCmd::AddOutput(hub_id) => {
+            if let Some(port_id) = model.add_port(hub_id, false) {
+                model.focus_port(hub_id, port_id);
+                change.dirty = true;
+            }
+        }
+        MenuCmd::NewHub => {
+            model.add_hub();
+            change.dirty = true;
+        }
+    }
+}
+
+/// Right-click the empty canvas. `hub_id` is who receives a new source or output.
+fn canvas_menu(resp: &egui::Response, hub_id: Option<u64>) -> Option<MenuCmd> {
+    let mut cmd = None;
+    resp.context_menu(|ui| {
+        ui.set_min_width(168.0);
+        if let Some(hub_id) = hub_id {
+            if ui.button("Add source").clicked() {
+                cmd = Some(MenuCmd::AddSource(hub_id));
+                ui.close_menu();
+            }
+            if ui.button("Add output").clicked() {
+                cmd = Some(MenuCmd::AddOutput(hub_id));
+                ui.close_menu();
+            }
+            ui.separator();
+        }
+        if ui.button("New hub").clicked() {
+            cmd = Some(MenuCmd::NewHub);
+            ui.close_menu();
+        }
+    });
+    cmd
 }
 
 struct Gesture {
@@ -718,22 +909,35 @@ struct Gesture {
     pick: Option<(u64, Option<u64>)>,
     drag: Option<(u64, Option<u64>, Vec2)>,
     open: Option<DockPane>,
+    menu: Option<MenuCmd>,
 }
 
-fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed]) -> Gesture {
+fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool) -> Gesture {
     let mut gesture = Gesture {
         hover: None,
         pick: None,
         drag: None,
         open: None,
+        menu: None,
     };
     for node in nodes {
-        let id = Id::new(("pb_hub_node", node.hub_id, node.port_id.unwrap_or(0), node.role as u8));
+        let id = Id::new((
+            "pb_hub_node",
+            node.hub_id,
+            node.port_id.unwrap_or(0),
+            node.role as u8,
+        ));
+        let opens = open_target(model, node).is_some();
+        let tip = if opens {
+            "Drag to move. Click for details. Double-click opens the protocol panel. Right-click to add a source or output."
+        } else {
+            "Drag to move. Click for details. Right-click to add a source or output."
+        };
         let resp = ui
             .interact(node.rect, id, Sense::click_and_drag())
-            .on_hover_text("Drag to move. Click for details. Double-click opens the protocol panel.");
+            .on_hover_text(tip);
         let key = (node.hub_id, node.port_id);
-        if resp.hovered() || resp.dragged() {
+        if !panning && (resp.hovered() || resp.dragged()) {
             gesture.hover = Some(key);
             let cursor = if resp.dragged() {
                 egui::CursorIcon::Grabbing
@@ -742,13 +946,31 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed]) -> Gesture {
             };
             ui.ctx().set_cursor_icon(cursor);
         }
-        if resp.dragged() {
+        if !panning && resp.dragged() {
             gesture.drag = Some((node.hub_id, node.port_id, resp.drag_delta()));
         } else if resp.clicked() {
             gesture.pick = Some(key);
         }
+        if resp.secondary_clicked() {
+            gesture.pick = Some(key);
+        }
         if resp.double_clicked() {
             gesture.open = open_target(model, node);
+        }
+        let mut menu = None;
+        resp.context_menu(|ui| {
+            ui.set_min_width(168.0);
+            if ui.button("Add source").clicked() {
+                menu = Some(MenuCmd::AddSource(node.hub_id));
+                ui.close_menu();
+            }
+            if ui.button("Add output").clicked() {
+                menu = Some(MenuCmd::AddOutput(node.hub_id));
+                ui.close_menu();
+            }
+        });
+        if menu.is_some() {
+            gesture.menu = menu;
         }
     }
     gesture
@@ -761,8 +983,9 @@ fn open_target(model: &HubModel, node: &Placed) -> Option<DockPane> {
             .hub(node.hub_id)
             .and_then(|hub| hub.protocol)
             .map(HubProto::pane),
-        Role::Source | Role::Output => find_port(model, node.hub_id, node.port_id)
-            .map(|port| port.protocol.pane()),
+        Role::Source | Role::Output => {
+            find_port(model, node.hub_id, node.port_id).map(|port| port.protocol.pane())
+        }
     }
 }
 
@@ -932,7 +1155,11 @@ fn paint_port_node(
         pos2(node.rect.min.x + 12.0, node.rect.min.y),
         pos2(node.rect.max.x - 8.0, node.rect.max.y),
     );
-    let role = if node.role == Role::Source { "IN" } else { "OUT" };
+    let role = if node.role == Role::Source {
+        "IN"
+    } else {
+        "OUT"
+    };
     painter.with_clip_rect(clip).text(
         pos2(clip.min.x, node.rect.center().y - 8.0),
         Align2::LEFT_CENTER,
@@ -949,7 +1176,14 @@ fn paint_port_node(
     );
 }
 
-fn paint_card(painter: &egui::Painter, rect: Rect, ink: Color32, on: bool, hot: bool, p: &ThemePalette) {
+fn paint_card(
+    painter: &egui::Painter,
+    rect: Rect,
+    ink: Color32,
+    on: bool,
+    hot: bool,
+    p: &ThemePalette,
+) {
     let shadow = rect.translate(vec2(0.0, 2.0));
     painter.rect_filled(shadow, Rounding::same(8.0), Color32::from_black_alpha(36));
     let fill = if on {
@@ -961,12 +1195,19 @@ fn paint_card(painter: &egui::Painter, rect: Rect, ink: Color32, on: bool, hot: 
     };
     painter.rect_filled(rect, Rounding::same(8.0), fill);
     if on {
-        painter.rect_stroke(rect.expand(3.0), Rounding::same(10.0), Stroke::new(1.5, p.accent));
+        painter.rect_stroke(
+            rect.expand(3.0),
+            Rounding::same(10.0),
+            Stroke::new(1.5, p.accent),
+        );
     }
     painter.rect_stroke(
         rect,
         Rounding::same(8.0),
-        Stroke::new(if on || hot { 1.8 } else { 1.15 }, if on || hot { ink } else { p.line }),
+        Stroke::new(
+            if on || hot { 1.8 } else { 1.15 },
+            if on || hot { ink } else { p.line },
+        ),
     );
 }
 
@@ -983,18 +1224,26 @@ fn paint_grip(painter: &egui::Painter, rect: Rect, color: Color32) {
     }
 }
 
-fn inspector(ui: &mut Ui, model: &mut HubModel, width: f32, height: f32, p: &ThemePalette) -> HubChange {
+fn inspector(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    width: f32,
+    height: f32,
+    p: &ThemePalette,
+) -> HubChange {
     let (rect, _) = ui.allocate_exact_size(vec2(width.max(1.0), height.max(1.0)), Sense::hover());
     ui.painter()
         .rect_filled(rect, Rounding::same(8.0), p.control);
     ui.painter()
         .rect_stroke(rect, Rounding::same(8.0), Stroke::new(1.0, p.line));
+    // Keep controls off the rounded edge. The clip is a hair outside that inset so a 1px stroke still draws.
+    let inner = rect.shrink(12.0);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(rect.shrink(10.0))
+            .max_rect(inner)
             .layout(Layout::top_down(egui::Align::Min)),
     );
-    child.set_clip_rect(rect.shrink(1.0));
+    child.set_clip_rect(inner.expand(2.0).intersect(rect.shrink(2.0)));
     let mut change = HubChange::quiet();
     ScrollArea::vertical()
         .id_salt("pb_hub_edit")
@@ -1180,34 +1429,38 @@ fn port_section(
     let locked = model.hub(hub_id).and_then(|hub| hub.protocol).is_some();
     for port_id in ports {
         ui.add_space(4.0);
+        // Place × first so it stays inside the panel, then the protocol, then the name in what remains.
         ui.horizontal(|ui| {
-            let label = &mut port_field(model, hub_id, port_id).label;
-            if ui
-                .add(egui::TextEdit::singleline(label).desired_width(120.0))
-                .changed()
-            {
-                dirty = true;
-            }
-            if !locked {
-                let current = port_field(model, hub_id, port_id).protocol;
-                let mut next = current;
-                egui::ComboBox::from_id_salt(("pb_hub_proto", port_id))
-                    .selected_text(current.label())
-                    .width(96.0)
-                    .show_ui(ui, |ui| {
-                        for proto in HubProto::ALL {
-                            ui.selectable_value(&mut next, proto, proto.label());
-                        }
-                    });
-                if next != current {
-                    port_field(model, hub_id, port_id).protocol = next;
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                if text_button(ui, "×", false, p).clicked() {
+                    model.remove_port(hub_id, port_id);
                     dirty = true;
                 }
-            }
-            if text_button(ui, "×", false, p).clicked() {
-                model.remove_port(hub_id, port_id);
-                dirty = true;
-            }
+                if !locked {
+                    let current = port_field(model, hub_id, port_id).protocol;
+                    let mut next = current;
+                    egui::ComboBox::from_id_salt(("pb_hub_proto", port_id))
+                        .selected_text(current.label())
+                        .width(88.0)
+                        .show_ui(ui, |ui| {
+                            for proto in HubProto::ALL {
+                                ui.selectable_value(&mut next, proto, proto.label());
+                            }
+                        });
+                    if next != current {
+                        port_field(model, hub_id, port_id).protocol = next;
+                        dirty = true;
+                    }
+                }
+                let field_w = (ui.available_width() - 2.0).max(36.0);
+                let label = &mut port_field(model, hub_id, port_id).label;
+                if ui
+                    .add(egui::TextEdit::singleline(label).desired_width(field_w))
+                    .changed()
+                {
+                    dirty = true;
+                }
+            });
         });
     }
     dirty
@@ -1243,7 +1496,14 @@ fn port_proto(model: &HubModel, hub_id: u64, port_id: Option<u64>) -> HubProto {
         .unwrap_or(HubProto::Modbus)
 }
 
-fn link_curve(painter: &egui::Painter, from: Rect, to: Rect, color: Color32, dashed: bool, hot: bool) {
+fn link_curve(
+    painter: &egui::Painter,
+    from: Rect,
+    to: Rect,
+    color: Color32,
+    dashed: bool,
+    hot: bool,
+) {
     let (start, end, dir) = facing(from, to);
     let pull = ((end - start).length() * 0.42).clamp(28.0, 110.0);
     let c1 = start + dir * pull;
@@ -1464,5 +1724,55 @@ mod tests {
             .find(|node| node.role == Role::Hub && node.hub_id == 6)
             .unwrap();
         assert_eq!(open_target(&model, edge), Some(DockPane::Mqtt));
+    }
+
+    #[test]
+    fn scrollbars_only_when_a_node_leaves_the_grid() {
+        let nodes = layout_nodes(&HubModel::sample().hubs);
+        let mut bounds = nodes[0].rect;
+        for node in nodes.iter().skip(1) {
+            bounds = bounds.union(node.rect);
+        }
+        // Spare room smaller than the old 56px margin; every node still inside → no bars.
+        let inside = scroll_fit(&nodes, vec2(bounds.max.x + 12.0, bounds.max.y + 12.0));
+        assert_eq!(inside.allow, [false, false]);
+        // Fitting axes center the node block in the view.
+        let expect_x = (inside.size.x - bounds.width()) * 0.5 - bounds.min.x;
+        let expect_y = (inside.size.y - bounds.height()) * 0.5 - bounds.min.y;
+        assert!((inside.shift.x - expect_x).abs() < 0.1);
+        assert!((inside.shift.y - expect_y).abs() < 0.1);
+        // A node past the right edge scrolls that axis only. The other axis stays the view size.
+        let tight = scroll_fit(&nodes, vec2(bounds.max.x - 20.0, bounds.max.y + 80.0));
+        assert_eq!(tight.allow, [true, false]);
+        assert!(tight.size.x >= bounds.max.x);
+        assert!((tight.size.y - (bounds.max.y + 80.0)).abs() < 0.1);
+        // A node off the top-left of the grid is outside, and can be scrolled back in.
+        let off = vec![placed(
+            1,
+            None,
+            Role::Hub,
+            pos2(-10.0, 40.0),
+            vec2(HUB_W, HUB_H),
+        )];
+        let left = scroll_fit(&off, vec2(800.0, 600.0));
+        assert_eq!(left.allow, [true, false]);
+        assert!(left.shift.x > 0.0);
+        // Y fits → centered (not left at the default origin).
+        let hub_h = HUB_H;
+        let expect_y = (600.0 - hub_h) * 0.5 - (40.0 - hub_h * 0.5);
+        assert!((left.shift.y - expect_y).abs() < 0.1);
+        // A pan on an axis that fits is dropped, so a leftover offset cannot invent a bar.
+        let pinned = pinned_scroll(vec2(30.0, 12.0), Some(vec2(10.0, 4.0)), [true, false]);
+        assert_eq!(pinned, Some(vec2(10.0, 0.0)));
+        assert!(pinned_scroll(Vec2::ZERO, None, [false, false]).is_none());
+    }
+
+    #[test]
+    fn panning_moves_the_view_with_the_pointer() {
+        let next = pan_scroll(vec2(40.0, 10.0), vec2(15.0, -4.0));
+        assert!((next.x - 25.0).abs() < 0.01);
+        assert!((next.y - 14.0).abs() < 0.01);
+        let clamped = pan_scroll(vec2(4.0, 0.0), vec2(20.0, 8.0));
+        assert_eq!(clamped, Vec2::ZERO);
     }
 }

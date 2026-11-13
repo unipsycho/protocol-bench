@@ -336,22 +336,78 @@ pub fn apply_theme(ctx: &egui::Context, theme: AppTheme) {
     ctx.set_visuals(visuals);
 }
 
+/// How far each corner wash reaches. Under half of either side, so the two washes do not meet.
+pub fn corner_glow_radius(screen: egui::Vec2) -> f32 {
+    screen.x.min(screen.y) * 0.46
+}
+
 /// Warm wash behind the dock. Pane fills cover most of it; the gutters show the rest.
 pub fn paint_root_bg(ctx: &egui::Context, p: &ThemePalette) {
     let screen = ctx.screen_rect();
     let painter = ctx.layer_painter(egui::LayerId::background());
     painter.rect_filled(screen, Rounding::ZERO, p.bg);
-    let (a0, a1, a2, a3) = if p.is_light {
-        (10, 14, 18, 8)
-    } else {
-        (16, 22, 28, 14)
-    };
-    let copper_at = egui::pos2(screen.min.x + screen.width() * 0.16, screen.min.y + 10.0);
-    for (radius, alpha) in [(420.0_f32, a0), (240.0, a1), (120.0, a2)] {
-        painter.circle_filled(copper_at, radius, tint(p.accent, alpha));
+    let radius = corner_glow_radius(screen.size());
+    let peak = tint(p.accent, if p.is_light { 40 } else { 72 });
+    // Same accent wash in both corners. A vertex mesh interpolates it, so it does not band.
+    paint_corner_glow(
+        &painter,
+        screen.left_top(),
+        radius,
+        peak,
+        0.0,
+        std::f32::consts::FRAC_PI_2,
+    );
+    paint_corner_glow(
+        &painter,
+        screen.right_bottom(),
+        radius,
+        peak,
+        std::f32::consts::PI,
+        std::f32::consts::FRAC_PI_2,
+    );
+}
+
+/// Quarter-circle radial gradient. Rings sample a cosine falloff; the GPU fills between them.
+fn paint_corner_glow(
+    painter: &egui::Painter,
+    origin: egui::Pos2,
+    radius: f32,
+    peak: Color32,
+    start: f32,
+    sweep: f32,
+) {
+    const RINGS: usize = 6;
+    const STEPS: usize = 56;
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(origin, peak);
+    let mut inner = 0u32;
+    let mut inner_is_point = true;
+    for ring in 1..=RINGS {
+        let d = ring as f32 / RINGS as f32;
+        let fade = 0.5 * (1.0 + (std::f32::consts::PI * d).cos());
+        let color = peak.gamma_multiply(fade);
+        let reach = radius * d;
+        let first = mesh.vertices.len() as u32;
+        for step in 0..=STEPS {
+            let ang = start + sweep * (step as f32 / STEPS as f32);
+            mesh.colored_vertex(origin + egui::vec2(ang.cos(), ang.sin()) * reach, color);
+        }
+        if inner_is_point {
+            for step in 0..STEPS as u32 {
+                mesh.add_triangle(inner, first + step, first + step + 1);
+            }
+            inner_is_point = false;
+        } else {
+            for step in 0..STEPS as u32 {
+                let a = inner + step;
+                let b = first + step;
+                mesh.add_triangle(a, b, b + 1);
+                mesh.add_triangle(a, b + 1, a + 1);
+            }
+        }
+        inner = first;
     }
-    let teal_at = egui::pos2(screen.max.x - 60.0, screen.max.y - 20.0);
-    painter.circle_filled(teal_at, 280.0, tint(p.live, a3));
+    painter.add(mesh);
 }
 
 /// Inter + JetBrains Mono, SIL Open Font License, bundled so the face does not depend on the system.
@@ -412,5 +468,19 @@ mod tests {
         assert_eq!(blended.b(), mid(theme.b(), scope::BG.b()));
         assert_ne!(blended, scope::BG);
         assert_ne!(blended, theme);
+    }
+
+    #[test]
+    fn corner_glow_stays_under_half_the_window() {
+        for screen in [
+            egui::vec2(1280.0, 800.0),
+            egui::vec2(1920.0, 1080.0),
+            egui::vec2(800.0, 600.0),
+        ] {
+            let radius = corner_glow_radius(screen);
+            assert!(radius < screen.x * 0.5);
+            assert!(radius < screen.y * 0.5);
+            assert!(radius > screen.x.min(screen.y) * 0.4);
+        }
     }
 }

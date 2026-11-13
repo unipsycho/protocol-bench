@@ -19,3 +19,4 @@ egui = "0.29"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 directories = "5"
+image = { version = "0.25", default-features = false, features = ["png"] }
