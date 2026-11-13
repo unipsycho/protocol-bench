@@ -20,6 +20,12 @@ const MARGIN: f32 = 40.0;
 const INSPECT_DEFAULT: f32 = 276.0;
 const INSPECT_MIN: f32 = 180.0;
 const DIAGRAM_MIN: f32 = 280.0;
+/// Shared height for Sources/Outputs name · protocol · remove controls.
+const PORT_ROW_H: f32 = 28.0;
+const PORT_ROW_GAP: f32 = 6.0;
+const PORT_PROTO_W: f32 = 100.0;
+/// Right gutter so the inspector scrollbar does not cover Add / ×.
+const INSPECT_SCROLL_GUTTER: f32 = 14.0;
 /// Current default view is maximum zoom. Wheel zooms out from here.
 const ZOOM_MAX: f32 = 1.0;
 const ZOOM_MIN: f32 = 0.25;
@@ -213,6 +219,10 @@ pub struct HubModel {
     /// Ephemeral UI state — not saved with the project.
     #[serde(skip)]
     pub selection: Vec<(u64, Option<u64>)>,
+    /// Camera translation of `world * zoom` into the grid (pixels). `None` = auto-center.
+    /// Ephemeral — not saved with the project.
+    #[serde(skip)]
+    pub view_pan: Option<[f32; 2]>,
     /// Width of the right-hand configure panel when the hubs view is wide enough.
     #[serde(default = "default_inspector_width")]
     pub inspector_width: f32,
@@ -238,6 +248,7 @@ impl HubModel {
             selected_port: None,
             selected_link: None,
             selection: vec![(1, None)],
+            view_pan: None,
             inspector_width: INSPECT_DEFAULT,
             zoom: ZOOM_MAX,
             hubs: vec![
@@ -408,6 +419,8 @@ impl HubModel {
         self.selected_link = None;
         match self.selection.as_slice() {
             [] => {
+                // Empty canvas: clear Node Properties entirely.
+                self.selected = None;
                 self.selected_port = None;
             }
             [(hub_id, None)] => {
@@ -496,8 +509,9 @@ impl HubModel {
         }
     }
 
-    /// Put every node back on the automatic arrangement.
+    /// Put every node back on the automatic arrangement and re-center the camera.
     pub fn clear_arrangement(&mut self) {
+        self.view_pan = None;
         for hub in &mut self.hubs {
             hub.at = None;
             for port in hub.sources.iter_mut().chain(hub.outputs.iter_mut()) {
@@ -966,23 +980,6 @@ fn scroll_fit(nodes: &[Placed], view: Vec2) -> ScrollFit {
     ScrollFit { allow, size, shift }
 }
 
-/// Pan offset. An axis that already fits stays at zero so a stale scrollbar cannot shift the canvas.
-fn pinned_scroll(current: Vec2, pan: Option<Vec2>, allow: [bool; 2]) -> Option<Vec2> {
-    let mut offset = pan.unwrap_or(current);
-    if !allow[0] {
-        offset.x = 0.0;
-    }
-    if !allow[1] {
-        offset.y = 0.0;
-    }
-    let changed = (offset.x - current.x).abs() > 0.01 || (offset.y - current.y).abs() > 0.01;
-    if pan.is_some() || changed {
-        Some(offset)
-    } else {
-        None
-    }
-}
-
 /// Scale layout rects about the diagram origin for the current zoom.
 fn scale_nodes(nodes: &[Placed], zoom: f32) -> Vec<Placed> {
     nodes
@@ -997,20 +994,12 @@ fn scale_nodes(nodes: &[Placed], zoom: f32) -> Vec<Placed> {
         .collect()
 }
 
-/// Keep the world point under the cursor fixed while zoom changes (cursor-anchored zoom).
-fn zoom_toward(
-    offset: Vec2,
-    view_pos: Vec2,
-    old_shift: Vec2,
-    new_shift: Vec2,
-    old_zoom: f32,
-    new_zoom: f32,
-) -> Vec2 {
+/// Keep the world point under the cursor fixed while zoom changes.
+/// Camera: `screen = grid.min + pan + world * zoom` → `pan' = view_pos - world * new_zoom`.
+fn zoom_cam(pan: Vec2, view_pos: Vec2, old_zoom: f32, new_zoom: f32) -> Vec2 {
     let old_z = old_zoom.max(0.0001);
-    let world = (offset + view_pos - old_shift) / old_z;
-    let next = world * new_zoom + new_shift - view_pos;
-    // ScrollArea offsets cannot go negative; clamp only that floor.
-    Vec2::new(next.x.max(0.0), next.y.max(0.0))
+    let world = (view_pos - pan) / old_z;
+    view_pos - world * new_zoom
 }
 
 /// Wheel (and pinch) over the canvas, anchored at the pointer. Clears scroll so parents do not move.
@@ -1203,7 +1192,6 @@ fn diagram_view(
         Rounding::same(8.0),
         Stroke::new(1.0, tint(p.accent, 150)),
     );
-    // The scrollport is the visible grid. Insetting it would count chrome as overflow.
     let grid = rect.shrink(1.0);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
@@ -1212,28 +1200,30 @@ fn diagram_view(
     );
     child.set_clip_rect(grid);
     let mut change = HubChange::quiet();
-    let scroll_id = child.make_persistent_id(Id::new("pb_hub_diagram"));
-    let pan = canvas_pan(&child, rect, scroll_id);
-    let stored = egui::scroll_area::State::load(child.ctx(), scroll_id)
-        .map(|state| state.offset)
-        .unwrap_or(Vec2::ZERO);
+
     let mut zoom = clamp_zoom(model.zoom);
-    let mut zoom_pan = None;
+    let fit = scroll_fit(&scale_nodes(&layout_nodes(&model.hubs), zoom), grid.size());
+    // Persistent camera; None falls back to auto-center / overflow fit shift.
+    let mut cam = model
+        .view_pan
+        .map(|p| vec2(p[0], p[1]))
+        .unwrap_or(fit.shift);
+
+    // Middle-drag / Space-drag pans the camera (content follows the pointer).
+    let pan_delta = canvas_pan_delta(&child, rect);
+    let panning = pan_delta.is_some();
+    if let Some(delta) = pan_delta {
+        cam += delta;
+        model.view_pan = Some([cam.x, cam.y]);
+    }
+
+    // Wheel zoom: keep the world point under the pointer fixed.
     if let Some((factor, pointer)) = canvas_zoom_factor(&child, rect) {
         let next = clamp_zoom(zoom * factor);
         if (next - zoom).abs() > 0.0005 {
-            let world = layout_nodes(&model.hubs);
-            let old_fit = scroll_fit(&scale_nodes(&world, zoom), grid.size());
-            let new_fit = scroll_fit(&scale_nodes(&world, next), grid.size());
             let view_pos = pointer - grid.min;
-            zoom_pan = Some(zoom_toward(
-                pan.unwrap_or(stored),
-                view_pos,
-                old_fit.shift,
-                new_fit.shift,
-                zoom,
-                next,
-            ));
+            cam = zoom_cam(cam, view_pos, zoom, next);
+            model.view_pan = Some([cam.x, cam.y]);
             zoom = next;
             if (model.zoom - zoom).abs() > 0.0005 {
                 model.zoom = zoom;
@@ -1241,224 +1231,184 @@ fn diagram_view(
             }
         }
     }
-    let fit = scroll_fit(&scale_nodes(&layout_nodes(&model.hubs), zoom), grid.size());
-    // Cursor-anchored zoom must be allowed to set scroll even when content would otherwise center.
-    let mut allow = fit.allow;
-    if zoom_pan.is_some() {
-        allow = [true, true];
+
+    // Paint in the grid; camera pan replaces ScrollArea for zoom/pan.
+    let (area, canvas) = child.allocate_exact_size(grid.size(), Sense::click_and_drag());
+    if model.hubs.is_empty() {
+        child.painter().text(
+            area.center(),
+            Align2::CENTER_CENTER,
+            "No hubs yet — right-click or use New hub",
+            font_ui(14.0),
+            p.muted,
+        );
+        if let Some(cmd) = canvas_menu(&canvas, None, None) {
+            apply_menu(model, cmd, &mut change);
+        }
+        return change;
     }
-    // Wheel is cursor-anchored zoom; pan stays middle-drag / Space-drag via scroll_offset.
-    let mut scroll = ScrollArea::both()
-        .id_salt("pb_hub_diagram")
-        .auto_shrink([false, false])
-        .drag_to_scroll(false)
-        .enable_scrolling(false)
-        .scroll(allow);
-    if !allow[0] && !allow[1] {
-        scroll = scroll.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
-    } else if zoom_pan.is_some() && !fit.allow[0] && !fit.allow[1] {
-        // Zooming inside a fitting view: keep bars hidden while still applying the pan.
-        scroll = scroll.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+    let nodes = scale_nodes(&layout_nodes(&model.hubs), zoom);
+    let shift = area.min.to_vec2() + cam;
+    let screen: Vec<Placed> = nodes
+        .iter()
+        .map(|node| Placed {
+            rect: node.rect.translate(shift),
+            ..*node
+        })
+        .collect();
+    let mut gesture = gesture_nodes(&mut child, model, &screen, panning);
+    // Links only when no node took the pointer (nodes sit on top of edges).
+    if gesture.hover.is_none()
+        && gesture.pick.is_none()
+        && gesture.menu.is_none()
+        && !panning
+    {
+        if let Some((hub_id, port_id)) = hit_link(&mut child, model, &screen, zoom) {
+            gesture.hot_link = Some((hub_id, port_id));
+            gesture.hover = Some((hub_id, Some(port_id)));
+            child.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            if canvas.clicked() || canvas.secondary_clicked() {
+                gesture.pick = Some((hub_id, Some(port_id)));
+                gesture.link_pick = true;
+            }
+        }
     }
-    let scroll_to = if let Some(offset) = zoom_pan {
-        // Do not pin/zero cursor-anchored zoom offsets.
-        Some(offset)
-    } else {
-        pinned_scroll(stored, pan, fit.allow)
-    };
-    if let Some(offset) = scroll_to {
-        scroll = scroll.scroll_offset(offset);
-    }
-    let content_shift = fit.shift;
-    let content_size = fit.size;
-    scroll.show(&mut child, |ui| {
-        // click_and_drag: empty-canvas drag draws a marquee; nodes on top still win hits.
-        let (area, canvas) = ui.allocate_exact_size(content_size, Sense::click_and_drag());
-        if model.hubs.is_empty() {
-            ui.painter().text(
-                area.center(),
-                Align2::CENTER_CENTER,
-                "No hubs yet — right-click or use New hub",
-                font_ui(14.0),
-                p.muted,
-            );
-            if let Some(cmd) = canvas_menu(&canvas, None, None) {
-                apply_menu(model, cmd, &mut change);
-            }
-            return;
-        }
-        let nodes = scale_nodes(&layout_nodes(&model.hubs), zoom);
-        let shift = area.min.to_vec2() + content_shift;
-        let screen: Vec<Placed> = nodes
-            .iter()
-            .map(|node| Placed {
-                rect: node.rect.translate(shift),
-                ..*node
-            })
-            .collect();
-        let panning = pan.is_some();
-        let mut gesture = gesture_nodes(ui, model, &screen, panning);
-        // Links only when no node took the pointer (nodes sit on top of edges).
-        if gesture.hover.is_none()
-            && gesture.pick.is_none()
-            && gesture.menu.is_none()
-            && !panning
-        {
-            if let Some((hub_id, port_id)) = hit_link(ui, model, &screen, zoom) {
-                gesture.hot_link = Some((hub_id, port_id));
-                gesture.hover = Some((hub_id, Some(port_id)));
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                if canvas.clicked() || canvas.secondary_clicked() {
-                    gesture.pick = Some((hub_id, Some(port_id)));
-                    gesture.link_pick = true;
-                }
-            }
-        }
-        // Bounding-box select on empty canvas (not while panning, on a node, or on a link).
-        let marquee_id = Id::new("pb_hub_marquee");
-        let mut marquee_paint = None;
-        let on_empty = gesture.hover.is_none()
-            && gesture.drag.is_none()
-            && gesture.hot_link.is_none()
-            && !panning;
-        if on_empty && canvas.drag_started() {
-            if let Some(pos) = canvas.interact_pointer_pos() {
-                ui.ctx().data_mut(|d| {
-                    d.insert_temp(
-                        marquee_id,
-                        Marquee {
-                            origin: pos,
-                            tip: pos,
-                        },
-                    );
-                });
-            }
-        }
-        if canvas.dragged() {
-            if let Some(mut box_drag) = ui.ctx().data(|d| d.get_temp::<Marquee>(marquee_id)) {
-                if let Some(pos) = canvas.interact_pointer_pos() {
-                    box_drag.tip = pos;
-                    ui.ctx().data_mut(|d| d.insert_temp(marquee_id, box_drag));
-                    marquee_paint = Some(box_drag);
-                }
-            }
-        }
-        let mut finished_marquee = false;
-        if canvas.drag_stopped() {
-            if let Some(box_drag) = ui.ctx().data_mut(|d| d.remove_temp::<Marquee>(marquee_id)) {
-                finished_marquee = true;
-                let rect = box_drag.rect();
-                if rect.width() > 4.0 || rect.height() > 4.0 {
-                    let keys = nodes_in_marquee(&screen, rect);
-                    model.set_selection(keys);
-                    change.dirty = true;
-                }
-            }
-        } else if let Some(box_drag) = ui.ctx().data(|d| d.get_temp::<Marquee>(marquee_id)) {
-            marquee_paint = Some(box_drag);
-        }
-        // Empty click clears selection. Skip when a marquee just finished (release also clicks).
-        if on_empty
-            && canvas.clicked()
-            && !finished_marquee
-            && !gesture.link_pick
-            && gesture.pick.is_none()
-        {
-            model.set_selection(Vec::new());
-            change.dirty = true;
-        }
-        if let Some((hub_id, port_id, delta)) = gesture.drag {
-            // Group-move every selected node; if the dragged node was outside the
-            // selection, replace selection with that one node first.
-            if !model.selection_contains(hub_id, port_id) {
-                match port_id {
-                    Some(id) => model.focus_port(hub_id, id),
-                    None => model.focus_hub(hub_id),
-                }
-            }
-            let keys = model.selection.clone();
-            let z = zoom.max(0.0001);
-            for (move_hub, move_port) in keys {
-                let Some(node) = screen
-                    .iter()
-                    .find(|node| node.hub_id == move_hub && node.port_id == move_port)
-                else {
-                    continue;
-                };
-                let world = (node.rect.center() - shift + delta) / z;
-                model.set_center(
-                    move_hub,
-                    move_port,
-                    [world.x.max(24.0), world.y.max(24.0)],
+    // Bounding-box select on empty canvas (not while panning, on a node, or on a link).
+    let marquee_id = Id::new("pb_hub_marquee");
+    let mut marquee_paint = None;
+    let on_empty = gesture.hover.is_none()
+        && gesture.drag.is_none()
+        && gesture.hot_link.is_none()
+        && !panning;
+    if on_empty && canvas.drag_started() {
+        if let Some(pos) = canvas.interact_pointer_pos() {
+            child.ctx().data_mut(|d| {
+                d.insert_temp(
+                    marquee_id,
+                    Marquee {
+                        origin: pos,
+                        tip: pos,
+                    },
                 );
-            }
-            change.dirty = true;
+            });
         }
-        if let Some((hub_id, port_id)) = gesture.pick {
-            if gesture.link_pick {
-                if let Some(port_id) = port_id {
-                    model.focus_link(hub_id, port_id);
-                    change.dirty = true;
-                }
-            } else {
-                match port_id {
-                    Some(port_id) => model.focus_port(hub_id, port_id),
-                    None => model.focus_hub(hub_id),
-                }
+    }
+    if canvas.dragged() {
+        if let Some(mut box_drag) = child.ctx().data(|d| d.get_temp::<Marquee>(marquee_id)) {
+            if let Some(pos) = canvas.interact_pointer_pos() {
+                box_drag.tip = pos;
+                child.ctx().data_mut(|d| d.insert_temp(marquee_id, box_drag));
+                marquee_paint = Some(box_drag);
+            }
+        }
+    }
+    let mut finished_marquee = false;
+    if canvas.drag_stopped() {
+        if let Some(box_drag) = child.ctx().data_mut(|d| d.remove_temp::<Marquee>(marquee_id)) {
+            finished_marquee = true;
+            let box_rect = box_drag.rect();
+            if box_rect.width() > 4.0 || box_rect.height() > 4.0 {
+                let keys = nodes_in_marquee(&screen, box_rect);
+                model.set_selection(keys);
                 change.dirty = true;
             }
         }
-        if let Some(pane) = gesture.open {
-            change.open = Some(pane);
+    } else if let Some(box_drag) = child.ctx().data(|d| d.get_temp::<Marquee>(marquee_id)) {
+        marquee_paint = Some(box_drag);
+    }
+    // Empty click clears selection. Skip when a marquee just finished (release also clicks).
+    if on_empty
+        && canvas.clicked()
+        && !finished_marquee
+        && !gesture.link_pick
+        && gesture.pick.is_none()
+    {
+        model.set_selection(Vec::new());
+        change.dirty = true;
+    }
+    if let Some((hub_id, port_id, delta)) = gesture.drag {
+        // Group-move every selected node; if the dragged node was outside the
+        // selection, replace selection with that one node first.
+        if !model.selection_contains(hub_id, port_id) {
+            match port_id {
+                Some(id) => model.focus_port(hub_id, id),
+                None => model.focus_hub(hub_id),
+            }
         }
-        let target = model
-            .selected
-            .or_else(|| model.hubs.first().map(|hub| hub.id));
-        // Prefer the hovered connection; else the already-selected edge.
-        let edge = gesture.hot_link.or_else(|| model.transform_edge());
-        let menu = gesture
-            .menu
-            .or_else(|| canvas_menu(&canvas, target, edge));
-        if let Some(cmd) = menu {
-            apply_menu(model, cmd, &mut change);
+        let keys = model.selection.clone();
+        let z = zoom.max(0.0001);
+        for (move_hub, move_port) in keys {
+            let Some(node) = screen
+                .iter()
+                .find(|node| node.hub_id == move_hub && node.port_id == move_port)
+            else {
+                continue;
+            };
+            let world = (node.rect.center() - shift + delta) / z;
+            model.set_center(
+                move_hub,
+                move_port,
+                [world.x.max(24.0), world.y.max(24.0)],
+            );
         }
-        let nodes = scale_nodes(&layout_nodes(&model.hubs), zoom);
-        let screen: Vec<Placed> = nodes
-            .iter()
-            .map(|node| Placed {
-                rect: node.rect.translate(shift),
-                ..*node
-            })
-            .collect();
-        paint_flow(
-            ui.painter(),
-            &screen,
-            model,
-            gesture.hover,
-            gesture.hot_link.or(model.selected_link.map(|id| {
-                (
-                    model.selected.unwrap_or(0),
-                    id,
-                )
-            })),
-            zoom,
-            p,
-        );
-        if let Some(box_drag) = marquee_paint {
-            paint_marquee(ui.painter(), box_drag.rect(), p);
+        change.dirty = true;
+    }
+    if let Some((hub_id, port_id)) = gesture.pick {
+        if gesture.link_pick {
+            if let Some(port_id) = port_id {
+                model.focus_link(hub_id, port_id);
+                change.dirty = true;
+            }
+        } else {
+            match port_id {
+                Some(port_id) => model.focus_port(hub_id, port_id),
+                None => model.focus_hub(hub_id),
+            }
+            change.dirty = true;
         }
-    });
-    if pan.is_some() {
+    }
+    if let Some(pane) = gesture.open {
+        change.open = Some(pane);
+    }
+    let target = model
+        .selected
+        .or_else(|| model.hubs.first().map(|hub| hub.id));
+    // Prefer the hovered connection; else the already-selected edge.
+    let edge = gesture.hot_link.or_else(|| model.transform_edge());
+    let menu = gesture.menu.or_else(|| canvas_menu(&canvas, target, edge));
+    if let Some(cmd) = menu {
+        apply_menu(model, cmd, &mut change);
+    }
+    let nodes = scale_nodes(&layout_nodes(&model.hubs), zoom);
+    let screen: Vec<Placed> = nodes
+        .iter()
+        .map(|node| Placed {
+            rect: node.rect.translate(shift),
+            ..*node
+        })
+        .collect();
+    paint_flow(
+        child.painter(),
+        &screen,
+        model,
+        gesture.hover,
+        gesture.hot_link.or(model.selected_link.map(|id| (model.selected.unwrap_or(0), id))),
+        zoom,
+        p,
+    );
+    if let Some(box_drag) = marquee_paint {
+        paint_marquee(child.painter(), box_drag.rect(), p);
+    }
+    if panning {
         child.ctx().set_cursor_icon(egui::CursorIcon::AllScroll);
     }
     change
 }
 
-/// Middle-drag, or Space+left-drag, pans like a Fusion node editor.
-/// Returns the scroll offset to apply this frame.
-fn canvas_pan(ui: &Ui, rect: Rect, scroll_id: Id) -> Option<Vec2> {
+/// Middle-drag, or Space+left-drag: pointer delta for camera pan.
+fn canvas_pan_delta(ui: &Ui, rect: Rect) -> Option<Vec2> {
     let typing = ui.ctx().wants_keyboard_input();
-    let delta = ui.ctx().input(|i| {
+    ui.ctx().input(|i| {
         let over = i.pointer.hover_pos().is_some_and(|pos| rect.contains(pos));
         if !over {
             return None;
@@ -1470,16 +1420,7 @@ fn canvas_pan(ui: &Ui, rect: Rect, scroll_id: Id) -> Option<Vec2> {
         } else {
             None
         }
-    })?;
-    let current = egui::scroll_area::State::load(ui.ctx(), scroll_id)
-        .map(|state| state.offset)
-        .unwrap_or(Vec2::ZERO);
-    Some(pan_scroll(current, delta))
-}
-
-/// Drag the canvas with the pointer. Offset cannot go negative.
-fn pan_scroll(offset: Vec2, delta: Vec2) -> Vec2 {
-    Vec2::new((offset.x - delta.x).max(0.0), (offset.y - delta.y).max(0.0))
+    })
 }
 
 enum MenuCmd {
@@ -2091,6 +2032,9 @@ fn inspector(
         .id_salt("pb_hub_edit")
         .auto_shrink([false, false])
         .show(&mut child, |ui| {
+            // Overlay scrollbar sits on the right; keep Add / × / row edges clear of it.
+            let width = (ui.available_width() - INSPECT_SCROLL_GUTTER).max(1.0);
+            ui.set_width(width);
             change = change.join(edit_selected(ui, model, p));
         });
     change
@@ -2108,6 +2052,15 @@ fn edit_selected(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChan
         ui.label(
             egui::RichText::new("Select a single node to edit its properties.")
                 .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        return HubChange::quiet();
+    }
+    // Nothing selected (empty-canvas click) — clear the panel.
+    if model.selection.is_empty() && model.selected_link.is_none() {
+        ui.label(
+            egui::RichText::new("Click a node to see it here.")
+                .font(font_ui(12.5))
                 .color(p.muted),
         );
         return HubChange::quiet();
@@ -2310,14 +2263,8 @@ fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
     if port_section(ui, model, id, true, p) {
         change.dirty = true;
     }
-    ui.add_space(8.0);
-    if step_section(ui, model, id, true, p) {
-        change.dirty = true;
-    }
-    ui.add_space(8.0);
-    if step_section(ui, model, id, false, p) {
-        change.dirty = true;
-    }
+    // Aggregators / calculations are edge nodes — edited when selected on the canvas,
+    // not listed under hub properties.
     ui.add_space(8.0);
     if port_section(ui, model, id, false, p) {
         change.dirty = true;
@@ -2359,141 +2306,69 @@ fn port_section(
             list.iter().map(|port| port.id).collect()
         })
         .unwrap_or_default();
-    // Match ComboBox button height (at least interact_size.y) so the name field lines up.
-    let row_h = ui.spacing().interact_size.y;
     for port_id in ports {
         ui.add_space(4.0);
-        // Place × first so it stays inside the panel, then the protocol, then the name in what remains.
+        // Name · protocol · × — one shared height, fixed gaps, LTR so spacing is obvious.
         ui.horizontal(|ui| {
-            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                if text_button(ui, "×", false, p).clicked() {
-                    model.remove_port(hub_id, port_id);
-                    dirty = true;
-                }
-                let current = port_field(model, hub_id, port_id).protocol;
-                let mut next = current;
+            ui.spacing_mut().item_spacing.x = PORT_ROW_GAP;
+            ui.set_min_height(PORT_ROW_H);
+            let field_w =
+                (ui.available_width() - PORT_PROTO_W - PORT_ROW_H - 2.0 * PORT_ROW_GAP).max(36.0);
+            let label = &mut port_field(model, hub_id, port_id).label;
+            if ui
+                .add_sized(
+                    vec2(field_w, PORT_ROW_H),
+                    egui::TextEdit::singleline(label)
+                        .desired_width(field_w)
+                        .margin(egui::Margin::symmetric(6.0, 4.0)),
+                )
+                .changed()
+            {
+                dirty = true;
+            }
+            let current = port_field(model, hub_id, port_id).protocol;
+            let mut next = current;
+            // ComboBox button height follows interact_size.y.
+            ui.scope(|ui| {
+                ui.spacing_mut().interact_size = vec2(PORT_PROTO_W, PORT_ROW_H);
                 egui::ComboBox::from_id_salt(("pb_hub_proto", port_id))
                     .selected_text(current.label())
-                    .width(88.0)
+                    .width(PORT_PROTO_W)
                     .show_ui(ui, |ui| {
                         for proto in HubProto::ALL {
                             ui.selectable_value(&mut next, proto, proto.label());
                         }
                     });
-                if next != current {
-                    port_field(model, hub_id, port_id).protocol = next;
-                    dirty = true;
-                }
-                let field_w = (ui.available_width() - 2.0).max(36.0);
-                let label = &mut port_field(model, hub_id, port_id).label;
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(label)
-                            .desired_width(field_w)
-                            .min_size(vec2(0.0, row_h)),
-                    )
-                    .changed()
-                {
-                    dirty = true;
-                }
             });
+            if next != current {
+                port_field(model, hub_id, port_id).protocol = next;
+                dirty = true;
+            }
+            if port_remove_button(ui, p).clicked() {
+                model.remove_port(hub_id, port_id);
+                dirty = true;
+            }
         });
     }
     dirty
 }
 
-fn step_section(
-    ui: &mut Ui,
-    model: &mut HubModel,
-    hub_id: u64,
-    aggregator: bool,
-    p: &ThemePalette,
-) -> bool {
-    let mut dirty = false;
-    let title = if aggregator {
-        "AGGREGATORS"
+/// Square remove control matching `PORT_ROW_H`, with × centered in the button.
+fn port_remove_button(ui: &mut Ui, p: &ThemePalette) -> egui::Response {
+    let size = vec2(PORT_ROW_H, PORT_ROW_H);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let fill = if resp.hovered() {
+        tint(p.accent, 20)
     } else {
-        "CALCULATIONS"
+        p.header_top
     };
-    let edge = model
-        .transform_edge()
-        .filter(|(id, _)| *id == hub_id)
-        .map(|(_, port)| port);
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(title)
-                .font(font_ui(10.5))
-                .color(p.muted),
-        );
-        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-            let can_add = edge.is_some();
-            let add = text_button(ui, "Add", false, p);
-            if !can_add {
-                add.on_hover_text("Select a connection first");
-            } else if add.clicked() {
-                if let Some(edge_port) = edge {
-                    if let Some(step_id) = model.add_step(hub_id, aggregator, edge_port) {
-                        model.focus_port(hub_id, step_id);
-                        dirty = true;
-                    }
-                }
-            }
-        });
-    });
-    if edge.is_none() {
-        ui.label(
-            egui::RichText::new("Select a link to place on the path")
-                .font(font_ui(11.0))
-                .color(p.muted),
-        );
-    }
-    let steps: Vec<(u64, String)> = model
-        .hub(hub_id)
-        .map(|hub| {
-            let list = if aggregator {
-                &hub.aggregators
-            } else {
-                &hub.calculations
-            };
-            list.iter()
-                .map(|step| {
-                    let edge_name = hub
-                        .sources
-                        .iter()
-                        .chain(hub.outputs.iter())
-                        .find(|port| port.id == step.edge_port)
-                        .map(|port| port.label.clone())
-                        .unwrap_or_else(|| "?".into());
-                    (step.id, edge_name)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    for (step_id, edge_name) in steps {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                if text_button(ui, "×", false, p).clicked() {
-                    model.remove_port(hub_id, step_id);
-                    dirty = true;
-                }
-                ui.label(
-                    egui::RichText::new(edge_name)
-                        .font(font_ui(11.0))
-                        .color(p.muted),
-                );
-                let field_w = (ui.available_width() - 2.0).max(36.0);
-                let label = &mut step_field(model, hub_id, step_id).label;
-                if ui
-                    .add(egui::TextEdit::singleline(label).desired_width(field_w))
-                    .changed()
-                {
-                    dirty = true;
-                }
-            });
-        });
-    }
-    dirty
+    ui.painter().rect_filled(rect, Rounding::same(5.0), fill);
+    ui.painter()
+        .rect_stroke(rect, Rounding::same(5.0), Stroke::new(1.0, p.line));
+    let galley = ui.fonts(|fonts| fonts.layout_no_wrap("×".to_owned(), font_ui(14.0), p.text));
+    ui.painter()
+        .galley(rect.center() - galley.size() * 0.5, galley, p.text);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn port_field(model: &mut HubModel, hub_id: u64, port_id: u64) -> &mut HubPort {
@@ -2866,19 +2741,14 @@ mod tests {
         let hub_h = HUB_H;
         let expect_y = (600.0 - hub_h) * 0.5 - (40.0 - hub_h * 0.5);
         assert!((left.shift.y - expect_y).abs() < 0.1);
-        // A pan on an axis that fits is dropped, so a leftover offset cannot invent a bar.
-        let pinned = pinned_scroll(vec2(30.0, 12.0), Some(vec2(10.0, 4.0)), [true, false]);
-        assert_eq!(pinned, Some(vec2(10.0, 0.0)));
-        assert!(pinned_scroll(Vec2::ZERO, None, [false, false]).is_none());
     }
 
     #[test]
-    fn panning_moves_the_view_with_the_pointer() {
-        let next = pan_scroll(vec2(40.0, 10.0), vec2(15.0, -4.0));
-        assert!((next.x - 25.0).abs() < 0.01);
-        assert!((next.y - 14.0).abs() < 0.01);
-        let clamped = pan_scroll(vec2(4.0, 0.0), vec2(20.0, 8.0));
-        assert_eq!(clamped, Vec2::ZERO);
+    fn camera_pan_follows_the_pointer() {
+        // Middle/Space drag adds the pointer delta to the camera.
+        let cam = vec2(40.0, 10.0) + vec2(15.0, -4.0);
+        assert!((cam.x - 55.0).abs() < 0.01);
+        assert!((cam.y - 6.0).abs() < 0.01);
     }
 
     #[test]
@@ -2928,20 +2798,29 @@ mod tests {
     }
 
     #[test]
-    fn zoom_toward_keeps_the_world_point_under_the_cursor() {
-        // Values chosen so the new offset stays non-negative (no clamp).
-        let offset = vec2(200.0, 180.0);
+    fn zoom_cam_keeps_the_world_point_under_the_cursor() {
+        let pan = vec2(40.0, 20.0);
         let view = vec2(100.0, 80.0);
-        let old_shift = vec2(12.0, 6.0);
-        let new_shift = vec2(4.0, 2.0);
         let old_z = 1.0;
         let new_z = 0.5;
-        let next = zoom_toward(offset, view, old_shift, new_shift, old_z, new_z);
-        assert!(next.x >= 0.0 && next.y >= 0.0);
-        let world_before = (offset + view - old_shift) / old_z;
-        let world_after = (next + view - new_shift) / new_z;
+        let next = zoom_cam(pan, view, old_z, new_z);
+        let world_before = (view - pan) / old_z;
+        let world_after = (view - next) / new_z;
         assert!((world_before.x - world_after.x).abs() < 0.05);
         assert!((world_before.y - world_after.y).abs() < 0.05);
+        // Negative camera is allowed (cursor-anchored zoom when content fits).
+        assert!(next.x < pan.x || next.y < pan.y || (new_z - old_z).abs() > 0.0);
+    }
+
+    #[test]
+    fn empty_selection_clears_node_properties() {
+        let mut model = HubModel::sample();
+        assert_eq!(model.selected, Some(1));
+        model.set_selection(Vec::new());
+        assert!(model.selection.is_empty());
+        assert!(model.selected.is_none());
+        assert!(model.selected_port.is_none());
+        assert!(model.selected_link.is_none());
     }
 
     #[test]
