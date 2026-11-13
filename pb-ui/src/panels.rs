@@ -54,90 +54,142 @@ fn points_panel(ui: &mut egui::Ui, host: &HostSnapshot, p: &ThemePalette) {
         return;
     }
 
-    // Tight fixed columns; Source flexes; Updated stays left-aligned (not flush-right).
-    const NAME_W: f32 = 72.0;
-    const VALUE_W: f32 = 72.0;
-    const UPDATED_W: f32 = 96.0;
+    // Modest gutters; header + rows share one column geometry so labels line up.
+    const NAME_W: f32 = 78.0;
+    const VALUE_W: f32 = 78.0;
+    const UPDATED_W: f32 = 100.0;
     const DOT_W: f32 = 12.0;
-    const COL_GAP: f32 = 6.0;
+    const COL_GAP: f32 = 10.0;
+
+    // Precompute Updated strings so the row helper stays borrow-simple.
+    let updated: Vec<String> = host
+        .points
+        .iter()
+        .map(|pt| format_updated(pt.updated_ms))
+        .collect();
 
     egui::ScrollArea::vertical()
         .id_salt("pb_points_live")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = COL_GAP;
-            ui.spacing_mut().item_spacing.y = 0.0;
+            let row_w = ui.available_width().max(1.0);
+            let source_w = (row_w - DOT_W - NAME_W - VALUE_W - UPDATED_W - COL_GAP * 4.0).max(48.0);
 
-            // Header — left-justified like data rows.
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = COL_GAP;
-                ui.add_space(DOT_W);
-                points_cell(
-                    ui,
-                    egui::RichText::new("NAME").font(font_ui(10.5)).color(p.muted),
-                    NAME_W,
-                );
-                points_cell(
-                    ui,
-                    egui::RichText::new("VALUE").font(font_ui(10.5)).color(p.muted),
-                    VALUE_W,
-                );
-                let source_w = (ui.available_width() - UPDATED_W - COL_GAP).max(48.0);
-                points_cell(
-                    ui,
-                    egui::RichText::new("SOURCE").font(font_ui(10.5)).color(p.muted),
-                    source_w,
-                );
-                points_cell(
-                    ui,
-                    egui::RichText::new("UPDATED").font(font_ui(10.5)).color(p.muted),
-                    UPDATED_W,
-                );
-            });
+            points_table_row(
+                ui,
+                PointsRow {
+                    quality: None,
+                    name: "NAME",
+                    value: "VALUE",
+                    source: "SOURCE",
+                    source_full: "",
+                    updated: "UPDATED",
+                    header: true,
+                },
+                NAME_W,
+                VALUE_W,
+                source_w,
+                UPDATED_W,
+                DOT_W,
+                COL_GAP,
+                p,
+            );
             ui.add_space(2.0);
             ui.separator();
             ui.add_space(1.0);
 
-            for point in &host.points {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = COL_GAP;
-                    quality_dot(ui, &point.quality, p);
-                    points_cell(
-                        ui,
-                        egui::RichText::new(&point.name)
-                            .font(font_ui(12.0))
-                            .color(p.text),
-                        NAME_W,
-                    );
-                    points_cell(
-                        ui,
-                        egui::RichText::new(truncate_chars(&point.value, 14))
-                            .font(font_ui(12.0))
-                            .color(p.text),
-                        VALUE_W,
-                    );
-                    let source_w = (ui.available_width() - UPDATED_W - COL_GAP).max(48.0);
-                    // ~7px per char at 12pt — keep the end of the path visible.
-                    let max_chars = ((source_w / 7.0) as usize).max(6);
-                    let shown = truncate_keep_end(&point.source, max_chars);
-                    points_cell(
-                        ui,
-                        egui::RichText::new(&shown)
-                            .font(font_ui(12.0))
-                            .color(p.muted),
-                        source_w,
-                    )
-                    .on_hover_text(&point.source);
-                    points_cell(
-                        ui,
-                        egui::RichText::new(format_updated(point.updated_ms))
-                            .font(font_ui(12.0))
-                            .color(p.muted),
-                        UPDATED_W,
-                    );
-                });
+            for (i, point) in host.points.iter().enumerate() {
+                points_table_row(
+                    ui,
+                    PointsRow {
+                        quality: Some(point.quality.as_str()),
+                        name: point.name.as_str(),
+                        value: point.value.as_str(),
+                        source: point.source.as_str(),
+                        source_full: point.source.as_str(),
+                        updated: updated[i].as_str(),
+                        header: false,
+                    },
+                    NAME_W,
+                    VALUE_W,
+                    source_w,
+                    UPDATED_W,
+                    DOT_W,
+                    COL_GAP,
+                    p,
+                );
             }
         });
+}
+
+struct PointsRow<'a> {
+    quality: Option<&'a str>,
+    name: &'a str,
+    value: &'a str,
+    source: &'a str,
+    source_full: &'a str,
+    updated: &'a str,
+    header: bool,
+}
+
+fn points_table_row(
+    ui: &mut egui::Ui,
+    row: PointsRow<'_>,
+    name_w: f32,
+    value_w: f32,
+    source_w: f32,
+    updated_w: f32,
+    dot_w: f32,
+    gap: f32,
+    p: &ThemePalette,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        // Same DOT slot for header and data so columns share an origin.
+        let (dot_rect, dot_resp) = ui.allocate_exact_size(Vec2::splat(dot_w), Sense::hover());
+        if let Some(q) = row.quality {
+            let color = match q {
+                "good" => Color32::from_rgb(0x3d, 0xb8, 0x6b),
+                "bad" => Color32::from_rgb(0xe0, 0x55, 0x55),
+                _ => Color32::from_rgb(0xd4, 0xa0, 0x3c),
+            };
+            let r = 3.0;
+            ui.painter().circle_filled(dot_rect.center(), r, color);
+            ui.painter()
+                .circle_stroke(dot_rect.center(), r, Stroke::new(1.0, tint(p.text, 40)));
+            dot_resp.on_hover_text(q);
+        }
+
+        let (name_t, value_t, source_t, updated_t) = if row.header {
+            (
+                egui::RichText::new(row.name).font(font_ui(10.5)).color(p.muted),
+                egui::RichText::new(row.value).font(font_ui(10.5)).color(p.muted),
+                egui::RichText::new(row.source).font(font_ui(10.5)).color(p.muted),
+                egui::RichText::new(row.updated).font(font_ui(10.5)).color(p.muted),
+            )
+        } else {
+            let max_chars = ((source_w / 7.0) as usize).max(6);
+            let shown = truncate_keep_end(row.source, max_chars);
+            (
+                egui::RichText::new(row.name).font(font_ui(12.0)).color(p.text),
+                egui::RichText::new(truncate_chars(row.value, 14))
+                    .font(font_ui(12.0))
+                    .color(p.text),
+                egui::RichText::new(shown).font(font_ui(12.0)).color(p.muted),
+                egui::RichText::new(row.updated)
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            )
+        };
+
+        points_cell(ui, name_t, name_w);
+        points_cell(ui, value_t, value_w);
+        let source_resp = points_cell(ui, source_t, source_w);
+        if !row.header && !row.source_full.is_empty() {
+            source_resp.on_hover_text(row.source_full);
+        }
+        points_cell(ui, updated_t, updated_w);
+    });
 }
 
 /// Fixed-width cell, always left-justified inside its column.
@@ -148,21 +200,6 @@ fn points_cell(ui: &mut egui::Ui, text: egui::RichText, width: f32) -> egui::Res
         |ui| ui.add(egui::Label::new(text).truncate()),
     )
     .inner
-}
-
-fn quality_dot(ui: &mut egui::Ui, quality: &str, p: &ThemePalette) {
-    let color = match quality {
-        "good" => Color32::from_rgb(0x3d, 0xb8, 0x6b),
-        "bad" => Color32::from_rgb(0xe0, 0x55, 0x55),
-        _ => Color32::from_rgb(0xd4, 0xa0, 0x3c),
-    };
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-    let r = 3.0;
-    ui.painter().circle_filled(rect.center(), r, color);
-    // Soft ring so the dot stays readable on light and dark panes.
-    ui.painter()
-        .circle_stroke(rect.center(), r, Stroke::new(1.0, tint(p.text, 40)));
-    response.on_hover_text(quality);
 }
 
 /// Ellipsis at the start so the end of a long path stays visible.

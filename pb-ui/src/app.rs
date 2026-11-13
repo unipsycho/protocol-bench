@@ -109,7 +109,7 @@ impl ProtocolBenchApp {
                         project::migrate_panel_point_refs(&mut mqtt, &mut store);
                     }
                     mqtt_saved = file.mqtt.clone();
-                    mqtt_panel::apply_mqtt_session(&engine, &mqtt);
+                    mqtt_panel::apply_mqtt_session(&engine, &mut mqtt);
                     status = format!("Loaded project {}", project_path.display());
                 }
                 Err(err) => {
@@ -209,7 +209,7 @@ impl ProtocolBenchApp {
         }
         self.mqtt_saved = file.mqtt.clone();
         self.project_path = path;
-        mqtt_panel::apply_mqtt_session(&self.engine, &self.mqtt);
+        mqtt_panel::apply_mqtt_session(&self.engine, &mut self.mqtt);
         self.status = format!("Opened {}", self.project_path.display());
         Ok(())
     }

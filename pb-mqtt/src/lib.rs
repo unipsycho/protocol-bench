@@ -49,6 +49,9 @@ pub struct ClientConfig {
     pub port: u16,
     #[serde(default = "default_client_id")]
     pub client_id: String,
+    /// Fresh random MQTT client id on each connect (avoids broker collisions).
+    #[serde(default)]
+    pub unique_client_id: bool,
     #[serde(default)]
     pub username: String,
     #[serde(default)]
@@ -104,6 +107,7 @@ impl Default for ClientConfig {
             host: default_host(),
             port: default_port(),
             client_id: default_client_id(),
+            unique_client_id: false,
             username: String::new(),
             password: String::new(),
             transport: default_transport(),
@@ -113,6 +117,25 @@ impl Default for ClientConfig {
             outputs: Vec::new(),
             auto_connect: false,
         }
+    }
+}
+
+fn connect_client_id(cfg: &ClientConfig) -> String {
+    if cfg.unique_client_id {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mix = t ^ n.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        format!("pb-{}-{:x}", cfg.id, mix & 0xffff_ffff)
+    } else if cfg.client_id.trim().is_empty() {
+        format!("pb-{}", cfg.id)
+    } else {
+        cfg.client_id.clone()
     }
 }
 
@@ -239,10 +262,11 @@ impl PackState {
     fn start_client(rt: &mut ClientRuntime) -> Result<(), String> {
         Self::stop_client(rt);
         let transport = rt.config.transport_kind()?;
+        let client_id = connect_client_id(&rt.config);
         let session = MqttSession::spawn(
             rt.config.host.clone(),
             rt.config.port,
-            rt.config.client_id.clone(),
+            client_id,
             rt.config.username.clone(),
             rt.config.password.clone(),
             transport,
@@ -434,6 +458,7 @@ impl PackState {
                     rt.config.host != cfg.host
                         || rt.config.port != cfg.port
                         || rt.config.client_id != cfg.client_id
+                        || rt.config.unique_client_id != cfg.unique_client_id
                         || rt.config.transport != cfg.transport
                         || rt.config.username != cfg.username
                         || rt.config.password != cfg.password

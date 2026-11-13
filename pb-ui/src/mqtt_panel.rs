@@ -35,6 +35,8 @@ pub struct MqttClient {
     pub host: String,
     pub port: String,
     pub client_id: String,
+    /// When true, each Connect uses a fresh random MQTT client id (TopicBench-style).
+    pub unique_client_id: bool,
     pub username: String,
     pub password: String,
     pub transport: String,
@@ -58,7 +60,8 @@ impl MqttClient {
             label: "Local broker".into(),
             host: "127.0.0.1".into(),
             port: "1883".into(),
-            client_id: "protocol-bench".into(),
+            client_id: "pb-local".into(),
+            unique_client_id: false,
             username: String::new(),
             password: String::new(),
             transport: "tcp".into(),
@@ -79,33 +82,36 @@ impl MqttClient {
 #[derive(Debug, Clone)]
 pub struct MqttPanelState {
     pub clients: Vec<MqttClient>,
-    pub selected: usize,
+    /// Index into `clients` when a connection is selected; `None` = list only.
+    pub selected: Option<usize>,
 }
 
 impl Default for MqttPanelState {
     fn default() -> Self {
         Self {
             clients: vec![MqttClient::default_local()],
-            selected: 0,
+            selected: None,
         }
     }
 }
 
 impl MqttPanelState {
     pub fn selected(&self) -> Option<&MqttClient> {
-        self.clients.get(self.selected)
+        self.selected.and_then(|i| self.clients.get(i))
     }
 
     pub fn selected_mut(&mut self) -> Option<&mut MqttClient> {
-        self.clients.get_mut(self.selected)
+        self.selected.and_then(|i| self.clients.get_mut(i))
     }
 
-    fn ensure_selection(&mut self) {
+    fn ensure_clients(&mut self) {
         if self.clients.is_empty() {
             self.clients.push(MqttClient::default_local());
-            self.selected = 0;
-        } else if self.selected >= self.clients.len() {
-            self.selected = self.clients.len() - 1;
+            self.selected = None;
+        } else if let Some(i) = self.selected {
+            if i >= self.clients.len() {
+                self.selected = None;
+            }
         }
     }
 
@@ -118,10 +124,42 @@ impl MqttPanelState {
         }
         id
     }
+
+    /// Fill empty / colliding static MQTT client ids so each connection is unique.
+    pub fn ensure_unique_mqtt_client_ids(&mut self) {
+        let mut seen = std::collections::BTreeSet::new();
+        for c in &mut self.clients {
+            let trimmed = c.client_id.trim().to_string();
+            if trimmed.is_empty() || seen.contains(&trimmed) {
+                c.client_id = fresh_mqtt_client_id(&c.id);
+            }
+            seen.insert(c.client_id.clone());
+        }
+    }
+}
+
+/// Short random MQTT client id: `pb-<conn>-<hex>`.
+pub fn fresh_mqtt_client_id(conn_id: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mix = t ^ n.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let conn = if conn_id.trim().is_empty() {
+        "mqtt"
+    } else {
+        conn_id.trim()
+    };
+    format!("pb-{conn}-{:x}", mix & 0xffff_ffff)
 }
 
 /// Push full multi-client document to the MQTT pack (reconcile + optional connect).
-pub fn apply_mqtt_session(engine: &EngineHandle, state: &MqttPanelState) {
+pub fn apply_mqtt_session(engine: &EngineHandle, state: &mut MqttPanelState) {
+    state.ensure_unique_mqtt_client_ids();
     let clients: Vec<serde_json::Value> = state
         .clients
         .iter()
@@ -133,6 +171,7 @@ pub fn apply_mqtt_session(engine: &EngineHandle, state: &MqttPanelState) {
                 "host": c.host,
                 "port": port,
                 "client_id": c.client_id,
+                "unique_client_id": c.unique_client_id,
                 "username": c.username,
                 "password": c.password,
                 "transport": c.transport,
@@ -164,7 +203,7 @@ pub fn paint(
     engine: &EngineHandle,
     state: &mut MqttPanelState,
 ) {
-    state.ensure_selection();
+    state.ensure_clients();
     // Claim the full pane body with an explicit rect — nested horizontal rows
     // collapse available_height and clip the config editor.
     let full = ui.available_rect_before_wrap();
@@ -204,6 +243,16 @@ fn paint_body(
 
     clients_bar(ui, state, engine, p);
     ui.add_space(10.0);
+
+    // Detail form only when a connection is selected.
+    if state.selected().is_none() {
+        ui.label(
+            egui::RichText::new("Select a connection to edit broker settings, Inputs, and Outputs.")
+                .font(font_ui(12.5))
+                .color(p.muted),
+        );
+        return;
+    }
 
     // Remaining pane rect after blurb + connections — config scrolls inside this.
     let rem = ui.available_rect_before_wrap();
@@ -277,13 +326,14 @@ fn clients_bar(
         let mut select = None;
         let mut remove = None;
         for (i, client) in state.clients.iter().enumerate() {
-            let selected = i == state.selected;
+            let selected = state.selected == Some(i);
             let label = if client.label.is_empty() {
                 client.id.as_str()
             } else {
                 client.label.as_str()
             };
             if text_btn(ui, label, selected, p).clicked() {
+                // Toggle: click again clears selection → list only.
                 select = Some(i);
             }
             if state.clients.len() > 1
@@ -293,11 +343,21 @@ fn clients_bar(
             }
         }
         if let Some(i) = select {
-            state.selected = i;
+            state.selected = if state.selected == Some(i) {
+                None
+            } else {
+                Some(i)
+            };
         }
         if let Some(i) = remove {
+            let was = state.selected;
             state.clients.remove(i);
-            state.ensure_selection();
+            state.selected = match was {
+                Some(s) if s == i => None,
+                Some(s) if s > i => Some(s - 1),
+                other => other,
+            };
+            state.ensure_clients();
             apply_mqtt_session(engine, state);
         }
         ui.add_space(8.0);
@@ -305,10 +365,10 @@ fn clients_bar(
             let id = state.unique_id("broker");
             let mut c = MqttClient::default_local();
             c.id = id.clone();
-            c.label = id;
-            c.client_id = format!("pb-{}", c.id);
+            c.label = id.clone();
+            c.client_id = fresh_mqtt_client_id(&id);
             state.clients.push(c);
-            state.selected = state.clients.len() - 1;
+            state.selected = Some(state.clients.len() - 1);
             apply_mqtt_session(engine, state);
         }
     });
@@ -331,7 +391,7 @@ fn selected_client_editor(
         field(ui, "Label", &mut c.label, p);
         field(ui, "Host", &mut c.host, p);
         field(ui, "Port", &mut c.port, p);
-        field(ui, "Client ID", &mut c.client_id, p);
+        client_id_field(ui, c, p);
         field(ui, "Username", &mut c.username, p);
         password(ui, "Password", &mut c.password, p);
         transport(ui, &mut c.transport, p);
@@ -661,6 +721,45 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
         );
         let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
         ui.add(egui::TextEdit::singleline(value).desired_width(w));
+    });
+    ui.add_space(4.0);
+}
+
+fn client_id_field(ui: &mut egui::Ui, c: &mut MqttClient, p: &ThemePalette) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.add_sized(
+            [LABEL_W, 20.0],
+            egui::Label::new(
+                egui::RichText::new("Client ID")
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            ),
+        );
+        let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
+        let edit = egui::TextEdit::singleline(&mut c.client_id).desired_width(w);
+        // Static id kept when Unique is off; disabled while random overrides CONNECT.
+        if c.unique_client_id {
+            ui.add_enabled(false, edit);
+        } else {
+            ui.add(edit);
+        }
+    });
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_space(LABEL_W + 10.0);
+        ui.checkbox(
+            &mut c.unique_client_id,
+            egui::RichText::new("Unique client ID (random on connect)")
+                .font(font_ui(11.5))
+                .color(p.text),
+        )
+        .on_hover_text(
+            "Fresh random MQTT client id on each Connect — avoids collisions when multiple sessions share this broker.",
+        );
+        if !c.unique_client_id && text_btn(ui, "Randomize", false, p).clicked() {
+            c.client_id = fresh_mqtt_client_id(&c.id);
+        }
     });
     ui.add_space(4.0);
 }

@@ -99,6 +99,9 @@ pub struct MqttClientSerde {
     pub port: u16,
     #[serde(default = "default_mqtt_client_id")]
     pub client_id: String,
+    /// Fresh random MQTT client id on each connect (TopicBench-style).
+    #[serde(default)]
+    pub unique_client_id: bool,
     #[serde(default)]
     pub username: String,
     #[serde(default)]
@@ -141,7 +144,7 @@ fn default_port() -> u16 {
     1883
 }
 fn default_mqtt_client_id() -> String {
-    "protocol-bench".into()
+    "pb-local".into()
 }
 fn default_transport() -> String {
     "tcp".into()
@@ -155,6 +158,7 @@ impl MqttClientSerde {
             host: default_host(),
             port: default_port(),
             client_id: default_mqtt_client_id(),
+            unique_client_id: false,
             username: String::new(),
             password: String::new(),
             transport: default_transport(),
@@ -172,6 +176,7 @@ impl MqttClientSerde {
             host: c.host.clone(),
             port: c.port.parse().unwrap_or(1883),
             client_id: c.client_id.clone(),
+            unique_client_id: c.unique_client_id,
             username: c.username.clone(),
             password: c.password.clone(),
             transport: normalize_transport(&c.transport),
@@ -210,6 +215,7 @@ impl MqttClientSerde {
             host: self.host.clone(),
             port: self.port.to_string(),
             client_id: self.client_id.clone(),
+            unique_client_id: self.unique_client_id,
             username: self.username.clone(),
             password: self.password.clone(),
             transport: normalize_transport(&self.transport),
@@ -266,11 +272,16 @@ impl MqttProject {
         if state.clients.is_empty() {
             state.clients.push(MqttClient::default_local());
         }
-        state.selected = state
-            .clients
-            .iter()
-            .position(|c| c.id == self.selected_id)
-            .unwrap_or(0);
+        state.ensure_unique_mqtt_client_ids();
+        // Empty selected_id → list-only (no detail form).
+        state.selected = if self.selected_id.is_empty() {
+            None
+        } else {
+            state
+                .clients
+                .iter()
+                .position(|c| c.id == self.selected_id)
+        };
     }
 }
 
