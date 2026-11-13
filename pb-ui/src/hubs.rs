@@ -1234,7 +1234,7 @@ pub fn paint(
     model: &mut HubModel,
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
-    mqtt: &MqttPanelState,
+    mqtt: &mut MqttPanelState,
     host: &HostSnapshot,
 ) -> HubChange {
     let mut change = HubChange::quiet();
@@ -2236,7 +2236,7 @@ fn inspector(
     height: f32,
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
-    mqtt: &MqttPanelState,
+    mqtt: &mut MqttPanelState,
     host: &HostSnapshot,
 ) -> HubChange {
     let (rect, _) = ui.allocate_exact_size(vec2(width.max(1.0), height.max(1.0)), Sense::hover());
@@ -2270,7 +2270,7 @@ fn edit_selected(
     model: &mut HubModel,
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
-    mqtt: &MqttPanelState,
+    mqtt: &mut MqttPanelState,
     host: &HostSnapshot,
 ) -> HubChange {
     // Item-specific properties only when exactly one canvas node is selected.
@@ -2308,7 +2308,7 @@ fn edit_selected(
         }
         return edit_port(ui, model, p, mqtt_connections, mqtt, host);
     }
-    edit_hub(ui, model, p)
+    edit_hub(ui, model, mqtt, p)
 }
 
 fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
@@ -2381,7 +2381,7 @@ fn edit_port(
     model: &mut HubModel,
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
-    mqtt: &MqttPanelState,
+    mqtt: &mut MqttPanelState,
     host: &HostSnapshot,
 ) -> HubChange {
     let Some(hub_id) = model.selected else {
@@ -2498,7 +2498,7 @@ fn edit_mqtt_port_binds(
     port_id: u64,
     incoming: bool,
     mqtt_connections: &[(String, String)],
-    mqtt: &MqttPanelState,
+    mqtt: &mut MqttPanelState,
     host: &HostSnapshot,
     p: &ThemePalette,
 ) -> HubChange {
@@ -2738,26 +2738,110 @@ fn edit_mqtt_port_binds(
                 .font(font_ui(10.5))
                 .color(p.muted),
         );
-        ui.add_space(4.0);
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(
+                "Publish path uses the connection above (Clients). Live egress / throttle come later.",
+            )
+            .font(font_ui(11.0))
+            .color(p.muted),
+        );
+        ui.add_space(6.0);
         let mut remove = None;
         let mut add = false;
+        let point_names: Vec<String> = host.points.iter().map(|p| p.name.clone()).collect();
         {
             let port = port_field(model, hub_id, port_id);
-            for (i, bind) in port.mqtt_outputs.iter().enumerate() {
+            for (i, bind) in port.mqtt_outputs.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let point_w = (ui.available_width() * 0.28).clamp(72.0, 140.0);
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut bind.point)
+                                .desired_width(point_w)
+                                .hint_text("point"),
+                        )
+                        .changed()
+                    {
+                        change.dirty = true;
+                    }
                     ui.label(
-                        egui::RichText::new(format!("{} → {}", bind.point, bind.topic))
+                        egui::RichText::new("→")
                             .font(font_ui(12.0))
-                            .color(p.text),
+                            .color(p.muted),
                     );
+                    let topic_w = (ui.available_width() - 120.0).max(80.0);
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut bind.topic)
+                                .desired_width(topic_w)
+                                .hint_text("topic"),
+                        )
+                        .changed()
+                    {
+                        change.dirty = true;
+                    }
+                    let mut qos = bind.qos;
+                    egui::ComboBox::from_id_salt(("pb_out_qos", hub_id, port_id, i))
+                        .selected_text(format!("Q{}", qos))
+                        .width(44.0)
+                        .show_ui(ui, |ui| {
+                            for q in [0_u8, 1, 2] {
+                                ui.selectable_value(&mut qos, q, format!("Q{q}"));
+                            }
+                        });
+                    if qos != bind.qos {
+                        bind.qos = qos;
+                        change.dirty = true;
+                    }
+                    if ui.checkbox(&mut bind.retain, "Ret").changed() {
+                        change.dirty = true;
+                    }
                     if text_button(ui, "×", false, p).clicked() {
                         remove = Some(i);
                     }
                 });
+                ui.add_space(2.0);
             }
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("ADD BIND")
+                    .font(font_ui(10.5))
+                    .color(p.muted),
+            );
+            ui.add_space(4.0);
+            // Point: free text + optional pick from live host points.
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [72.0, 20.0],
+                    egui::Label::new(
+                        egui::RichText::new("Point")
+                            .font(font_ui(12.0))
+                            .color(p.muted),
+                    ),
+                );
+                let mut pick = port.draft_mqtt_out_point.clone();
+                egui::ComboBox::from_id_salt(("pb_out_point_pick", hub_id, port_id))
+                    .selected_text(if pick.is_empty() {
+                        "(type or pick)".to_string()
+                    } else {
+                        pick.clone()
+                    })
+                    .width((ui.available_width()).min(220.0).max(120.0))
+                    .show_ui(ui, |ui| {
+                        for name in &point_names {
+                            ui.selectable_value(&mut pick, name.clone(), name);
+                        }
+                    });
+                if pick != port.draft_mqtt_out_point {
+                    port.draft_mqtt_out_point = pick;
+                }
+            });
+            ui.add_space(2.0);
             inspect_field(ui, "Point", &mut port.draft_mqtt_out_point, p);
             inspect_field(ui, "Topic", &mut port.draft_mqtt_out_topic, p);
-            if text_button(ui, "Add bind", false, p).clicked() {
+            if text_button(ui, "Add bind", true, p).clicked() {
                 add = true;
             }
         }
@@ -2771,12 +2855,16 @@ fn edit_mqtt_port_binds(
             let topic = port.draft_mqtt_out_topic.trim().to_string();
             if !point.is_empty() && !topic.is_empty() {
                 let bind = MqttOutputBind {
-                    point,
-                    topic,
+                    point: point.clone(),
+                    topic: topic.clone(),
                     qos: 0,
                     retain: false,
                 };
-                if !port.mqtt_outputs.iter().any(|b| b == &bind) {
+                if !port
+                    .mqtt_outputs
+                    .iter()
+                    .any(|b| b.point == bind.point && b.topic == bind.topic)
+                {
                     port.mqtt_outputs.push(bind);
                 }
                 port.draft_mqtt_out_point.clear();
@@ -2803,7 +2891,12 @@ fn inspect_field(ui: &mut Ui, label: &str, value: &mut String, p: &ThemePalette)
     ui.add_space(2.0);
 }
 
-fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
+fn edit_hub(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    mqtt: &mut MqttPanelState,
+    p: &ThemePalette,
+) -> HubChange {
     let Some(id) = model.selected else {
         ui.label(
             egui::RichText::new("Click a node to see it here.")
@@ -2847,13 +2940,14 @@ fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
     }
     let current = model.hub(id).unwrap().protocol;
     if current == HubProto::Mqtt {
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(
-                "MQTT hub/broker role is not active yet. MQTT ships as a client pack for source/output; embedded broker comes later.",
-            )
-            .font(font_ui(12.0))
-            .color(p.muted),
+        ui.add_space(10.0);
+        // Same project-wide embedded broker as the MQTT panel (single hub broker).
+        let _ = crate::mqtt_panel::edit_embedded_broker(
+            ui,
+            &mut mqtt.embedded,
+            &mut mqtt.draft_broker_user,
+            &mut mqtt.draft_broker_pass,
+            p,
         );
     }
     ui.add_space(8.0);

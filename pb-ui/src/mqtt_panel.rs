@@ -1,10 +1,12 @@
-//! MQTT panel: connections only (broker, client id, optional wide subscribe).
+//! MQTT panel: connections + embedded hub broker config (UI/persist).
 //!
 //! Point promotion lives on hub Input / Output nodes — many Inputs may share
 //! one connection; each node owns its own topic/field → point binds.
+//! Embedded rumqttd start/stop is stubbed until the pack wires it.
 
 use egui::{Color32, Layout, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2};
 use pb_engine::{EngineCommand, EngineHandle, EngineId, HostSnapshot};
+use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;
 
@@ -15,6 +17,48 @@ use crate::topic_tree::{self, TopicTree, TreeMode};
 const SIDE_BY_SIDE_MIN: f32 = 720.0;
 const TRANSPORTS: &[&str] = &["tcp", "tls", "ws", "wss"];
 const LABEL_W: f32 = 100.0;
+
+/// CONNECT auth user stub for the embedded hub broker (rumqttd later).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerUserStub {
+    pub username: String,
+    pub password: String,
+}
+
+fn default_broker_bind() -> String {
+    "0.0.0.0".into()
+}
+
+fn default_broker_listen_port() -> u16 {
+    1883
+}
+
+/// Single-project embedded MQTT broker (LAN listen). No live egress yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddedBrokerConfig {
+    /// When true, UI intends the broker to run (start/stop wired later).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Listen address — LAN default `0.0.0.0`.
+    #[serde(default = "default_broker_bind")]
+    pub bind: String,
+    #[serde(default = "default_broker_listen_port")]
+    pub port: u16,
+    /// CONNECT users; empty = anonymous OK (no topic ACL).
+    #[serde(default)]
+    pub users: Vec<BrokerUserStub>,
+}
+
+impl Default for EmbeddedBrokerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_broker_bind(),
+            port: default_broker_listen_port(),
+            users: Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MqttParseRule {
@@ -81,6 +125,11 @@ pub struct MqttPanelState {
     pub selected: Option<usize>,
     /// Per-connection topic trees from pack traffic (UI-owned).
     pub trees: BTreeMap<String, TopicTree>,
+    /// Project-wide embedded hub broker (single MQTT broker hub).
+    pub embedded: EmbeddedBrokerConfig,
+    /// Draft row for adding a CONNECT user.
+    pub draft_broker_user: String,
+    pub draft_broker_pass: String,
 }
 
 impl Default for MqttPanelState {
@@ -89,6 +138,9 @@ impl Default for MqttPanelState {
             clients: vec![MqttClient::default_local()],
             selected: None,
             trees: BTreeMap::new(),
+            embedded: EmbeddedBrokerConfig::default(),
+            draft_broker_user: String::new(),
+            draft_broker_pass: String::new(),
         }
     }
 }
@@ -318,7 +370,7 @@ fn paint_body(
     let pack_loaded = slot.map(|s| s.pack_loaded).unwrap_or(false);
     ui.label(
         egui::RichText::new(if pack_loaded {
-            "Connections only — broker, client id, optional wide subscribe. Point binds live on hub Input / Output nodes (many Inputs may share one connection)."
+            "Clients = subscribe / Input traffic. Embedded hub broker = LAN listen (config only until rumqttd). Point binds live on hub Input / Output nodes."
         } else {
             "MQTT pack not loaded. Build pb-mqtt into modules/."
         })
@@ -326,6 +378,15 @@ fn paint_body(
         .color(p.muted),
     );
     ui.add_space(8.0);
+
+    edit_embedded_broker(
+        ui,
+        &mut state.embedded,
+        &mut state.draft_broker_user,
+        &mut state.draft_broker_pass,
+        p,
+    );
+    ui.add_space(12.0);
 
     clients_bar(ui, state, engine, hubs, p);
     ui.add_space(10.0);
@@ -596,6 +657,109 @@ fn topic_tree_preview(
         .show(ui, |ui| {
             let _ = topic_tree::paint(ui, tree, client_id, TreeMode::Preview, p);
         });
+}
+
+/// Shared embedded-broker editor (MQTT panel + Hub MQTT props).
+/// Returns true when any field changed (autosave compares `MqttProject`).
+pub fn edit_embedded_broker(
+    ui: &mut egui::Ui,
+    cfg: &mut EmbeddedBrokerConfig,
+    draft_user: &mut String,
+    draft_pass: &mut String,
+    p: &ThemePalette,
+) -> bool {
+    let mut dirty = false;
+    section(ui, "EMBEDDED HUB BROKER", p);
+    ui.label(
+        egui::RichText::new(
+            "Single project broker — LAN listen. rumqttd start/stop not wired yet; settings persist in project.json.",
+        )
+        .font(font_ui(12.0))
+        .color(p.muted),
+    );
+    ui.add_space(6.0);
+    if ui
+        .checkbox(&mut cfg.enabled, "Enabled (start when pack supports it)")
+        .changed()
+    {
+        dirty = true;
+    }
+    ui.add_space(4.0);
+    {
+        let mut bind = cfg.bind.clone();
+        field(ui, "Bind", &mut bind, p);
+        if bind != cfg.bind {
+            cfg.bind = bind;
+            dirty = true;
+        }
+    }
+    {
+        let mut port = cfg.port.to_string();
+        field(ui, "Port", &mut port, p);
+        if let Ok(n) = port.trim().parse::<u16>() {
+            if n != cfg.port {
+                cfg.port = n;
+                dirty = true;
+            }
+        }
+    }
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("CONNECT USERS — empty = anonymous OK (no topic ACL)")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(4.0);
+    let mut remove = None;
+    for (i, user) in cfg.users.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("{}  ·  ••••", user.username))
+                    .font(font_ui(12.0))
+                    .color(p.text),
+            );
+            if text_btn(ui, "×", false, p).clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        cfg.users.remove(i);
+        dirty = true;
+    }
+    field(ui, "Username", draft_user, p);
+    password(ui, "Password", draft_pass, p);
+    if text_btn(ui, "Add user", false, p).clicked() {
+        let u = draft_user.trim().to_string();
+        if !u.is_empty() {
+            if !cfg.users.iter().any(|x| x.username == u) {
+                cfg.users.push(BrokerUserStub {
+                    username: u,
+                    password: draft_pass.clone(),
+                });
+                dirty = true;
+            }
+            draft_user.clear();
+            draft_pass.clear();
+        }
+    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let label = if cfg.enabled {
+            "Start broker (stub)"
+        } else {
+            "Start broker (enable first)"
+        };
+        let r = text_btn(ui, label, cfg.enabled, p);
+        if r.clicked() && cfg.enabled {
+            // Persist intent only — pack start/stop comes later.
+            dirty = true;
+        }
+        r.on_hover_text("rumqttd not wired yet; config is saved for when the pack starts.");
+        let _ = text_btn(ui, "Stop (stub)", false, p)
+            .on_hover_text("No live broker process yet.");
+    });
+    dirty
 }
 
 fn section(ui: &mut egui::Ui, label: &str, p: &ThemePalette) {

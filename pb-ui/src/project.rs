@@ -8,10 +8,13 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::hubs::{HubModel, MqttInputBind, MqttOutputBind};
-use crate::mqtt_panel::{MqttClient, MqttOutput, MqttPanelState, MqttParseRule};
+use crate::mqtt_panel::{
+    EmbeddedBrokerConfig, MqttClient, MqttOutput, MqttPanelState, MqttParseRule,
+};
 use pb_points::{is_address_path, is_short_point_id, PointBinding, PointStore};
 
-pub const PROJECT_VERSION: u32 = 4;
+/// v5: additive `mqtt.embedded` hub broker config (LAN listen stub).
+pub const PROJECT_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectFile {
@@ -82,6 +85,9 @@ pub struct MqttProject {
     /// Selected connection id in the panel (optional).
     #[serde(default)]
     pub selected_id: String,
+    /// Embedded hub broker (single per project). Absent on older files → defaults.
+    #[serde(default)]
+    pub embedded: EmbeddedBrokerConfig,
 }
 
 impl Default for MqttProject {
@@ -90,6 +96,7 @@ impl Default for MqttProject {
         Self {
             selected_id: client.id.clone(),
             clients: vec![client],
+            embedded: EmbeddedBrokerConfig::default(),
         }
     }
 }
@@ -265,6 +272,7 @@ impl MqttProject {
         Self {
             clients,
             selected_id,
+            embedded: state.embedded.clone(),
         }
     }
 
@@ -283,6 +291,7 @@ impl MqttProject {
                 .iter()
                 .position(|c| c.id == self.selected_id)
         };
+        state.embedded = self.embedded.clone();
     }
 }
 
@@ -443,6 +452,7 @@ pub fn load(path: &Path) -> Result<ProjectFile, String> {
             mqtt: MqttProject {
                 selected_id: client.id.clone(),
                 clients: vec![client],
+                embedded: EmbeddedBrokerConfig::default(),
             },
             hubs: None,
         });
@@ -502,6 +512,13 @@ mod tests {
     fn multi_client_roundtrip() {
         let mut panel = MqttPanelState::default();
         panel.clients[0].host = "broker.local".into();
+        panel.embedded.enabled = true;
+        panel.embedded.bind = "0.0.0.0".into();
+        panel.embedded.port = 1884;
+        panel.embedded.users.push(crate::mqtt_panel::BrokerUserStub {
+            username: "ops".into(),
+            password: "secret".into(),
+        });
         let project = ProjectFile {
             version: PROJECT_VERSION,
             points: vec![PointBindingSerde {
@@ -516,6 +533,19 @@ mod tests {
         let back: ProjectFile = serde_json::from_str(&text).unwrap();
         assert_eq!(back.mqtt.clients[0].host, "broker.local");
         assert_eq!(back.points[0].id, "mqtt_1");
+        assert!(back.mqtt.embedded.enabled);
+        assert_eq!(back.mqtt.embedded.port, 1884);
+        assert_eq!(back.mqtt.embedded.users[0].username, "ops");
+    }
+
+    #[test]
+    fn embedded_defaults_on_old_mqtt_json() {
+        let raw = r#"{"version":4,"mqtt":{"clients":[{"id":"local","label":"Local","host":"127.0.0.1","port":1883,"client_id":"pb","transport":"tcp"}],"selected_id":"local"}}"#;
+        let back: ProjectFile = serde_json::from_str(raw).unwrap();
+        assert!(!back.mqtt.embedded.enabled);
+        assert_eq!(back.mqtt.embedded.bind, "0.0.0.0");
+        assert_eq!(back.mqtt.embedded.port, 1883);
+        assert!(back.mqtt.embedded.users.is_empty());
     }
 
     #[test]

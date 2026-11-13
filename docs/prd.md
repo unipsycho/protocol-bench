@@ -70,7 +70,7 @@ Rules:
 - Wide subscribe may be broad; **only hub Input–defined paths become points** (pack traffic still feeds the topic tree).
 - Shared **topic tree** (TopicBench-style): MQTT panel preview + Input inspector. Tree is fed from pack `traffic` snapshot, merged with live point sources so it stays aligned with the Points panel.
 - MQTT Input diagram nodes show bound **point count** on the right of the title. Input inspector has no Hide/Remove — delete via diagram later.
-- Persist in `project.json` v4: `mqtt.clients[]`, `hubs` (binds), `points[]`, `next_point_seq`.
+- Persist in `project.json` v5: `mqtt.clients[]`, `mqtt.embedded` (hub broker listen stub), `hubs` (binds), `points[]`, `next_point_seq`.
 
 ## What runs today, and what does not
 
