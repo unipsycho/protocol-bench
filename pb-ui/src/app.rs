@@ -14,6 +14,7 @@ use crate::dnd::{self, DropCommit, PaneHit};
 use crate::dock::DockPane;
 use crate::layout::{LayoutNode, SplitDir, TabGroup};
 use crate::mqtt_panel::{self, MqttPanelState};
+use crate::panels::PointsPanelState;
 use crate::panels;
 use crate::persist::{self, UiState};
 use crate::project::{self, MqttProject, ProjectFile};
@@ -43,6 +44,7 @@ pub struct ProtocolBenchApp {
     dirty: bool,
     last_save: Instant,
     mqtt: MqttPanelState,
+    points: PointsPanelState,
     /// Current JSON project path (MQTT wire config).
     project_path: PathBuf,
     /// Last MQTT snapshot written to the project file.
@@ -133,6 +135,7 @@ impl ProtocolBenchApp {
             dirty: false,
             last_save: Instant::now(),
             mqtt,
+            points: PointsPanelState::default(),
             project_path,
             mqtt_saved,
             last_project_save: Instant::now(),
@@ -1234,6 +1237,7 @@ impl ProtocolBenchApp {
                 &mut self.ui_state.hubs,
                 &self.engine,
                 &mut self.mqtt,
+                &mut self.points,
             );
             if hub_change.dirty {
                 self.mark_dirty();

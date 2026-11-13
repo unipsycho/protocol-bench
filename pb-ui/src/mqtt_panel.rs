@@ -726,6 +726,7 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
 }
 
 fn client_id_field(ui: &mut egui::Ui, c: &mut MqttClient, p: &ThemePalette) {
+    // Client ID edit + concise Unique checkbox on one row.
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
         ui.add_sized(
@@ -736,7 +737,7 @@ fn client_id_field(ui: &mut egui::Ui, c: &mut MqttClient, p: &ThemePalette) {
                     .color(p.muted),
             ),
         );
-        let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
+        let w = (ui.available_width() - 100.0).clamp(120.0, 280.0);
         let edit = egui::TextEdit::singleline(&mut c.client_id).desired_width(w);
         // Static id kept when Unique is off; disabled while random overrides CONNECT.
         if c.unique_client_id {
@@ -744,22 +745,15 @@ fn client_id_field(ui: &mut egui::Ui, c: &mut MqttClient, p: &ThemePalette) {
         } else {
             ui.add(edit);
         }
-    });
-    ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        ui.add_space(LABEL_W + 10.0);
         ui.checkbox(
             &mut c.unique_client_id,
-            egui::RichText::new("Unique client ID (random on connect)")
-                .font(font_ui(11.5))
+            egui::RichText::new("Unique")
+                .font(font_ui(12.0))
                 .color(p.text),
         )
         .on_hover_text(
-            "Fresh random MQTT client id on each Connect — avoids collisions when multiple sessions share this broker.",
+            "Fresh random MQTT client id on each Connect — avoids collisions across sessions.",
         );
-        if !c.unique_client_id && text_btn(ui, "Randomize", false, p).clicked() {
-            c.client_id = fresh_mqtt_client_id(&c.id);
-        }
     });
     ui.add_space(4.0);
 }

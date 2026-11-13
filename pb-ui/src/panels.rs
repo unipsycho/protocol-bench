@@ -1,14 +1,40 @@
 //! Pane bodies. Tables are empty on purpose: this build does not read or write a link.
 //! MQTT lives in `mqtt_panel` (multi-client Inputs / Outputs).
 
-use egui::{Align2, Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
-use pb_engine::{EngineHandle, HostSnapshot};
+use egui::{Align2, Color32, FontId, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
+use pb_engine::{EngineHandle, HostSnapshot, PointSnapshot};
 
 use crate::art;
 use crate::dock::DockPane;
 use crate::hubs::HubModel;
 use crate::mqtt_panel::{self, MqttPanelState};
 use crate::theme::{font_semi, font_ui, scope, tint, ThemePalette};
+
+/// Points panel filter + sort (session UI state).
+#[derive(Debug, Clone)]
+pub struct PointsPanelState {
+    pub filter: String,
+    pub sort: PointsSort,
+    pub ascending: bool,
+}
+
+impl Default for PointsPanelState {
+    fn default() -> Self {
+        Self {
+            filter: String::new(),
+            sort: PointsSort::Name,
+            ascending: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointsSort {
+    Name,
+    Value,
+    Source,
+    Updated,
+}
 
 /// Fill the pane body for one dock leaf.
 pub fn paint(
@@ -19,6 +45,7 @@ pub fn paint(
     hubs: &mut HubModel,
     engine: &EngineHandle,
     mqtt: &mut MqttPanelState,
+    points: &mut PointsPanelState,
 ) -> crate::hubs::HubChange {
     match pane {
         DockPane::Project => project_panel(ui, hubs, p),
@@ -28,7 +55,7 @@ pub fn paint(
             crate::hubs::HubChange::quiet()
         }
         DockPane::Points => {
-            points_panel(ui, host, p);
+            points_panel(ui, host, p, points);
             crate::hubs::HubChange::quiet()
         }
         _ => {
@@ -38,13 +65,84 @@ pub fn paint(
     }
 }
 
-fn points_panel(ui: &mut egui::Ui, host: &HostSnapshot, p: &ThemePalette) {
+/// Shared column widths for header + every data row.
+#[derive(Clone, Copy)]
+struct PointsCols {
+    row_w: f32,
+    gap: f32,
+    dot: f32,
+    name: f32,
+    value: f32,
+    source: f32,
+    updated: f32,
+}
+
+impl PointsCols {
+    fn from_width(avail: f32) -> Self {
+        const GAP: f32 = 10.0;
+        const DOT: f32 = 12.0;
+        const NAME: f32 = 78.0;
+        const VALUE: f32 = 78.0;
+        const UPDATED: f32 = 110.0;
+        let row_w = avail.max(1.0);
+        let source = (row_w - DOT - NAME - VALUE - UPDATED - GAP * 4.0).max(48.0);
+        Self {
+            row_w,
+            gap: GAP,
+            dot: DOT,
+            name: NAME,
+            value: VALUE,
+            source,
+            updated: UPDATED,
+        }
+    }
+
+    fn cell_rects(&self, row: Rect) -> (Rect, Rect, Rect, Rect, Rect) {
+        let y0 = row.min.y;
+        let y1 = row.max.y;
+        let mut x = row.min.x;
+        let dot = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.dot, y1));
+        x += self.dot + self.gap;
+        let name = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.name, y1));
+        x += self.name + self.gap;
+        let value = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.value, y1));
+        x += self.value + self.gap;
+        let source = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.source, y1));
+        x += self.source + self.gap;
+        let updated = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.updated, y1));
+        (dot, name, value, source, updated)
+    }
+}
+
+fn points_panel(
+    ui: &mut egui::Ui,
+    host: &HostSnapshot,
+    p: &ThemePalette,
+    state: &mut PointsPanelState,
+) {
     ui.label(
         egui::RichText::new("Live values from wired inputs — every protocol lands here.")
             .font(font_ui(12.5))
             .color(p.muted),
     );
     ui.add_space(6.0);
+
+    // Search filters name OR source.
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Search")
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        let w = (ui.available_width() - 8.0).clamp(160.0, 420.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut state.filter)
+                .desired_width(w)
+                .hint_text("name or source…"),
+        );
+    });
+    ui.add_space(6.0);
+
     if host.points.is_empty() {
         ui.label(
             egui::RichText::new("No points yet. Connect an input and subscribe to populate.")
@@ -54,152 +152,241 @@ fn points_panel(ui: &mut egui::Ui, host: &HostSnapshot, p: &ThemePalette) {
         return;
     }
 
-    // Modest gutters; header + rows share one column geometry so labels line up.
-    const NAME_W: f32 = 78.0;
-    const VALUE_W: f32 = 78.0;
-    const UPDATED_W: f32 = 100.0;
-    const DOT_W: f32 = 12.0;
-    const COL_GAP: f32 = 10.0;
-
-    // Precompute Updated strings so the row helper stays borrow-simple.
-    let updated: Vec<String> = host
+    let filter = state.filter.trim().to_ascii_lowercase();
+    let mut rows: Vec<&PointSnapshot> = host
         .points
+        .iter()
+        .filter(|pt| {
+            if filter.is_empty() {
+                return true;
+            }
+            pt.name.to_ascii_lowercase().contains(&filter)
+                || pt.source.to_ascii_lowercase().contains(&filter)
+        })
+        .collect();
+
+    rows.sort_by(|a, b| {
+        let ord = match state.sort {
+            PointsSort::Name => a.name.cmp(&b.name),
+            PointsSort::Value => a.value.cmp(&b.value),
+            PointsSort::Source => a.source.cmp(&b.source),
+            PointsSort::Updated => a.updated_ms.cmp(&b.updated_ms),
+        };
+        if state.ascending {
+            ord
+        } else {
+            ord.reverse()
+        }
+    });
+
+    if rows.is_empty() {
+        ui.label(
+            egui::RichText::new("No points match this search.")
+                .font(font_ui(12.5))
+                .color(p.muted),
+        );
+        return;
+    }
+
+    let updated: Vec<String> = rows
         .iter()
         .map(|pt| format_updated(pt.updated_ms))
         .collect();
+
+    // Compute column table once from the outer width, then lock it for header+rows.
+    let cols = PointsCols::from_width(ui.available_width());
 
     egui::ScrollArea::vertical()
         .id_salt("pb_points_live")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            let row_w = ui.available_width().max(1.0);
-            let source_w = (row_w - DOT_W - NAME_W - VALUE_W - UPDATED_W - COL_GAP * 4.0).max(48.0);
-
-            points_table_row(
-                ui,
-                PointsRow {
-                    quality: None,
-                    name: "NAME",
-                    value: "VALUE",
-                    source: "SOURCE",
-                    source_full: "",
-                    updated: "UPDATED",
-                    header: true,
-                },
-                NAME_W,
-                VALUE_W,
-                source_w,
-                UPDATED_W,
-                DOT_W,
-                COL_GAP,
-                p,
-            );
+            ui.set_min_width(cols.row_w);
+            let header_clicked = paint_points_header(ui, cols, state, p);
+            if let Some(col) = header_clicked {
+                if state.sort == col {
+                    state.ascending = !state.ascending;
+                } else {
+                    state.sort = col;
+                    state.ascending = true;
+                }
+            }
             ui.add_space(2.0);
             ui.separator();
             ui.add_space(1.0);
 
-            for (i, point) in host.points.iter().enumerate() {
-                points_table_row(
-                    ui,
-                    PointsRow {
-                        quality: Some(point.quality.as_str()),
-                        name: point.name.as_str(),
-                        value: point.value.as_str(),
-                        source: point.source.as_str(),
-                        source_full: point.source.as_str(),
-                        updated: updated[i].as_str(),
-                        header: false,
-                    },
-                    NAME_W,
-                    VALUE_W,
-                    source_w,
-                    UPDATED_W,
-                    DOT_W,
-                    COL_GAP,
-                    p,
-                );
+            for (i, point) in rows.iter().enumerate() {
+                paint_points_data_row(ui, cols, point, &updated[i], p);
             }
         });
 }
 
-struct PointsRow<'a> {
-    quality: Option<&'a str>,
-    name: &'a str,
-    value: &'a str,
-    source: &'a str,
-    source_full: &'a str,
-    updated: &'a str,
-    header: bool,
+fn sort_mark(state: &PointsPanelState, col: PointsSort) -> &'static str {
+    if state.sort != col {
+        return "";
+    }
+    if state.ascending {
+        " ▲"
+    } else {
+        " ▼"
+    }
 }
 
-fn points_table_row(
+fn paint_points_header(
     ui: &mut egui::Ui,
-    row: PointsRow<'_>,
-    name_w: f32,
-    value_w: f32,
-    source_w: f32,
-    updated_w: f32,
-    dot_w: f32,
-    gap: f32,
+    cols: PointsCols,
+    state: &PointsPanelState,
+    p: &ThemePalette,
+) -> Option<PointsSort> {
+    let (row, _) = ui.allocate_exact_size(Vec2::new(cols.row_w, 18.0), Sense::hover());
+    let (_dot, name_r, value_r, source_r, updated_r) = cols.cell_rects(row);
+    let font = font_ui(10.5);
+    let mut clicked = None;
+
+    if header_label(
+        ui,
+        name_r,
+        &format!("NAME{}", sort_mark(state, PointsSort::Name)),
+        &font,
+        p,
+        false,
+    )
+    .clicked()
+    {
+        clicked = Some(PointsSort::Name);
+    }
+    if header_label(
+        ui,
+        value_r,
+        &format!("VALUE{}", sort_mark(state, PointsSort::Value)),
+        &font,
+        p,
+        false,
+    )
+    .clicked()
+    {
+        clicked = Some(PointsSort::Value);
+    }
+    if header_label(
+        ui,
+        source_r,
+        &format!("SOURCE{}", sort_mark(state, PointsSort::Source)),
+        &font,
+        p,
+        false,
+    )
+    .clicked()
+    {
+        clicked = Some(PointsSort::Source);
+    }
+    if header_label(
+        ui,
+        updated_r,
+        &format!("UPDATED{}", sort_mark(state, PointsSort::Updated)),
+        &font,
+        p,
+        true,
+    )
+    .clicked()
+    {
+        clicked = Some(PointsSort::Updated);
+    }
+    clicked
+}
+
+fn header_label(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    text: &str,
+    font: &FontId,
+    p: &ThemePalette,
+    right: bool,
+) -> egui::Response {
+    let resp = ui.interact(rect, ui.id().with(text), Sense::click());
+    let align = if right {
+        Align2::RIGHT_CENTER
+    } else {
+        Align2::LEFT_CENTER
+    };
+    let pos = if right {
+        Pos2::new(rect.max.x, rect.center().y)
+    } else {
+        Pos2::new(rect.min.x, rect.center().y)
+    };
+    let color = if resp.hovered() { p.accent } else { p.muted };
+    ui.painter()
+        .text(pos, align, text, font.clone(), color);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn paint_points_data_row(
+    ui: &mut egui::Ui,
+    cols: PointsCols,
+    point: &PointSnapshot,
+    updated: &str,
     p: &ThemePalette,
 ) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        // Same DOT slot for header and data so columns share an origin.
-        let (dot_rect, dot_resp) = ui.allocate_exact_size(Vec2::splat(dot_w), Sense::hover());
-        if let Some(q) = row.quality {
-            let color = match q {
-                "good" => Color32::from_rgb(0x3d, 0xb8, 0x6b),
-                "bad" => Color32::from_rgb(0xe0, 0x55, 0x55),
-                _ => Color32::from_rgb(0xd4, 0xa0, 0x3c),
-            };
-            let r = 3.0;
-            ui.painter().circle_filled(dot_rect.center(), r, color);
-            ui.painter()
-                .circle_stroke(dot_rect.center(), r, Stroke::new(1.0, tint(p.text, 40)));
-            dot_resp.on_hover_text(q);
-        }
+    let (row, _) = ui.allocate_exact_size(Vec2::new(cols.row_w, 18.0), Sense::hover());
+    let (dot_r, name_r, value_r, source_r, updated_r) = cols.cell_rects(row);
 
-        let (name_t, value_t, source_t, updated_t) = if row.header {
-            (
-                egui::RichText::new(row.name).font(font_ui(10.5)).color(p.muted),
-                egui::RichText::new(row.value).font(font_ui(10.5)).color(p.muted),
-                egui::RichText::new(row.source).font(font_ui(10.5)).color(p.muted),
-                egui::RichText::new(row.updated).font(font_ui(10.5)).color(p.muted),
-            )
-        } else {
-            let max_chars = ((source_w / 7.0) as usize).max(6);
-            let shown = truncate_keep_end(row.source, max_chars);
-            (
-                egui::RichText::new(row.name).font(font_ui(12.0)).color(p.text),
-                egui::RichText::new(truncate_chars(row.value, 14))
-                    .font(font_ui(12.0))
-                    .color(p.text),
-                egui::RichText::new(shown).font(font_ui(12.0)).color(p.muted),
-                egui::RichText::new(row.updated)
-                    .font(font_ui(12.0))
-                    .color(p.muted),
-            )
+    // Quality dot in the reserved leading slot.
+    {
+        let color = match point.quality.as_str() {
+            "good" => Color32::from_rgb(0x3d, 0xb8, 0x6b),
+            "bad" => Color32::from_rgb(0xe0, 0x55, 0x55),
+            _ => Color32::from_rgb(0xd4, 0xa0, 0x3c),
         };
+        let r = 3.0;
+        ui.painter().circle_filled(dot_r.center(), r, color);
+        ui.painter()
+            .circle_stroke(dot_r.center(), r, Stroke::new(1.0, tint(p.text, 40)));
+        ui.interact(dot_r, ui.id().with(("q", point.name.as_str())), Sense::hover())
+            .on_hover_text(&point.quality);
+    }
 
-        points_cell(ui, name_t, name_w);
-        points_cell(ui, value_t, value_w);
-        let source_resp = points_cell(ui, source_t, source_w);
-        if !row.header && !row.source_full.is_empty() {
-            source_resp.on_hover_text(row.source_full);
-        }
-        points_cell(ui, updated_t, updated_w);
-    });
+    let font = font_ui(12.0);
+    paint_cell_text(ui, name_r, &point.name, font.clone(), p.text, false);
+    paint_cell_text(
+        ui,
+        value_r,
+        &truncate_chars(&point.value, 14),
+        font.clone(),
+        p.text,
+        false,
+    );
+    let max_chars = ((cols.source / 7.0) as usize).max(6);
+    let shown = truncate_keep_end(&point.source, max_chars);
+    let source_resp = paint_cell_text(ui, source_r, &shown, font.clone(), p.muted, false);
+    source_resp.on_hover_text(&point.source);
+    paint_cell_text(ui, updated_r, updated, font, p.muted, true);
 }
 
-/// Fixed-width cell, always left-justified inside its column.
-fn points_cell(ui: &mut egui::Ui, text: egui::RichText, width: f32) -> egui::Response {
-    ui.allocate_ui_with_layout(
-        Vec2::new(width, 18.0),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| ui.add(egui::Label::new(text).truncate()),
-    )
-    .inner
+fn paint_cell_text(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    right: bool,
+) -> egui::Response {
+    // Clip text to the exact column rect so wrap/overflow cannot shift neighbors.
+    let resp = ui.interact(
+        rect,
+        ui.id().with(("cell", rect.min.x.to_bits(), rect.min.y.to_bits(), text)),
+        Sense::hover(),
+    );
+    let painter = ui.painter().with_clip_rect(rect);
+    let align = if right {
+        Align2::RIGHT_CENTER
+    } else {
+        Align2::LEFT_CENTER
+    };
+    let pos = if right {
+        Pos2::new(rect.max.x, rect.center().y)
+    } else {
+        Pos2::new(rect.min.x, rect.center().y)
+    };
+    painter.text(pos, align, text, font, color);
+    resp
 }
 
 /// Ellipsis at the start so the end of a long path stays visible.
