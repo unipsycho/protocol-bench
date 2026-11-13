@@ -2473,12 +2473,9 @@ fn edit_port(
             p,
         ));
     }
-    ui.add_space(10.0);
-    if text_button(ui, &format!("Open {} panel", proto.label()), true, p).clicked() {
-        change.open = Some(proto.pane());
-    }
     // MQTT Input: no Hub details / Remove — delete via diagram select/Delete or right-click.
     if !(proto == HubProto::Mqtt && incoming) {
+        ui.add_space(10.0);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if text_button(ui, "Hub details", false, p).clicked() {
