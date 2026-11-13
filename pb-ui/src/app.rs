@@ -107,6 +107,8 @@ impl ProtocolBenchApp {
                     file.mqtt.apply_to_panel(&mut mqtt);
                     if let Some(hubs) = file.hubs {
                         ui_state.hubs = hubs;
+                        // Rebuild ephemeral canvas selection from persisted selected/port.
+                        ui_state.hubs.sanitize();
                     }
                     if let Ok(mut store) = engine.points().lock() {
                         project::import_bindings_to_store(
@@ -220,6 +222,7 @@ impl ProtocolBenchApp {
         file.mqtt.apply_to_panel(&mut self.mqtt);
         if let Some(hubs) = file.hubs {
             self.ui_state.hubs = hubs;
+            self.ui_state.hubs.sanitize();
         }
         if let Ok(mut store) = self.engine.points().lock() {
             project::import_bindings_to_store(&mut store, &file.points, file.next_point_seq);

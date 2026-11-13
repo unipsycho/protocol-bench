@@ -423,6 +423,12 @@ impl HubModel {
 
     /// Drop a port, step, link, or multi-select entry that no longer exists.
     fn keep_focus(&mut self) {
+        // `selection` is ephemeral (serde skip); restore from persisted selected/port on load.
+        if self.selection.is_empty() {
+            if let Some(hub_id) = self.selected {
+                self.selection = vec![(hub_id, self.selected_port)];
+            }
+        }
         let keys = self.selection.clone();
         self.selection = keys
             .into_iter()
