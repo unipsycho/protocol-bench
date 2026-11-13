@@ -1,5 +1,7 @@
 //! Live broker smoke: connect, subscribe → host upsert, publish.
 //! Skips when `PB_SMOKE_SKIP=1` or no broker is reachable.
+//!
+//! Auth (this host): `PB_SMOKE_USER` / `PB_SMOKE_PASS` (default `mqtt`/`mqtt`).
 
 use pb_abi::{PbHostApi, PbPackApi, PB_ABI_VERSION, PB_VALUE_STRING};
 use pb_mqtt::{pb_pack_abi_version, pb_pack_register};
@@ -53,11 +55,10 @@ fn broker_reachable(host: &str, port: u16) -> bool {
     .is_ok()
 }
 
-#[test]
-fn subscribe_point_and_publish() {
+fn smoke_env() -> Option<(String, u16, String, String)> {
     if std::env::var_os("PB_SMOKE_SKIP").is_some() {
         eprintln!("PB_SMOKE_SKIP set — skipping live MQTT smoke");
-        return;
+        return None;
     }
     let host = std::env::var("PB_SMOKE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = std::env::var("PB_SMOKE_PORT")
@@ -66,71 +67,96 @@ fn subscribe_point_and_publish() {
         .unwrap_or(1883);
     if !broker_reachable(&host, port) {
         eprintln!("no broker at {host}:{port} — skipping live MQTT smoke");
-        return;
+        return None;
     }
+    let user = std::env::var("PB_SMOKE_USER").unwrap_or_else(|_| "mqtt".into());
+    let pass = std::env::var("PB_SMOKE_PASS").unwrap_or_else(|_| "mqtt".into());
+    Some((host, port, user, pass))
+}
 
+fn open_pack(captured: &Arc<Mutex<Captured>>) -> (*mut c_void, PbPackApi) {
     assert_eq!(unsafe { pb_pack_abi_version() }, PB_ABI_VERSION);
-
-    let captured = Arc::new(Mutex::new(Captured { points: Vec::new() }));
     let host_api = PbHostApi {
         abi_version: PB_ABI_VERSION,
-        ctx: Arc::as_ptr(&captured) as *mut c_void,
+        ctx: Arc::as_ptr(captured) as *mut c_void,
         upsert_point: Some(upsert),
         log_message: Some(log_message),
     };
-
     let mut api = unsafe { std::mem::zeroed::<PbPackApi>() };
     assert_eq!(unsafe { pb_pack_register(&mut api) }, 0);
     let create = api.create.expect("create");
     let handle = unsafe { create(&host_api) };
     assert!(!handle.is_null());
+    (handle, api)
+}
 
-    let topic = "pb/smoke/in";
-    // Whole-payload Input bind (empty path) — subscribe alone does not create points.
-    let cfg = format!(
-        r#"{{"clients":[{{"id":"smoke","label":"smoke","host":"{host}","port":{port},"client_id":"pb-smoke","transport":"tcp","subscriptions":["{topic}"],"parse_rules":[{{"topic":"{topic}","path":"","point":""}}],"outputs":[{{"point":"mqtt_1","topic":"pb/smoke/write","qos":0,"retain":false}}],"auto_connect":true}}]}}"#
-    );
-    let configure = api.configure.expect("configure");
-    assert_eq!(unsafe { configure(handle, cfg.as_ptr() as *const c_char, cfg.len()) }, 0);
-
-    // Wait for ConnAck + resubscribe path.
+fn wait_connected(api: &PbPackApi, handle: *mut c_void, secs: u64) {
     let poll = api.poll.expect("poll");
     let is_connected = api.is_connected.expect("is_connected");
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
     while std::time::Instant::now() < deadline {
         unsafe { poll(handle) };
         if unsafe { is_connected(handle) } != 0 {
-            break;
+            return;
         }
         thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(unsafe { is_connected(handle) }, 1, "failed to connect to {host}:{port}");
+    assert_eq!(
+        unsafe { is_connected(handle) },
+        1,
+        "failed to connect within {secs}s"
+    );
+}
 
-    // External publish into the subscribed topic.
+fn mosquitto_pub(host: &str, port: u16, user: &str, pass: &str, topic: &str, msg: &str) {
     let status = std::process::Command::new("mosquitto_pub")
         .args([
             "-h",
-            &host,
+            host,
             "-p",
             &port.to_string(),
+            "-u",
+            user,
+            "-P",
+            pass,
             "-t",
             topic,
             "-m",
-            "smoke-payload",
+            msg,
         ])
         .status()
         .expect("mosquitto_pub");
-    assert!(status.success());
+    assert!(status.success(), "mosquitto_pub failed for {topic}");
+}
 
-    let got = deadline_points(&captured, poll, handle, "smoke-payload", deadline);
-    // Pack upserts the long address; the real host remaps to `mqtt_xxxx`.
+#[test]
+fn subscribe_point_and_publish() {
+    let Some((host, port, user, pass)) = smoke_env() else {
+        return;
+    };
+    let captured = Arc::new(Mutex::new(Captured { points: Vec::new() }));
+    let (handle, api) = open_pack(&captured);
+
+    let topic = "pb/smoke/in";
+    let cfg = format!(
+        r#"{{"clients":[{{"id":"smoke","label":"smoke","host":"{host}","port":{port},"client_id":"pb-smoke","username":"{user}","password":"{pass}","transport":"tcp","subscriptions":["{topic}"],"parse_rules":[{{"topic":"{topic}","path":"","point":""}}],"outputs":[{{"point":"mqtt_1","topic":"pb/smoke/write","qos":0,"retain":false}}],"auto_connect":true}}]}}"#
+    );
+    let configure = api.configure.expect("configure");
+    assert_eq!(
+        unsafe { configure(handle, cfg.as_ptr() as *const c_char, cfg.len()) },
+        0
+    );
+    wait_connected(&api, handle, 8);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    mosquitto_pub(&host, port, &user, &pass, topic, "smoke-payload");
+    let got = deadline_points(&captured, api.poll.expect("poll"), handle, "smoke-payload", deadline);
     assert!(
         got.iter()
             .any(|(n, v)| n.contains(topic) && v == "smoke-payload"),
         "subscribe did not upsert point: {got:?}"
     );
 
-    // Publish from the pack.
     let publish = api.publish.expect("publish");
     let out_topic = std::ffi::CString::new("pb/smoke/out").unwrap();
     let payload = b"from-pack";
@@ -148,7 +174,6 @@ fn subscribe_point_and_publish() {
         0
     );
 
-    // Point write → publish path (short id bound in outputs).
     let write_point = api.write_point.expect("write_point");
     let point_name = std::ffi::CString::new("mqtt_1").unwrap();
     let body = b"via-point";
@@ -165,10 +190,89 @@ fn subscribe_point_and_publish() {
         0
     );
 
-    let disconnect = api.disconnect.expect("disconnect");
-    assert_eq!(unsafe { disconnect(handle) }, 0);
-    let destroy = api.destroy.expect("destroy");
-    unsafe { destroy(handle) };
+    assert_eq!(unsafe { api.disconnect.expect("disconnect")(handle) }, 0);
+    unsafe { api.destroy.expect("destroy")(handle) };
+}
+
+/// `#` and `+` filters must connect, stay subscribed, and promote matching traffic.
+#[test]
+fn wildcard_hash_and_plus_subscribe() {
+    let Some((host, port, user, pass)) = smoke_env() else {
+        return;
+    };
+    let captured = Arc::new(Mutex::new(Captured { points: Vec::new() }));
+    let (handle, api) = open_pack(&captured);
+
+    let cfg = format!(
+        r#"{{"clients":[{{"id":"wc","label":"wc","host":"{host}","port":{port},"client_id":"pb-wc","username":"{user}","password":"{pass}","transport":"tcp","subscriptions":["pb/wc/#","pb/plus/+/x"],"parse_rules":[{{"topic":"pb/wc/#","path":"","point":""}},{{"topic":"pb/plus/+/x","path":"","point":""}}],"auto_connect":true}}]}}"#
+    );
+    let configure = api.configure.expect("configure");
+    assert_eq!(
+        unsafe { configure(handle, cfg.as_ptr() as *const c_char, cfg.len()) },
+        0,
+        "configure with # / + filters failed"
+    );
+    wait_connected(&api, handle, 8);
+
+    // Stay connected after wildcard sync.
+    thread::sleep(Duration::from_millis(200));
+    unsafe { api.poll.expect("poll")(handle) };
+    assert_eq!(
+        unsafe { api.is_connected.expect("is_connected")(handle) },
+        1,
+        "connection dropped after wildcard subscribe"
+    );
+
+    // Snapshot must remain valid JSON with subscriptions intact (not truncated).
+    let topics_json = api.topics_json.expect("topics_json");
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = unsafe {
+        topics_json(
+            handle,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len(),
+        )
+    };
+    assert!(n > 0, "topics_json empty");
+    let snap = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&snap).expect(&format!("topics_json invalid: {snap}"));
+    let subs = parsed[0]["topics"].as_array().expect("topics array");
+    let sub_strs: Vec<&str> = subs.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        sub_strs.iter().any(|s| *s == "pb/wc/#"),
+        "missing # filter in snapshot: {sub_strs:?}"
+    );
+    assert!(
+        sub_strs.iter().any(|s| *s == "pb/plus/+/x"),
+        "missing + filter in snapshot: {sub_strs:?}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    mosquitto_pub(&host, port, &user, &pass, "pb/wc/deep/leaf", "hash-hit");
+    mosquitto_pub(&host, port, &user, &pass, "pb/plus/mid/x", "plus-hit");
+
+    let got = deadline_points(&captured, api.poll.expect("poll"), handle, "hash-hit", deadline);
+    assert!(
+        got.iter().any(|(n, v)| n.contains("pb/wc/deep/leaf") && v == "hash-hit"),
+        "# filter did not promote: {got:?}"
+    );
+    let got2 = deadline_points(
+        &captured,
+        api.poll.expect("poll"),
+        handle,
+        "plus-hit",
+        std::time::Instant::now() + Duration::from_secs(4),
+    );
+    assert!(
+        got2
+            .iter()
+            .any(|(n, v)| n.contains("pb/plus/mid/x") && v == "plus-hit"),
+        "+ filter did not promote: {got2:?}"
+    );
+
+    assert_eq!(unsafe { api.disconnect.expect("disconnect")(handle) }, 0);
+    unsafe { api.destroy.expect("destroy")(handle) };
 }
 
 fn deadline_points(

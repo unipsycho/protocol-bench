@@ -175,6 +175,12 @@ mod tests {
     fn topic_filter_wildcards() {
         assert!(topic_matches("a/+/c", "a/b/c"));
         assert!(topic_matches("a/#", "a/b/c"));
+        assert!(topic_matches("#", "any/topic"));
+        assert!(topic_matches("+", "one"));
+        assert!(!topic_matches("+", "one/two"));
+        assert!(topic_matches("pb/plus/+/x", "pb/plus/mid/x"));
+        assert!(!topic_matches("pb/plus/+/x", "pb/plus/mid/y"));
+        assert!(topic_matches("pb/wc/#", "pb/wc/deep/leaf"));
     }
 
     #[test]

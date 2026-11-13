@@ -315,13 +315,21 @@ impl PackState {
         Ok(())
     }
 
-    fn sync_subscriptions(rt: &mut ClientRuntime) {
+    fn sync_subscriptions(rt: &mut ClientRuntime) -> Result<(), String> {
         let Some(session) = rt.session.as_ref() else {
-            return;
+            return Ok(());
         };
+        // MQTT filters may include `+` / `#` (single- / multi-level wildcards).
         for topic in &rt.config.subscriptions {
-            let _ = session.subscribe(topic, 0);
+            let t = topic.trim();
+            if t.is_empty() {
+                continue;
+            }
+            session
+                .subscribe(t, 0)
+                .map_err(|e| format!("subscribe '{t}': {e}"))?;
         }
+        Ok(())
     }
 
     fn handle_client_event(&mut self, id: &str, ev: SessionEvent) {
@@ -341,7 +349,11 @@ impl PackState {
                 if connected {
                     rt.quality_bad = false;
                     rt.last_error.clear();
-                    Self::sync_subscriptions(rt);
+                    if let Err(e) = Self::sync_subscriptions(rt) {
+                        rt.last_error = e.clone();
+                        rt.quality_bad = true;
+                        self.log(PB_LOG_ERROR, &format!("[{id}] {e}"));
+                    }
                 } else if !detail.is_empty()
                     && !detail.to_ascii_lowercase().contains("connecting")
                     && !detail.to_ascii_lowercase().contains("disconnected by user")
@@ -523,8 +535,10 @@ impl PackState {
                         rt.quality_bad = true;
                         self.log(PB_LOG_ERROR, &format!("[{id}] {e}"));
                     }
-                } else {
-                    Self::sync_subscriptions(rt);
+                } else if let Err(e) = Self::sync_subscriptions(rt) {
+                    rt.last_error = e.clone();
+                    rt.quality_bad = true;
+                    self.log(PB_LOG_ERROR, &format!("[{id}] {e}"));
                 }
             } else if rt.session.is_some() {
                 Self::stop_client(rt);
@@ -639,13 +653,15 @@ impl PackState {
             .clients
             .values()
             .map(|rt| {
+                // Cap snapshot traffic so host buffer growth stays bounded under `#`.
                 let traffic: Vec<Value> = rt
                     .traffic
                     .iter()
+                    .take(400)
                     .map(|(topic, leaf)| {
                         serde_json::json!({
                             "topic": topic,
-                            "payload": truncate_preview(&leaf.payload, 256),
+                            "payload": truncate_preview(&leaf.payload, 96),
                             "count": leaf.count,
                         })
                     })

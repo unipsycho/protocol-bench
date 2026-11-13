@@ -232,14 +232,17 @@ fn truncate(value: &str, max: usize) -> String {
 }
 
 /// Parse pack `detail_json` clients array into per-connection traffic rows.
-pub fn traffic_from_detail(detail_json: &str) -> BTreeMap<String, Vec<(String, String, u64)>> {
+/// Returns `None` when JSON is truncated/invalid (caller keeps prior trees).
+pub fn traffic_from_detail_ok(
+    detail_json: &str,
+) -> Option<BTreeMap<String, Vec<(String, String, u64)>>> {
+    let t = detail_json.trim();
+    if t.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(t).ok()?;
+    let arr = value.as_array()?;
     let mut out = BTreeMap::new();
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(detail_json) else {
-        return out;
-    };
-    let Some(arr) = value.as_array() else {
-        return out;
-    };
     for client in arr {
         let id = client
             .get("id")
@@ -271,7 +274,7 @@ pub fn traffic_from_detail(detail_json: &str) -> BTreeMap<String, Vec<(String, S
         }
         out.insert(id, rows);
     }
-    out
+    Some(out)
 }
 
 #[allow(dead_code)]

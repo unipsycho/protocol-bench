@@ -47,6 +47,7 @@ Editable wire config (not dock layout). Default path: `…/ProtocolBench/project
 
 - **MQTT panel** = connections (broker, client id, optional wide subscribe).
 - **Hub Input/Output nodes** = point promotion. Many Inputs may share one connection; each owns its own binds (overlap OK). Input binds always auto-assign sequential `mqtt_N` (no manual point id). Click topics in the shared topic tree (pack `traffic` snapshot) to bind; MQTT Input nodes show bind count on the diagram.
+- MQTT subscription filters support wildcards (`+`, `#`) end-to-end. Pack `topics_json` snapshots grow past 512 bytes when `#` floods traffic; the host reads with a growing buffer so the topic tree does not clear.
 - **`hubs`** in `project.json` holds the diagram + MQTT binds (v4+). Older files without `hubs` keep the diagram from `ui.toml` until the next save.
 
 ```json

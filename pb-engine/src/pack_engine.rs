@@ -68,13 +68,23 @@ impl PackEngine {
         let Some(f) = f else {
             return String::new();
         };
-        let mut buf = vec![0u8; 512];
-        let n = unsafe { f(self.handle, buf.as_mut_ptr() as *mut c_char, buf.len()) };
-        if n < 0 {
-            return String::new();
+        // Grow until the pack fits (wildcard `#` traffic snapshots exceed 512).
+        // write_cstr truncates to buf_len-1; n == capacity-1 means "maybe truncated".
+        let mut size = 4 * 1024;
+        loop {
+            let mut buf = vec![0u8; size];
+            let n = unsafe { f(self.handle, buf.as_mut_ptr() as *mut c_char, buf.len()) };
+            if n < 0 {
+                return String::new();
+            }
+            let end = (n as usize).min(buf.len().saturating_sub(1));
+            let truncated = end >= size.saturating_sub(1);
+            if truncated && size < 1024 * 1024 {
+                size *= 2;
+                continue;
+            }
+            return String::from_utf8_lossy(&buf[..end]).into_owned();
         }
-        let end = (n as usize).min(buf.len().saturating_sub(1));
-        String::from_utf8_lossy(&buf[..end]).into_owned()
     }
 }
 

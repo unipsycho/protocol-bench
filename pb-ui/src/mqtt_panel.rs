@@ -122,13 +122,19 @@ impl MqttPanelState {
             .slot(EngineId::Mqtt)
             .map(|s| s.detail_json.as_str())
             .unwrap_or("[]");
-        let by_client = topic_tree::traffic_from_detail(detail);
+        // Truncated / invalid JSON must not wipe an existing tree (wildcard flood).
+        let Some(by_client) = topic_tree::traffic_from_detail_ok(detail) else {
+            return;
+        };
         let known: std::collections::BTreeSet<_> =
             self.clients.iter().map(|c| c.id.clone()).collect();
         self.trees.retain(|id, _| known.contains(id));
         for c in &self.clients {
             let rows = by_client.get(&c.id).cloned().unwrap_or_default();
-            self.trees.entry(c.id.clone()).or_default().sync_from_traffic(&rows);
+            self.trees
+                .entry(c.id.clone())
+                .or_default()
+                .sync_from_traffic(&rows);
         }
     }
 
