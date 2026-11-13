@@ -9,8 +9,11 @@ use egui::{
 };
 use serde::Deserialize;
 
+use pb_engine::HostSnapshot;
+
 use crate::dock::DockPane;
 use crate::mqtt_panel::MqttPanelState;
+use crate::point_rows::{self, IdSourceCols, PointRowRef};
 use crate::theme::{blend_scope, divider_bar, font_semi, font_ui, tint, ThemePalette, SEP};
 use crate::topic_tree::{self, TopicTree, TreeMode};
 
@@ -1224,6 +1227,7 @@ pub fn paint(
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
     mqtt: &MqttPanelState,
+    host: &HostSnapshot,
 ) -> HubChange {
     let mut change = HubChange::quiet();
     // The dock column zeros item spacing, and that style is inherited here.
@@ -1288,6 +1292,7 @@ pub fn paint(
                 p,
                 mqtt_connections,
                 mqtt,
+                host,
             ));
         });
     } else {
@@ -1302,6 +1307,7 @@ pub fn paint(
             p,
             mqtt_connections,
             mqtt,
+            host,
         ));
     }
     change
@@ -2223,6 +2229,7 @@ fn inspector(
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
     mqtt: &MqttPanelState,
+    host: &HostSnapshot,
 ) -> HubChange {
     let (rect, _) = ui.allocate_exact_size(vec2(width.max(1.0), height.max(1.0)), Sense::hover());
     ui.painter()
@@ -2245,7 +2252,7 @@ fn inspector(
             // Overlay scrollbar sits on the right; keep Add / × / row edges clear of it.
             let width = (ui.available_width() - INSPECT_SCROLL_GUTTER).max(1.0);
             ui.set_width(width);
-            change = change.join(edit_selected(ui, model, p, mqtt_connections, mqtt));
+            change = change.join(edit_selected(ui, model, p, mqtt_connections, mqtt, host));
         });
     change
 }
@@ -2256,6 +2263,7 @@ fn edit_selected(
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
     mqtt: &MqttPanelState,
+    host: &HostSnapshot,
 ) -> HubChange {
     // Item-specific properties only when exactly one canvas node is selected.
     if model.multi_selected() {
@@ -2290,7 +2298,7 @@ fn edit_selected(
         {
             return edit_step(ui, model, p);
         }
-        return edit_port(ui, model, p, mqtt_connections, mqtt);
+        return edit_port(ui, model, p, mqtt_connections, mqtt, host);
     }
     edit_hub(ui, model, p)
 }
@@ -2366,6 +2374,7 @@ fn edit_port(
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
     mqtt: &MqttPanelState,
+    host: &HostSnapshot,
 ) -> HubChange {
     let Some(hub_id) = model.selected else {
         return HubChange::quiet();
@@ -2452,6 +2461,7 @@ fn edit_port(
             incoming,
             mqtt_connections,
             mqtt,
+            host,
             p,
         ));
     }
@@ -2484,6 +2494,7 @@ fn edit_mqtt_port_binds(
     incoming: bool,
     mqtt_connections: &[(String, String)],
     mqtt: &MqttPanelState,
+    host: &HostSnapshot,
     p: &ThemePalette,
 ) -> HubChange {
     let mut change = HubChange::quiet();
@@ -2521,7 +2532,7 @@ fn edit_mqtt_port_binds(
     if incoming {
         ui.add_space(10.0);
         ui.label(
-            egui::RichText::new("INPUT BINDS — topic → auto mqtt_N")
+            egui::RichText::new("INPUT BINDS — point id · source (this node)")
                 .font(font_ui(10.5))
                 .color(p.muted),
         );
@@ -2532,24 +2543,37 @@ fn edit_mqtt_port_binds(
         let conn = port_field(model, hub_id, port_id)
             .mqtt_connection
             .clone();
+        // Full-width rows: short id left, wire source right (shared with Points).
         {
             let port = port_field(model, hub_id, port_id);
+            let cols = IdSourceCols::from_width(ui.available_width(), true);
+            // Own source strings for the row lifetime (resolve returns &str into these).
+            let sources: Vec<String> = port
+                .mqtt_inputs
+                .iter()
+                .map(|b| point_rows::mqtt_bind_source(&conn, &b.topic, &b.path))
+                .collect();
             for (i, bind) in port.mqtt_inputs.iter().enumerate() {
-                let label = if bind.path.is_empty() {
-                    format!("{} → mqtt_N", bind.topic)
-                } else {
-                    format!("{}::{} → mqtt_N", bind.topic, bind.path)
-                };
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(label)
-                            .font(font_ui(12.0))
-                            .color(p.text),
-                    );
-                    if text_button(ui, "×", false, p).clicked() {
-                        remove = Some(i);
-                    }
-                });
+                let (id, source) = point_rows::resolve_input_bind_row(
+                    &bind.point,
+                    &sources[i],
+                    &host.points,
+                );
+                let action = point_rows::paint_id_source_row(
+                    ui,
+                    cols,
+                    PointRowRef {
+                        id: id.as_str(),
+                        source,
+                        value: None,
+                        quality: None,
+                        updated: None,
+                    },
+                    p,
+                );
+                if action.remove_clicked {
+                    remove = Some(i);
+                }
             }
         }
         ui.add_space(6.0);

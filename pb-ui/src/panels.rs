@@ -8,6 +8,7 @@ use crate::art;
 use crate::dock::DockPane;
 use crate::hubs::HubModel;
 use crate::mqtt_panel::{self, MqttPanelState};
+use crate::point_rows::{self, PointRowRef, PointsCols};
 use crate::theme::{font_semi, font_ui, scope, tint, ThemePalette};
 
 /// Points panel filter + sort (session UI state).
@@ -53,7 +54,7 @@ pub fn paint(
             // Sync trees so Input inspector can pick topics from live traffic.
             mqtt.sync_trees_from_host(host);
             let conns = mqtt.connection_choices();
-            crate::hubs::paint(ui, hubs, p, &conns, mqtt)
+            crate::hubs::paint(ui, hubs, p, &conns, mqtt, host)
         }
         DockPane::Mqtt => {
             mqtt_panel::paint(ui, host, p, engine, mqtt, hubs);
@@ -67,55 +68,6 @@ pub fn paint(
             scaffold_panel(ui, pane, host, p);
             crate::hubs::HubChange::quiet()
         }
-    }
-}
-
-/// Shared column widths for header + every data row.
-#[derive(Clone, Copy)]
-struct PointsCols {
-    row_w: f32,
-    gap: f32,
-    dot: f32,
-    name: f32,
-    value: f32,
-    source: f32,
-    updated: f32,
-}
-
-impl PointsCols {
-    fn from_width(avail: f32) -> Self {
-        const GAP: f32 = 5.0;
-        const DOT: f32 = 12.0;
-        const NAME: f32 = 78.0;
-        const VALUE: f32 = 78.0;
-        const UPDATED: f32 = 110.0;
-        let row_w = avail.max(1.0);
-        let source = (row_w - DOT - NAME - VALUE - UPDATED - GAP * 4.0).max(48.0);
-        Self {
-            row_w,
-            gap: GAP,
-            dot: DOT,
-            name: NAME,
-            value: VALUE,
-            source,
-            updated: UPDATED,
-        }
-    }
-
-    fn cell_rects(&self, row: Rect) -> (Rect, Rect, Rect, Rect, Rect) {
-        let y0 = row.min.y;
-        let y1 = row.max.y;
-        let mut x = row.min.x;
-        let dot = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.dot, y1));
-        x += self.dot + self.gap;
-        let name = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.name, y1));
-        x += self.name + self.gap;
-        let value = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.value, y1));
-        x += self.value + self.gap;
-        let source = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.source, y1));
-        x += self.source + self.gap;
-        let updated = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.updated, y1));
-        (dot, name, value, source, updated)
     }
 }
 
@@ -248,7 +200,12 @@ fn points_panel_body(
             ui.add_space(1.0);
 
             for (i, point) in rows.iter().enumerate() {
-                paint_points_data_row(ui, cols, point, &updated[i], p);
+                point_rows::paint_full_row(
+                    ui,
+                    cols,
+                    PointRowRef::from_snapshot(point, &updated[i]),
+                    p,
+                );
             }
         });
 }
@@ -349,100 +306,6 @@ fn header_label(
     ui.painter()
         .text(pos, align, text, font.clone(), color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-fn paint_points_data_row(
-    ui: &mut egui::Ui,
-    cols: PointsCols,
-    point: &PointSnapshot,
-    updated: &str,
-    p: &ThemePalette,
-) {
-    let (row, _) = ui.allocate_exact_size(Vec2::new(cols.row_w, 18.0), Sense::hover());
-    let (dot_r, name_r, value_r, source_r, updated_r) = cols.cell_rects(row);
-
-    // Quality dot in the reserved leading slot.
-    {
-        let color = match point.quality.as_str() {
-            "good" => Color32::from_rgb(0x3d, 0xb8, 0x6b),
-            "bad" => Color32::from_rgb(0xe0, 0x55, 0x55),
-            _ => Color32::from_rgb(0xd4, 0xa0, 0x3c),
-        };
-        let r = 3.0;
-        ui.painter().circle_filled(dot_r.center(), r, color);
-        ui.painter()
-            .circle_stroke(dot_r.center(), r, Stroke::new(1.0, tint(p.text, 40)));
-        ui.interact(dot_r, ui.id().with(("q", point.name.as_str())), Sense::hover())
-            .on_hover_text(&point.quality);
-    }
-
-    let font = font_ui(12.0);
-    paint_cell_text(ui, name_r, &point.name, font.clone(), p.text, false);
-    paint_cell_text(
-        ui,
-        value_r,
-        &truncate_chars(&point.value, 14),
-        font.clone(),
-        p.text,
-        false,
-    );
-    let max_chars = ((cols.source / 7.0) as usize).max(6);
-    let shown = truncate_keep_end(&point.source, max_chars);
-    let source_resp = paint_cell_text(ui, source_r, &shown, font.clone(), p.muted, false);
-    source_resp.on_hover_text(&point.source);
-    paint_cell_text(ui, updated_r, updated, font, p.muted, true);
-}
-
-fn paint_cell_text(
-    ui: &mut egui::Ui,
-    rect: Rect,
-    text: &str,
-    font: FontId,
-    color: Color32,
-    right: bool,
-) -> egui::Response {
-    // Clip text to the exact column rect so wrap/overflow cannot shift neighbors.
-    let resp = ui.interact(
-        rect,
-        ui.id().with(("cell", rect.min.x.to_bits(), rect.min.y.to_bits(), text)),
-        Sense::hover(),
-    );
-    let painter = ui.painter().with_clip_rect(rect);
-    let align = if right {
-        Align2::RIGHT_CENTER
-    } else {
-        Align2::LEFT_CENTER
-    };
-    let pos = if right {
-        Pos2::new(rect.max.x, rect.center().y)
-    } else {
-        Pos2::new(rect.min.x, rect.center().y)
-    };
-    painter.text(pos, align, text, font, color);
-    resp
-}
-
-/// Ellipsis at the start so the end of a long path stays visible.
-fn truncate_keep_end(value: &str, max_chars: usize) -> String {
-    let flat = value.replace('\n', " ");
-    let count = flat.chars().count();
-    if count <= max_chars {
-        return flat;
-    }
-    let keep = max_chars.saturating_sub(1);
-    let end: String = flat.chars().skip(count.saturating_sub(keep)).collect();
-    format!("…{end}")
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    let flat = value.replace('\n', " ");
-    if flat.chars().count() <= max_chars {
-        flat
-    } else {
-        let mut out: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
 }
 
 fn format_updated(updated_ms: u64) -> String {

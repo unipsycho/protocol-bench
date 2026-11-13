@@ -12,6 +12,7 @@ mod layout;
 mod mqtt_panel;
 mod panels;
 mod persist;
+mod point_rows;
 mod project;
 mod theme;
 mod topic_tree;
