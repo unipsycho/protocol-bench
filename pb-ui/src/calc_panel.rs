@@ -350,42 +350,36 @@ fn catalog_card(ui: &mut egui::Ui, kind: &CalcKind, active: bool, p: &ThemePalet
         .clicked()
 }
 
-fn point_picker(
+fn source_point_picker(
     ui: &mut egui::Ui,
-    label: &str,
     value: &mut String,
     point_names: &[String],
-    salt: (&str, u64),
+    step_id: u64,
     p: &ThemePalette,
 ) -> bool {
     let mut dirty = false;
-    ui.label(RichText::new(label).font(font_ui(10.5)).color(p.muted));
+    ui.label(RichText::new("SOURCE POINT").font(font_ui(10.5)).color(p.muted));
     ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        let mut pick = value.clone();
-        egui::ComboBox::from_id_salt(salt)
-            .selected_text(if pick.is_empty() {
-                "(type or pick)".to_string()
-            } else {
-                pick.clone()
-            })
-            .width(ui.available_width().min(220.0).max(120.0))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut pick, String::new(), "(none)");
-                for name in point_names {
-                    ui.selectable_value(&mut pick, name.clone(), name);
-                }
-            });
-        if pick != *value {
-            *value = pick;
-            dirty = true;
-        }
-    });
-    ui.add_space(2.0);
-    if ui
-        .add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY))
-        .changed()
-    {
+    let mut pick = value.clone();
+    // Keep a stale selection visible until the operator picks again.
+    let label = if pick.is_empty() {
+        "(pick a point)".to_string()
+    } else if point_names.iter().any(|n| n == &pick) {
+        pick.clone()
+    } else {
+        format!("{pick} (missing)")
+    };
+    egui::ComboBox::from_id_salt(("pb_calc_src_point", step_id))
+        .selected_text(label)
+        .width(ui.available_width().max(120.0))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut pick, String::new(), "(none)");
+            for name in point_names {
+                ui.selectable_value(&mut pick, name.clone(), name);
+            }
+        });
+    if pick != *value {
+        *value = pick;
         dirty = true;
     }
     dirty
@@ -408,38 +402,14 @@ fn detail_editor(
             .color(p.text),
     );
     ui.add_space(10.0);
-    if point_picker(
-        ui,
-        "SOURCE POINT",
-        &mut step.source_point,
-        point_names,
-        ("pb_calc_src_point", step_id),
-        p,
-    ) {
-        dirty = true;
-    }
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new("Point the formula / transform reads (edge input value).")
-            .font(font_ui(11.0))
-            .color(p.muted),
-    );
-    ui.add_space(8.0);
-    if point_picker(
-        ui,
-        "OUTPUT POINT",
-        &mut step.output_point,
-        point_names,
-        ("pb_calc_out_point", step_id),
-        p,
-    ) {
+    if source_point_picker(ui, &mut step.source_point, point_names, step_id, p) {
         dirty = true;
     }
     ui.add_space(4.0);
     ui.label(
         RichText::new(
-            "Where the result is written. Pick an existing point or type a new short id \
-(e.g. calc_1) — required when the result must not overwrite the source.",
+            "Transforms this point in place on its path to the Output node. \
+The Output node owns the destination topic / bind.",
         )
         .font(font_ui(11.0))
         .color(p.muted),

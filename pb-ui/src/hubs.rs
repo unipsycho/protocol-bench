@@ -224,12 +224,9 @@ pub struct HubStep {
     /// Window / tau in seconds for time-based kinds.
     #[serde(default)]
     pub window_secs: String,
-    /// Host point the calculation reads (`mqtt_1`, …).
+    /// Host point the calculation transforms in place on the path to Output.
     #[serde(default)]
     pub source_point: String,
-    /// Host point the calculation writes. Empty → create/bind when the engine runs.
-    #[serde(default)]
-    pub output_point: String,
 }
 
 fn default_calc_kind() -> String {
@@ -732,7 +729,6 @@ impl HubModel {
             param_b: "0.0".into(),
             window_secs: "10".into(),
             source_point: String::new(),
-            output_point: String::new(),
         };
         if aggregator {
             hub.aggregators.push(step);
