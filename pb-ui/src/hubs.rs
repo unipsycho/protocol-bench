@@ -149,11 +149,13 @@ pub struct MqttOutputBind {
     pub auto: bool,
 }
 
-/// Fan-in wire into an MQTT Output (many Sources / Calcs / Aggs → one Output).
+/// Directed wire: feeder → sink (Output, Calc, or Agg). Many→one fan-in allowed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HubFeed {
     pub to_hub: u64,
-    pub to_output: u64,
+    /// Sink node id (Output / Calculation / Aggregator). Legacy key: `to_output`.
+    #[serde(alias = "to_output")]
+    pub to_node: u64,
     pub from_hub: u64,
     /// Source port id, or calculation / aggregator step id.
     pub from_node: u64,
@@ -470,26 +472,20 @@ impl HubModel {
             if !hub.protocol.hub_capable() {
                 hub.protocol = HubProto::Modbus;
             }
-            // Attach orphan transforms (older saves) to a real port edge.
+            // PB-68: orphan transforms stay free-floating — never cascade-delete.
             let ports: Vec<u64> = hub
                 .sources
                 .iter()
                 .chain(hub.outputs.iter())
                 .map(|port| port.id)
                 .collect();
-            let fallback = ports.first().copied().unwrap_or(0);
-            if ports.is_empty() {
-                hub.aggregators.clear();
-                hub.calculations.clear();
-            } else {
-                for step in hub
-                    .aggregators
-                    .iter_mut()
-                    .chain(hub.calculations.iter_mut())
-                {
-                    if step.edge_port == 0 || !ports.contains(&step.edge_port) {
-                        step.edge_port = fallback;
-                    }
+            for step in hub
+                .aggregators
+                .iter_mut()
+                .chain(hub.calculations.iter_mut())
+            {
+                if step.edge_port != 0 && !ports.contains(&step.edge_port) {
+                    step.edge_port = 0;
                 }
             }
         }
@@ -879,18 +875,41 @@ impl HubModel {
         self.erase_node(hub_id, port_id);
     }
 
-    /// Remove one Input / Output / Calc / Agg. Output delete keeps connected transforms (PB-65).
+    /// Remove one Input / Output / Calc / Agg. Never cascade to other nodes (PB-68).
     fn erase_node(&mut self, hub_id: u64, port_id: u64) {
+        // Pin orphan transforms that lived on this port's edge so they stay visible.
+        let pin_at = self
+            .hub(hub_id)
+            .and_then(|hub| {
+                hub.sources
+                    .iter()
+                    .chain(hub.outputs.iter())
+                    .find(|p| p.id == port_id)
+                    .and_then(|p| p.at)
+            })
+            .or_else(|| self.hub(hub_id).and_then(|h| h.at));
         if let Some(hub) = self.hub_mut(hub_id) {
             hub.sources.retain(|port| port.id != port_id);
             hub.outputs.retain(|port| port.id != port_id);
-            // Drop only the selected step — never cascade by edge_port (PB-65).
+            // Drop only the selected step id — never cascade by edge_port.
             hub.aggregators.retain(|step| step.id != port_id);
             hub.calculations.retain(|step| step.id != port_id);
+            for step in hub
+                .aggregators
+                .iter_mut()
+                .chain(hub.calculations.iter_mut())
+            {
+                if step.edge_port == port_id {
+                    step.edge_port = 0;
+                    if step.at.is_none() {
+                        step.at = pin_at;
+                    }
+                }
+            }
         }
-        // Drop feeds that used this node as feeder or as Output sink.
+        // Drop only incident feeds (this node as feeder or sink).
         self.feeds.retain(|f| {
-            !(f.to_hub == hub_id && f.to_output == port_id)
+            !(f.to_hub == hub_id && f.to_node == port_id)
                 && !(f.from_hub == hub_id && f.from_node == port_id)
         });
         if self.selected_port == Some(port_id) {
@@ -904,36 +923,43 @@ impl HubModel {
         self.keep_focus();
     }
 
-    /// Connect a Source / Calc / Agg into an Output (many → one). Returns true if new.
+    /// True when `node_id` can start a feed wire (Input / Calc / Agg).
+    fn is_feeder(&self, hub_id: u64, node_id: u64) -> bool {
+        let Some(hub) = self.hub(hub_id) else {
+            return false;
+        };
+        hub.sources.iter().any(|p| p.id == node_id)
+            || hub.calculations.iter().any(|s| s.id == node_id)
+            || hub.aggregators.iter().any(|s| s.id == node_id)
+    }
+
+    /// True when `node_id` can accept a feed (Output / Calc / Agg).
+    fn is_sink(&self, hub_id: u64, node_id: u64) -> bool {
+        let Some(hub) = self.hub(hub_id) else {
+            return false;
+        };
+        hub.outputs.iter().any(|p| p.id == node_id)
+            || hub.calculations.iter().any(|s| s.id == node_id)
+            || hub.aggregators.iter().any(|s| s.id == node_id)
+    }
+
+    /// Connect feeder → sink (Output / Calc / Agg). Many→one fan-in. Returns true if new.
     pub fn connect_feed(
         &mut self,
         from_hub: u64,
         from_node: u64,
         to_hub: u64,
-        to_output: u64,
+        to_node: u64,
     ) -> bool {
-        if from_hub == to_hub && from_node == to_output {
+        if from_hub == to_hub && from_node == to_node {
             return false;
         }
-        let Some(hub) = self.hub(to_hub) else {
-            return false;
-        };
-        if !hub.outputs.iter().any(|p| p.id == to_output) {
-            return false;
-        }
-        // from_node must be a source, calc, or agg on from_hub.
-        let Some(from) = self.hub(from_hub) else {
-            return false;
-        };
-        let ok = from.sources.iter().any(|p| p.id == from_node)
-            || from.calculations.iter().any(|s| s.id == from_node)
-            || from.aggregators.iter().any(|s| s.id == from_node);
-        if !ok {
+        if !self.is_feeder(from_hub, from_node) || !self.is_sink(to_hub, to_node) {
             return false;
         }
         let feed = HubFeed {
             to_hub,
-            to_output,
+            to_node,
             from_hub,
             from_node,
         };
@@ -941,7 +967,78 @@ impl HubModel {
             return false;
         }
         self.feeds.push(feed);
+        self.apply_feed_binding(from_hub, from_node, to_hub, to_node);
         true
+    }
+
+    /// Reattach one end of an existing feed. Returns true when the feed changed.
+    pub fn rewire_feed(
+        &mut self,
+        idx: usize,
+        from_end: bool,
+        hub_id: u64,
+        node_id: u64,
+    ) -> bool {
+        let Some(feed) = self.feeds.get(idx).cloned() else {
+            return false;
+        };
+        let (from_hub, from_node, to_hub, to_node) = if from_end {
+            if !self.is_feeder(hub_id, node_id) {
+                return false;
+            }
+            (hub_id, node_id, feed.to_hub, feed.to_node)
+        } else {
+            if !self.is_sink(hub_id, node_id) {
+                return false;
+            }
+            (feed.from_hub, feed.from_node, hub_id, node_id)
+        };
+        if from_hub == to_hub && from_node == to_node {
+            return false;
+        }
+        let next = HubFeed {
+            from_hub,
+            from_node,
+            to_hub,
+            to_node,
+        };
+        if self.feeds.iter().enumerate().any(|(i, f)| i != idx && f == &next) {
+            return false;
+        }
+        if next == feed {
+            return false;
+        }
+        self.checkpoint();
+        self.feeds[idx] = next;
+        self.apply_feed_binding(from_hub, from_node, to_hub, to_node);
+        true
+    }
+
+    /// Side effects when a feed lands on Calc (source_point) or Agg (members).
+    fn apply_feed_binding(
+        &mut self,
+        from_hub: u64,
+        from_node: u64,
+        to_hub: u64,
+        to_node: u64,
+    ) {
+        let pts = self.points_for_node(from_hub, from_node, &[]);
+        let Some(hub) = self.hub_mut(to_hub) else {
+            return;
+        };
+        if let Some(step) = hub.calculations.iter_mut().find(|s| s.id == to_node) {
+            if let Some(p) = pts.first() {
+                step.source_point = p.clone();
+            }
+            return;
+        }
+        if let Some(step) = hub.aggregators.iter_mut().find(|s| s.id == to_node) {
+            for p in pts {
+                if !step.members.iter().any(|m| m == &p) {
+                    step.members.push(p);
+                }
+            }
+        }
     }
 
     pub fn remove_feed(&mut self, idx: usize) {
@@ -1006,18 +1103,11 @@ impl HubModel {
             .feeds
             .iter()
             .filter(|f| {
-                let Some(to) = self.hub(f.to_hub) else {
-                    return false;
-                };
-                if !to.outputs.iter().any(|p| p.id == f.to_output) {
+                // Sink must still exist (Output / Calc / Agg).
+                if !self.is_sink(f.to_hub, f.to_node) {
                     return false;
                 }
-                let Some(from) = self.hub(f.from_hub) else {
-                    return false;
-                };
-                from.sources.iter().any(|p| p.id == f.from_node)
-                    || from.calculations.iter().any(|s| s.id == f.from_node)
-                    || from.aggregators.iter().any(|s| s.id == f.from_node)
+                self.is_feeder(f.from_hub, f.from_node)
             })
             .cloned()
             .collect();
@@ -1027,8 +1117,15 @@ impl HubModel {
         self.feeds = keep;
         let mut by_out: BTreeMap<(u64, u64), Vec<String>> = BTreeMap::new();
         for feed in &self.feeds {
+            // Auto MQTT binds only for Output sinks.
+            let Some(to) = self.hub(feed.to_hub) else {
+                continue;
+            };
+            if !to.outputs.iter().any(|p| p.id == feed.to_node) {
+                continue;
+            }
             let pts = self.points_for_node(feed.from_hub, feed.from_node, host_points);
-            let entry = by_out.entry((feed.to_hub, feed.to_output)).or_default();
+            let entry = by_out.entry((feed.to_hub, feed.to_node)).or_default();
             for p in pts {
                 if !entry.iter().any(|x| x == &p) {
                     entry.push(p);
@@ -1322,7 +1419,7 @@ fn layout_nodes(hubs: &[Hub]) -> Vec<Placed> {
             );
         }
     }
-    // Edge transforms: evenly along the port↔hub segment unless dragged.
+    // Edge transforms: on their port↔hub segment, or free-floating when orphaned (PB-68).
     for hub in hubs {
         let Some(hub_node) = nodes
             .iter()
@@ -1331,32 +1428,53 @@ fn layout_nodes(hubs: &[Hub]) -> Vec<Placed> {
         else {
             continue;
         };
-        let edges: Vec<u64> = hub
-            .sources
+        let steps: Vec<(u64, Role, u64, Option<[f32; 2]>)> = hub
+            .aggregators
             .iter()
-            .chain(hub.outputs.iter())
-            .map(|port| port.id)
+            .map(|s| (s.id, Role::Aggregator, s.edge_port, s.at))
+            .chain(
+                hub.calculations
+                    .iter()
+                    .map(|s| (s.id, Role::Calculation, s.edge_port, s.at)),
+            )
             .collect();
-        for edge_port in edges {
-            let on_edge = hub.steps_on(edge_port);
-            if on_edge.is_empty() {
-                continue;
+        // Group by edge_port for even spacing; orphans (edge_port 0 / missing) use at/hub.
+        let mut by_edge: BTreeMap<u64, Vec<(u64, Role, Option<[f32; 2]>)>> = BTreeMap::new();
+        let mut orphans = Vec::new();
+        for (id, role, edge_port, at) in steps {
+            let port_exists = hub.sources.iter().any(|p| p.id == edge_port)
+                || hub.outputs.iter().any(|p| p.id == edge_port);
+            if edge_port != 0 && port_exists {
+                by_edge
+                    .entry(edge_port)
+                    .or_default()
+                    .push((id, role, at));
+            } else {
+                orphans.push((id, role, at));
             }
+        }
+        for (edge_port, on_edge) in by_edge {
             let Some(port_node) = nodes
                 .iter()
                 .find(|node| node.hub_id == hub.id && node.port_id == Some(edge_port))
                 .copied()
             else {
+                for (id, role, at) in on_edge {
+                    let center = at
+                        .map(|at| pos2(at[0], at[1]))
+                        .unwrap_or(hub_node.rect.center() + vec2(0.0, 48.0));
+                    nodes.push(placed(
+                        hub.id,
+                        Some(id),
+                        role,
+                        center,
+                        vec2(PORT_W, PORT_H),
+                    ));
+                }
                 continue;
             };
             let n = on_edge.len() as f32;
-            for (i, (id, role)) in on_edge.into_iter().enumerate() {
-                let at = hub
-                    .aggregators
-                    .iter()
-                    .chain(hub.calculations.iter())
-                    .find(|step| step.id == id)
-                    .and_then(|step| step.at);
+            for (i, (id, role, at)) in on_edge.into_iter().enumerate() {
                 let t = (i as f32 + 1.0) / (n + 1.0);
                 let mid =
                     port_node.rect.center() + (hub_node.rect.center() - port_node.rect.center()) * t;
@@ -1369,6 +1487,18 @@ fn layout_nodes(hubs: &[Hub]) -> Vec<Placed> {
                     vec2(PORT_W, PORT_H),
                 ));
             }
+        }
+        for (i, (id, role, at)) in orphans.into_iter().enumerate() {
+            let center = at.map(|at| pos2(at[0], at[1])).unwrap_or_else(|| {
+                hub_node.rect.center() + vec2(0.0, 56.0 + i as f32 * (PORT_H + 12.0))
+            });
+            nodes.push(placed(
+                hub.id,
+                Some(id),
+                role,
+                center,
+                vec2(PORT_W, PORT_H),
+            ));
         }
     }
     nodes
@@ -1837,6 +1967,18 @@ fn diagram_view(
         })
         .collect();
     let mut gesture = gesture_nodes(&mut child, model, &screen, panning);
+    // If the press landed on a feed handle, do not treat it as a node move.
+    let pointer_now = child.ctx().pointer_interact_pos();
+    if let Some(pos) = pointer_now {
+        if hit_feed_endpoint(model, &screen, pos, zoom).is_some()
+            && child
+                .ctx()
+                .input(|i| i.pointer.button_down(egui::PointerButton::Primary))
+        {
+            gesture.drag = None;
+            gesture.drag_started = false;
+        }
+    }
     // PB-66: one undo frame per rearrange drag (not every move tick).
     if gesture.drag_started {
         model.checkpoint();
@@ -1928,6 +2070,63 @@ fn diagram_view(
         model.set_selection(Vec::new());
         change.dirty = true;
     }
+    // PB-69: rewire — grab a feed endpoint and drop on another compatible node.
+    #[derive(Clone, Copy, Default)]
+    struct RewireState {
+        feed_idx: usize,
+        end: FeedEnd,
+    }
+    let rewire_id = Id::new("pb_hub_rewire");
+    let pointer = child.ctx().pointer_interact_pos();
+    // Start on primary press near a handle (before node-move applies).
+    let pressed = child
+        .ctx()
+        .input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+    if pressed && gesture.wire_from.is_none() && !panning {
+        if let Some(pos) = pointer {
+            if let Some((idx, end)) = hit_feed_endpoint(model, &screen, pos, zoom) {
+                child
+                    .ctx()
+                    .data_mut(|d| d.insert_temp(rewire_id, RewireState { feed_idx: idx, end }));
+            }
+        }
+    }
+    let mut rewire_preview: Option<(Pos2, Pos2)> = None;
+    let rewiring = child.ctx().data(|d| d.get_temp::<RewireState>(rewire_id));
+    if rewiring.is_some() {
+        gesture.drag = None;
+        gesture.drag_started = false;
+    }
+    if let Some(state) = rewiring {
+        if let Some(pos) = pointer {
+            if let Some(feed) = model.feeds.get(state.feed_idx) {
+                let fixed = match state.end {
+                    FeedEnd::From => feed_ends(&screen, feed).map(|(_, b, _, _)| b),
+                    FeedEnd::To => feed_ends(&screen, feed).map(|(a, _, _, _)| a),
+                };
+                if let Some(fixed) = fixed {
+                    rewire_preview = Some((fixed, pos));
+                }
+            }
+        }
+        let released = child.ctx().input(|i| i.pointer.any_released());
+        if released {
+            child.ctx().data_mut(|d| d.remove_temp::<RewireState>(rewire_id));
+            if let Some(pos) = pointer {
+                if let Some(target) = screen.iter().find(|n| n.rect.contains(pos)) {
+                    if let Some(node_id) = target.port_id {
+                        let from_end = matches!(state.end, FeedEnd::From);
+                        if model.rewire_feed(state.feed_idx, from_end, target.hub_id, node_id)
+                        {
+                            let _ = model.sync_output_feed_binds(&host.points);
+                            change.dirty = true;
+                        }
+                    }
+                }
+            }
+            rewire_preview = None;
+        }
+    }
     if let Some((hub_id, port_id, delta)) = gesture.drag {
         // Group-move every selected node; if the dragged node was outside the
         // selection, replace selection with that one node first.
@@ -1972,10 +2171,15 @@ fn diagram_view(
     if let Some(pane) = gesture.open {
         change.open = Some(pane);
     }
-    // PB-63: Alt-drag wire Input/Calc/Agg → Output (persist start across drag frames).
+
+    // PB-63/69: Alt-drag wire feeder → Output/Calc/Agg (persist across frames).
     let wire_id = Id::new("pb_hub_fan_wire");
-    if let Some(from) = gesture.wire_from {
-        child.ctx().data_mut(|d| d.insert_temp(wire_id, from));
+    if gesture.wire_from.is_some()
+        && child.ctx().data(|d| d.get_temp::<RewireState>(rewire_id)).is_none()
+    {
+        if let Some(from) = gesture.wire_from {
+            child.ctx().data_mut(|d| d.insert_temp(wire_id, from));
+        }
     }
     let mut wire_preview: Option<((u64, Option<u64>), Pos2)> = None;
     if let Some(from) = child.ctx().data(|d| d.get_temp::<(u64, Option<u64>)>(wire_id)) {
@@ -1989,10 +2193,10 @@ fn diagram_view(
             if let Some(pos) = child.ctx().pointer_interact_pos() {
                 if let Some(to) = screen
                     .iter()
-                    .find(|n| n.role == Role::Output && n.rect.contains(pos))
+                    .find(|n| sink_role(n.role) && n.rect.contains(pos))
                 {
-                    if let (Some(from_id), Some(out_id)) = (from.1, to.port_id) {
-                        if model.connect_feed(from.0, from_id, to.hub_id, out_id) {
+                    if let (Some(from_id), Some(to_id)) = (from.1, to.port_id) {
+                        if model.connect_feed(from.0, from_id, to.hub_id, to_id) {
                             let _ = model.sync_output_feed_binds(&host.points);
                             change.dirty = true;
                         }
@@ -2028,7 +2232,7 @@ fn diagram_view(
         zoom,
         p,
     );
-    // Fan-in feed wires + live Alt-drag preview.
+    // Fan-in feed wires + live Alt-drag / rewire preview.
     paint_feeds(child.painter(), &screen, model, p);
     if let Some((from, tip)) = wire_preview {
         if let Some(src) = screen
@@ -2045,6 +2249,16 @@ fn diagram_view(
             );
         }
     }
+    if let Some((fixed, tip)) = rewire_preview {
+        link_curve(
+            child.painter(),
+            Rect::from_center_size(fixed, vec2(1.0, 1.0)),
+            Rect::from_center_size(tip, vec2(1.0, 1.0)),
+            p.accent,
+            true,
+            true,
+        );
+    }
     if let Some(box_drag) = marquee_paint {
         paint_marquee(child.painter(), box_drag.rect(), p);
     }
@@ -2056,21 +2270,69 @@ fn diagram_view(
 
 fn paint_feeds(painter: &egui::Painter, nodes: &[Placed], model: &HubModel, p: &ThemePalette) {
     for feed in &model.feeds {
-        let Some(from) = nodes
-            .iter()
-            .find(|n| n.hub_id == feed.from_hub && n.port_id == Some(feed.from_node))
-        else {
+        let Some((from_pt, to_pt, from_rect, to_rect)) = feed_ends(nodes, feed) else {
             continue;
         };
-        let Some(to) = nodes.iter().find(|n| {
-            n.hub_id == feed.to_hub
-                && n.port_id == Some(feed.to_output)
-                && n.role == Role::Output
-        }) else {
-            continue;
-        };
-        link_curve(painter, from.rect, to.rect, p.live, false, false);
+        link_curve(painter, from_rect, to_rect, p.live, false, false);
+        // PB-69: endpoint handles at wire tips (away from node centers).
+        let r = 5.0;
+        for c in [from_pt, to_pt] {
+            painter.circle_filled(c, r, p.accent);
+            painter.circle_stroke(c, r, Stroke::new(1.0, p.line));
+        }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+enum FeedEnd {
+    #[default]
+    From,
+    To,
+}
+
+fn feed_ends(nodes: &[Placed], feed: &HubFeed) -> Option<(Pos2, Pos2, Rect, Rect)> {
+    let from = nodes
+        .iter()
+        .find(|n| n.hub_id == feed.from_hub && n.port_id == Some(feed.from_node))?;
+    let to = nodes.iter().find(|n| {
+        n.hub_id == feed.to_hub
+            && n.port_id == Some(feed.to_node)
+            && sink_role(n.role)
+    })?;
+    let (a, b, _) = facing(from.rect, to.rect);
+    Some((a, b, from.rect, to.rect))
+}
+
+/// Hit a feed endpoint handle under the pointer (for rewire).
+fn hit_feed_endpoint(
+    model: &HubModel,
+    nodes: &[Placed],
+    pos: Pos2,
+    zoom: f32,
+) -> Option<(usize, FeedEnd)> {
+    let thresh = (10.0 * zoom.max(0.35)).max(8.0);
+    let mut best: Option<(f32, usize, FeedEnd)> = None;
+    for (idx, feed) in model.feeds.iter().enumerate() {
+        let Some((from_pt, to_pt, _, _)) = feed_ends(nodes, feed) else {
+            continue;
+        };
+        let d_from = from_pt.distance(pos);
+        if d_from <= thresh && best.is_none_or(|(bd, _, _)| d_from < bd) {
+            best = Some((d_from, idx, FeedEnd::From));
+        }
+        let d_to = to_pt.distance(pos);
+        if d_to <= thresh && best.is_none_or(|(bd, _, _)| d_to < bd) {
+            best = Some((d_to, idx, FeedEnd::To));
+        }
+    }
+    best.map(|(_, idx, end)| (idx, end))
+}
+
+fn sink_role(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Output | Role::Calculation | Role::Aggregator
+    )
 }
 
 fn feeder_label(model: &HubModel, hub_id: u64, node_id: u64) -> String {
@@ -2257,10 +2519,10 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
         );
         let tip = match node.role {
             Role::Source | Role::Output => {
-                "Drag to move. Alt-drag Input → Output to fan-in points. Click for details. Right-click to add aggregator/calculation."
+                "Drag to move. Alt-drag Input/Calc/Agg → Output/Calc/Agg to wire. Grab wire ends to reattach. Click for details."
             }
             Role::Aggregator | Role::Calculation => {
-                "Drag to move. Alt-drag onto an Output to publish this point. Click for details."
+                "Drag to move. Alt-drag onto Output/Calc/Agg to wire. Drop wires here on the input side. Click for details."
             }
             _ if opens => {
                 "Drag to move. Click for details. Double-click opens the protocol panel. Right-click to add source/output."
@@ -2563,7 +2825,8 @@ fn paint_hub_node(
     };
     let z = zoom.max(0.35);
     let ink = hub.protocol.ink(p.is_light);
-    paint_card(painter, node.rect, ink, on, hot, p);
+    // PB-70: soft filled ground so hubs stand out from Input/Output/Calc/Agg (pane).
+    paint_hub_card(painter, node.rect, ink, on, hot, p);
     paint_grip(painter, node.rect, if hot || on { ink } else { p.muted });
     let clip = Rect::from_min_max(
         pos2(node.rect.min.x + 18.0 * z, node.rect.min.y + 4.0 * z),
@@ -2723,15 +2986,54 @@ fn paint_card(
     hot: bool,
     p: &ThemePalette,
 ) {
-    let shadow = rect.translate(vec2(0.0, 2.0));
-    painter.rect_filled(shadow, Rounding::same(8.0), Color32::from_black_alpha(36));
+    paint_card_fill(
+        painter,
+        rect,
+        ink,
+        on,
+        hot,
+        p,
+        if on {
+            p.header_top
+        } else if hot {
+            tint(ink, if p.is_light { 28 } else { 36 })
+        } else {
+            p.pane
+        },
+    );
+}
+
+/// Hub card — idle fill uses `control` so hubs read as anchors (PB-70).
+fn paint_hub_card(
+    painter: &egui::Painter,
+    rect: Rect,
+    ink: Color32,
+    on: bool,
+    hot: bool,
+    p: &ThemePalette,
+) {
     let fill = if on {
         p.header_top
     } else if hot {
         tint(ink, if p.is_light { 28 } else { 36 })
     } else {
-        p.pane
+        // Soft lift vs port/calc `pane` cards — same palette, not loud.
+        p.control
     };
+    paint_card_fill(painter, rect, ink, on, hot, p, fill);
+}
+
+fn paint_card_fill(
+    painter: &egui::Painter,
+    rect: Rect,
+    ink: Color32,
+    on: bool,
+    hot: bool,
+    p: &ThemePalette,
+    fill: Color32,
+) {
+    let shadow = rect.translate(vec2(0.0, 2.0));
+    painter.rect_filled(shadow, Rounding::same(8.0), Color32::from_black_alpha(36));
     painter.rect_filled(rect, Rounding::same(8.0), fill);
     if on {
         painter.rect_stroke(
@@ -3343,7 +3645,7 @@ fn edit_mqtt_port_binds(
             .feeds
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.to_hub == hub_id && f.to_output == port_id)
+            .filter(|(_, f)| f.to_hub == hub_id && f.to_node == port_id)
             .map(|(i, _)| i)
             .collect();
         if feed_idxs.is_empty() {
@@ -3925,13 +4227,81 @@ mod tests {
         model.remove_port(hub, out);
         assert!(
             model.hub(hub).unwrap().calculations.iter().any(|s| s.id == calc),
-            "calc must survive Output delete (PB-65)"
+            "calc must survive Output delete (PB-68)"
         );
         assert!(
             model.hub(hub).unwrap().outputs.iter().all(|p| p.id != out),
             "output gone"
         );
         assert!(model.feeds.is_empty(), "feeds into Output must clear");
+        // Orphan calc must still layout on the canvas.
+        let nodes = layout_nodes(&model.hubs);
+        assert!(
+            nodes.iter().any(|n| n.port_id == Some(calc)),
+            "orphaned calc must remain visible"
+        );
+    }
+
+    #[test]
+    fn calc_feeding_two_outputs_survives_one_delete() {
+        let mut model = HubModel::sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let out_a = model.hubs[1].outputs[0].id;
+        let out_b = model.add_port(hub, false).expect("second output");
+        let calc = model.add_step(hub, false, src).expect("calc");
+        if let Some(step) = model
+            .hub_mut(hub)
+            .and_then(|h| h.calculations.iter_mut().find(|s| s.id == calc))
+        {
+            step.source_point = "mqtt_1".into();
+            step.at = Some([220.0, 140.0]);
+        }
+        assert!(model.connect_feed(hub, calc, hub, out_a));
+        assert!(model.connect_feed(hub, calc, hub, out_b));
+        assert_eq!(model.feeds.len(), 2);
+        model.remove_port(hub, out_a);
+        assert!(
+            model.hub(hub).unwrap().calculations.iter().any(|s| s.id == calc),
+            "shared calc must remain"
+        );
+        assert!(
+            model.hub(hub).unwrap().outputs.iter().any(|p| p.id == out_b),
+            "other output must remain"
+        );
+        assert_eq!(model.feeds.len(), 1);
+        assert_eq!(model.feeds[0].to_node, out_b);
+        assert_eq!(model.feeds[0].from_node, calc);
+        let nodes = layout_nodes(&model.hubs);
+        assert!(nodes.iter().any(|n| n.port_id == Some(calc)));
+        assert!(nodes.iter().any(|n| n.port_id == Some(out_b)));
+        assert!(nodes.iter().all(|n| n.port_id != Some(out_a)));
+    }
+
+    #[test]
+    fn feed_into_calc_sets_source_point() {
+        let mut model = HubModel::sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let calc = model.add_step(hub, false, src).expect("calc");
+        // Point from MQTT input bind.
+        if let Some(port) = model.hub_mut(hub).and_then(|h| h.sources.iter_mut().find(|p| p.id == src))
+        {
+            port.mqtt_inputs.push(MqttInputBind {
+                topic: "plant/t".into(),
+                path: String::new(),
+                point: "temp_1".into(),
+            });
+        }
+        assert!(model.connect_feed(hub, src, hub, calc));
+        let step = model
+            .hub(hub)
+            .unwrap()
+            .calculations
+            .iter()
+            .find(|s| s.id == calc)
+            .unwrap();
+        assert_eq!(step.source_point, "temp_1");
     }
 
     #[test]
