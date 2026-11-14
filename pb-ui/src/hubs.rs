@@ -1217,7 +1217,19 @@ fn zoom_cam(pan: Vec2, view_pos: Vec2, old_zoom: f32, new_zoom: f32) -> Vec2 {
 
 /// Wheel (and pinch) over the canvas, anchored at the pointer. Clears scroll so parents do not move.
 fn canvas_zoom_factor(ui: &Ui, rect: Rect) -> Option<(f32, Pos2)> {
-    ui.ctx().input_mut(|i| {
+    let ctx = ui.ctx().clone();
+    // Foreground windows (calc types modal) must keep the wheel — don't zoom through them.
+    if ctx.data(|d| d.get_temp::<bool>(Id::new("pb_calc_types_blocking")).unwrap_or(false)) {
+        return None;
+    }
+    if let Some(pos) = ctx.pointer_hover_pos() {
+        if let Some(layer) = ctx.layer_id_at(pos) {
+            if layer.order >= egui::Order::Foreground {
+                return None;
+            }
+        }
+    }
+    ctx.input_mut(|i| {
         let pointer = i.pointer.hover_pos().filter(|pos| rect.contains(*pos))?;
         let scroll = i.smooth_scroll_delta;
         let pinch = i.zoom_delta();

@@ -3,7 +3,7 @@
 //! Shown in the Hubs inspector when a calculation node is selected.
 //! Catalog lives in a large modal help guide; picking a type pre-fills config.
 
-use egui::{Align, Color32, Id, Layout, RichText, Sense, Vec2};
+use egui::{Align, Align2, Color32, Id, Layout, RichText, Sense, Vec2};
 use pb_engine::PointSnapshot;
 
 use crate::hubs::HubStep;
@@ -238,14 +238,19 @@ pub fn paint_node_props(
     if open {
         let mut pick = None;
         let mut still_open = open;
+        // Mark open so the hub canvas does not steal wheel zoom behind the modal.
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(Id::new("pb_calc_types_blocking"), true));
         egui::Window::new("Calculation types")
             .id(Id::new(("pb_calc_types_win", step_id)))
             .open(&mut still_open)
             .collapsible(false)
             .resizable(true)
-            .default_size([920.0, 640.0])
-            .min_width(720.0)
-            .min_height(420.0)
+            .order(egui::Order::Foreground)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_size([960.0, 640.0])
+            .min_width(760.0)
+            .min_height(440.0)
             .show(ui.ctx(), |ui| {
                 ui.label(
                     RichText::new(
@@ -256,32 +261,38 @@ configuration from the example. Types marked time use a window or time constant.
                     .color(p.text),
                 );
                 ui.add_space(14.0);
+                let gap = 12.0;
+                let card_h = 128.0;
                 egui::ScrollArea::vertical()
                     .id_salt(("pb_calc_types_scroll", step_id))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let gap = 12.0;
-                        let col_w = ((ui.available_width() - gap * 2.0) / 3.0).max(200.0);
-                        for row in CALC_KINDS.chunks(3) {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = gap;
-                                for kind in row {
+                        // Equal 3-column grid — fixed card size, no staggered flow.
+                        let col_w = ((ui.available_width() - gap * 2.0) / 3.0).max(210.0);
+                        egui::Grid::new(("pb_calc_types_grid", step_id))
+                            .num_columns(3)
+                            .spacing([gap, gap])
+                            .min_col_width(col_w)
+                            .max_col_width(col_w)
+                            .show(ui, |ui| {
+                                for (i, kind) in CALC_KINDS.iter().enumerate() {
                                     let active = step.calc_kind == kind.id;
                                     ui.allocate_ui_with_layout(
-                                        Vec2::new(col_w, 0.0),
+                                        Vec2::new(col_w, card_h),
                                         Layout::top_down(Align::Min),
                                         |ui| {
-                                            ui.set_min_width(col_w);
-                                            ui.set_max_width(col_w);
+                                            ui.set_min_size(Vec2::new(col_w, card_h));
+                                            ui.set_max_size(Vec2::new(col_w, card_h));
                                             if catalog_card(ui, kind, active, p) {
                                                 pick = Some(kind.id);
                                             }
                                         },
                                     );
+                                    if (i + 1) % 3 == 0 {
+                                        ui.end_row();
+                                    }
                                 }
                             });
-                            ui.add_space(gap);
-                        }
                     });
             });
         if let Some(id) = pick {
@@ -292,7 +303,15 @@ configuration from the example. Types marked time use a window or time constant.
             still_open = false;
         }
         open = still_open;
-        ui.ctx().data_mut(|d| d.insert_temp(modal_id, open));
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(modal_id, open);
+            if !open {
+                d.insert_temp(Id::new("pb_calc_types_blocking"), false);
+            }
+        });
+    } else {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(Id::new("pb_calc_types_blocking"), false));
     }
 
     dirty
@@ -313,13 +332,15 @@ fn catalog_card(ui: &mut egui::Ui, kind: &CalcKind, active: bool, p: &ThemePalet
     } else {
         egui::Stroke::new(1.0, p.line)
     };
+    let size = ui.available_size();
     let resp = egui::Frame::none()
         .fill(fill)
         .stroke(stroke)
         .rounding(egui::Rounding::same(8.0))
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
+            ui.set_min_size(size);
+            ui.set_max_size(size);
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(kind.name)
@@ -338,12 +359,13 @@ fn catalog_card(ui: &mut egui::Ui, kind: &CalcKind, active: bool, p: &ThemePalet
             });
             ui.add_space(4.0);
             ui.label(RichText::new(kind.blurb).font(font_ui(12.0)).color(p.muted));
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(format!("Example · {}", kind.example))
-                    .font(font_ui(11.5))
-                    .color(p.text),
-            );
+            ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+                ui.label(
+                    RichText::new(format!("Example · {}", kind.example))
+                        .font(font_ui(11.5))
+                        .color(p.text),
+                );
+            });
         });
     ui.interact(resp.response.rect, ui.id().with(("calc_card", kind.id)), Sense::click())
         .clicked()
@@ -585,8 +607,8 @@ fn live_preview(
     host_points: &[PointSnapshot],
     p: &ThemePalette,
 ) {
-    heading(ui, "Live preview", p.live, p);
-    ui.add_space(6.0);
+    ui.label(RichText::new("LIVE PREVIEW").font(font_ui(10.5)).color(p.muted));
+    ui.add_space(4.0);
     if step.source_point.trim().is_empty() {
         ui.label(
             RichText::new("Pick a source point to preview input → output.")
@@ -598,7 +620,7 @@ fn live_preview(
     let Some(pt) = host_points.iter().find(|pt| pt.name == step.source_point) else {
         ui.label(
             RichText::new(format!(
-                "Source point “{}” is not in the live host yet.",
+                "Source “{}” not live yet.",
                 step.source_point
             ))
             .font(font_ui(12.0))
@@ -608,64 +630,25 @@ fn live_preview(
     };
     if pt.value.trim().is_empty() {
         ui.label(
-            RichText::new(format!(
-                "{} · quality {} — no value yet.",
-                pt.name, pt.quality
-            ))
-            .font(font_ui(12.0))
-            .color(p.muted),
+            RichText::new(format!("{} · no value yet", pt.name))
+                .font(font_ui(12.0))
+                .color(p.muted),
         );
         return;
     }
 
-    let fill = Color32::from_rgba_unmultiplied(p.live.r(), p.live.g(), p.live.b(), 24);
-    egui::Frame::none()
-        .fill(fill)
-        .stroke(egui::Stroke::new(1.0, p.line))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.label(
-                RichText::new(format!("Point · {} · quality {}", pt.name, pt.quality))
-                    .font(font_ui(11.5))
-                    .color(p.muted),
-            );
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Input").font(font_semi(12.5)).color(p.muted));
-                ui.add_space(8.0);
-                ui.label(RichText::new(&pt.value).font(font_semi(15.0)).color(p.text));
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Output").font(font_semi(12.5)).color(p.muted));
-                ui.add_space(8.0);
-                match parse_f64(&pt.value) {
-                    Some(x) => match compute_preview(kind, step, x) {
-                        Ok(out) => {
-                            ui.label(RichText::new(out).font(font_semi(15.0)).color(p.accent));
-                        }
-                        Err(msg) => {
-                            ui.label(RichText::new(msg).font(font_ui(12.0)).color(p.muted));
-                        }
-                    },
-                    None => {
-                        ui.label(
-                            RichText::new("non-numeric input — preview needs a number")
-                                .font(font_ui(12.0))
-                                .color(p.muted),
-                        );
-                    }
-                }
-            });
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("In-place on the path to Output · preview only (edge runner follows).")
-                    .font(font_ui(11.0))
-                    .color(p.muted),
-            );
-        });
+    let out = match parse_f64(&pt.value) {
+        Some(x) => compute_preview(kind, step, x).unwrap_or_else(|m| m),
+        None => "non-numeric".into(),
+    };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(RichText::new("Input").font(font_ui(12.0)).color(p.muted));
+        ui.label(RichText::new(&pt.value).font(font_semi(13.0)).color(p.text));
+        ui.label(RichText::new("→").font(font_ui(13.0)).color(p.muted));
+        ui.label(RichText::new("Output").font(font_ui(12.0)).color(p.muted));
+        ui.label(RichText::new(out).font(font_semi(13.0)).color(p.accent));
+    });
 }
 
 fn detail_editor(
