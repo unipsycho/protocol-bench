@@ -711,6 +711,141 @@ fn detail_editor(
     ui.add_space(10.0);
 
     match kind.id {
+        "scale_offset" => {
+            if field_row(ui, "Scale", &mut step.param_a, p) {
+                dirty = true;
+            }
+            ui.add_space(4.0);
+            if field_row(ui, "Offset", &mut step.param_b, p) {
+                dirty = true;
+            }
+        }
+        "unit_convert" => {
+            if enum_row(
+                ui,
+                "From",
+                &mut step.param_a,
+                UNIT_CHOICES,
+                ("pb_calc_unit_from", step_id),
+                p,
+            ) {
+                dirty = true;
+            }
+            ui.add_space(4.0);
+            if enum_row(
+                ui,
+                "To",
+                &mut step.param_b,
+                UNIT_CHOICES,
+                ("pb_calc_unit_to", step_id),
+                p,
+            ) {
+                dirty = true;
+            }
+        }
+        "clamp" => {
+            if field_row(ui, "Min", &mut step.param_a, p) {
+                dirty = true;
+            }
+            ui.add_space(4.0);
+            if field_row(ui, "Max", &mut step.param_b, p) {
+                dirty = true;
+            }
+        }
+        "deadband" => {
+            if field_row(ui, "Band ±", &mut step.param_a, p) {
+                dirty = true;
+            }
+        }
+        "rolling_avg" => {
+            if field_row(ui, "Window (s)", &mut step.window_secs, p) {
+                dirty = true;
+            }
+            ui.add_space(4.0);
+            if enum_row(
+                ui,
+                "Samples",
+                &mut step.param_a,
+                SAMPLE_MODES,
+                ("pb_calc_roll_samples", step_id),
+                p,
+            ) {
+                dirty = true;
+            }
+        }
+        "ema" => {
+            if field_row(ui, "Tau (s)", &mut step.window_secs, p) {
+                dirty = true;
+            }
+            ui.add_space(4.0);
+            if field_row(ui, "Alpha", &mut step.param_a, p) {
+                dirty = true;
+            }
+        }
+        "rate_of_change" => {
+            if enum_row(
+                ui,
+                "Units",
+                &mut step.param_a,
+                ROC_UNITS,
+                ("pb_calc_roc_units", step_id),
+                p,
+            ) {
+                dirty = true;
+            }
+            ui.add_space(4.0);
+            if enum_row(
+                ui,
+                "Sign",
+                &mut step.param_b,
+                ROC_SIGN,
+                ("pb_calc_roc_sign", step_id),
+                p,
+            ) {
+                dirty = true;
+            }
+        }
+        "min_max_hold" => {
+            if enum_row(
+                ui,
+                "Mode",
+                &mut step.param_a,
+                HOLD_MODES,
+                ("pb_calc_hold_mode", step_id),
+                p,
+            ) {
+                dirty = true;
+            }
+            ui.add_space(4.0);
+            if field_row(ui, "Hold (s)", &mut step.window_secs, p) {
+                dirty = true;
+            }
+        }
+        "hysteresis" => {
+            if field_row(ui, "On ≥", &mut step.param_a, p) {
+                dirty = true;
+            }
+            ui.add_space(4.0);
+            if field_row(ui, "Off ≤", &mut step.param_b, p) {
+                dirty = true;
+            }
+        }
+        "boolean_compare" => {
+            if enum_row(
+                ui,
+                "Operator",
+                &mut step.param_a,
+                COMPARE_OPS,
+                ("pb_calc_cmp_op", step_id),
+                p,
+            ) {
+                dirty = true;
+            }
+            ui.add_space(4.0);
+            if field_row(ui, "Setpoint", &mut step.param_b, p) {
+                dirty = true;
+            }
+        }
         "formula" => {
             ui.label(RichText::new("FORMULA").font(font_ui(10.5)).color(p.muted));
             ui.add_space(4.0);
@@ -733,16 +868,19 @@ fn detail_editor(
                 .color(p.muted),
             );
         }
-        "rolling_avg" | "ema" | "rate_of_change" | "min_max_hold" | "time_window" => {
+        "time_window" => {
             if field_row(ui, "Window (s)", &mut step.window_secs, p) {
                 dirty = true;
             }
             ui.add_space(4.0);
-            if field_row(ui, "Param A", &mut step.param_a, p) {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            if field_row(ui, "Param B", &mut step.param_b, p) {
+            if enum_row(
+                ui,
+                "Mode",
+                &mut step.param_a,
+                TIME_WINDOW_MODES,
+                ("pb_calc_tw_mode", step_id),
+                p,
+            ) {
                 dirty = true;
             }
         }
@@ -754,16 +892,53 @@ fn detail_editor(
             if field_row(ui, "Param B", &mut step.param_b, p) {
                 dirty = true;
             }
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(format!("Hint · {}", kind.example))
-                    .font(font_ui(11.0))
-                    .color(p.muted),
-            );
         }
     }
     dirty
 }
+
+const COMPARE_OPS: &[(&str, &str)] = &[
+    (">", ">"),
+    (">=", "≥"),
+    ("<", "<"),
+    ("<=", "≤"),
+    ("==", "="),
+    ("!=", "≠"),
+];
+
+const UNIT_CHOICES: &[(&str, &str)] = &[
+    ("°C", "°C"),
+    ("°F", "°F"),
+    ("psi", "psi"),
+    ("kPa", "kPa"),
+    ("bar", "bar"),
+    ("m", "m"),
+    ("ft", "ft"),
+];
+
+const HOLD_MODES: &[(&str, &str)] = &[("min", "Min"), ("max", "Max")];
+
+const TIME_WINDOW_MODES: &[(&str, &str)] = &[
+    ("avg", "Average"),
+    ("gate", "Gate"),
+    ("debounce", "Debounce"),
+];
+
+const ROC_UNITS: &[(&str, &str)] = &[
+    ("/s", "per second"),
+    ("/min", "per minute"),
+    ("/h", "per hour"),
+];
+
+const ROC_SIGN: &[(&str, &str)] = &[("", "Signed"), ("abs", "Absolute")];
+
+const SAMPLE_MODES: &[(&str, &str)] = &[
+    ("auto", "Auto"),
+    ("5", "5"),
+    ("10", "10"),
+    ("20", "20"),
+    ("50", "50"),
+];
 
 fn field_row(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) -> bool {
     let mut changed = false;
@@ -776,6 +951,49 @@ fn field_row(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalett
             .add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY))
             .changed()
         {
+            changed = true;
+        }
+    });
+    changed
+}
+
+fn enum_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    choices: &[(&str, &str)],
+    salt: impl std::hash::Hash,
+    p: &ThemePalette,
+) -> bool {
+    let mut changed = false;
+    // Normalize unknown stored values to the first choice.
+    if !choices.iter().any(|(id, _)| *id == value.as_str()) {
+        if let Some((id, _)) = choices.first() {
+            *value = (*id).into();
+            changed = true;
+        }
+    }
+    let shown = choices
+        .iter()
+        .find(|(id, _)| *id == value.as_str())
+        .map(|(_, label)| (*label).to_string())
+        .unwrap_or_else(|| value.clone());
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [88.0, 20.0],
+            egui::Label::new(RichText::new(label).font(font_ui(12.0)).color(p.muted)),
+        );
+        let mut pick = value.clone();
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text(shown)
+            .width(ui.available_width().max(80.0))
+            .show_ui(ui, |ui| {
+                for (id, name) in choices {
+                    ui.selectable_value(&mut pick, (*id).to_string(), *name);
+                }
+            });
+        if pick != *value {
+            *value = pick;
             changed = true;
         }
     });
