@@ -2314,7 +2314,7 @@ fn edit_selected(
         }
         return edit_port(ui, model, p, mqtt_connections, mqtt, host);
     }
-    edit_hub(ui, model, mqtt, p)
+    edit_hub(ui, model, p)
 }
 
 fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
@@ -2897,12 +2897,7 @@ fn inspect_field(ui: &mut Ui, label: &str, value: &mut String, p: &ThemePalette)
     ui.add_space(2.0);
 }
 
-fn edit_hub(
-    ui: &mut Ui,
-    model: &mut HubModel,
-    mqtt: &mut MqttPanelState,
-    p: &ThemePalette,
-) -> HubChange {
+fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
     let Some(id) = model.selected else {
         ui.label(
             egui::RichText::new("Click a node to see it here.")
@@ -2930,36 +2925,32 @@ fn edit_hub(
     );
     ui.add_space(4.0);
     let current = model.hub(id).unwrap().protocol;
-    // Selector (not action buttons): pick the hub's one server-capable protocol.
-    let mut next = current;
-    egui::ComboBox::from_id_salt(("pb_hub_protocol", id))
-        .selected_text(current.label())
-        .width((ui.available_width()).min(220.0).max(120.0))
-        .show_ui(ui, |ui| {
-            for proto in HubProto::HUBS {
-                ui.selectable_value(&mut next, proto, proto.label());
-            }
-        });
-    if next != current {
-        model.set_hub_protocol(id, next);
-        change.dirty = true;
-    }
-    let current = model.hub(id).unwrap().protocol;
-    if current == HubProto::Mqtt {
-        ui.add_space(10.0);
-        // Same project-wide embedded broker as the MQTT panel (single hub broker).
-        let _ = crate::mqtt_panel::edit_embedded_broker(
-            ui,
-            &mut mqtt.embedded,
-            &mut mqtt.draft_broker_user,
-            &mut mqtt.draft_broker_pass,
-            p,
-        );
-    }
-    ui.add_space(8.0);
-    if text_button(ui, &format!("Open {} panel", current.label()), true, p).clicked() {
-        change.open = Some(current.pane());
-    }
+    // Protocol + open panel on one row (MQTT opens the broker/clients panel).
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        let mut next = current;
+        egui::ComboBox::from_id_salt(("pb_hub_protocol", id))
+            .selected_text(current.label())
+            .width(140.0)
+            .show_ui(ui, |ui| {
+                for proto in HubProto::HUBS {
+                    ui.selectable_value(&mut next, proto, proto.label());
+                }
+            });
+        if next != current {
+            model.set_hub_protocol(id, next);
+            change.dirty = true;
+        }
+        let current = model.hub(id).unwrap().protocol;
+        let open_label = if current == HubProto::Mqtt {
+            "Open MQTT panel/broker".to_string()
+        } else {
+            format!("Open {} panel", current.label())
+        };
+        if text_button(ui, &open_label, true, p).clicked() {
+            change.open = Some(current.pane());
+        }
+    });
     ui.add_space(10.0);
     if port_section(ui, model, id, true, p) {
         change.dirty = true;

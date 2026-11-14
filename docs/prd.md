@@ -70,13 +70,13 @@ Rules:
 - Wide subscribe may be broad; **only hub Input–defined paths become points** (pack traffic still feeds the topic tree).
 - Shared **topic tree** (TopicBench-style): MQTT panel preview + Input inspector. Tree is fed from pack `traffic` snapshot, merged with live point sources so it stays aligned with the Points panel.
 - MQTT Input diagram nodes show bound **point count** on the right of the title. Input inspector has no Hide/Remove — delete via diagram later.
-- Persist in `project.json` v5: `mqtt.clients[]`, `mqtt.embedded` (hub broker listen stub), `hubs` (binds), `points[]`, `next_point_seq`.
+- Persist in `project.json` v5: `mqtt.clients[]`, `mqtt.embedded` (hub broker listen; rumqttd Start/Stop in MQTT panel), `hubs` (binds), `points[]`, `next_point_seq`.
 
 ## What runs today, and what does not
 
 Today: the window, layout, themes, the hub diagram (Input/Output MQTT binds), the engine thread boundary, host point store (`pb-points`), pack loader, headless `pb-service`, and the **MQTT client pack** (connection + hub-node binds → points / publish; TCP / TLS / WS / WSS).
 
-Not yet: embedded MQTT broker (hub role), other protocol packs, Sparkplug, license signing enforcement, MSI, full UI↔service IPC / MCP. No file requester in this build. When one is added, it must not block the UI thread (blocking dialogs / vsync stalls on another Hyprland workspace trip “not responding”).
+Not yet: other protocol packs, Sparkplug, license signing enforcement, MSI, full UI↔service IPC / MCP. Embedded MQTT broker (rumqttd) Start/Stop is live in the MQTT panel. No file requester in this build. When one is added, it must not block the UI thread (blocking dialogs / vsync stalls on another Hyprland workspace trip “not responding”).
 
 ## Protocols
 

@@ -1,10 +1,13 @@
-//! MQTT client protocol pack (cdylib) for Protocol Bench.
+//! MQTT protocol pack (cdylib) for Protocol Bench.
 //!
-//! Multi-client: one pack handle owns many broker connections. Worker + EventLoop
-//! pattern from TopicBench `mqtt/live.rs` (no UI/tree). Broker hub role deferred.
+//! Multi-client rumqttc sessions + optional embedded rumqttd LAN broker.
+//! Worker + EventLoop pattern from TopicBench `mqtt/live.rs` (no UI/tree).
 
+mod broker;
 mod json_path;
 mod session;
+
+use broker::EmbeddedBroker;
 
 pub use json_path::{
     extract_path_value, migrate_point_id, point_id_for_client_field, point_id_for_client_topic,
@@ -212,6 +215,9 @@ impl ClientRuntime {
 struct PackState {
     host: PbHostApi,
     clients: BTreeMap<String, ClientRuntime>,
+    /// Embedded hub broker (at most one).
+    embedded: Option<EmbeddedBroker>,
+    embedded_error: String,
 }
 
 impl PackState {
@@ -219,6 +225,8 @@ impl PackState {
         Self {
             host,
             clients: BTreeMap::new(),
+            embedded: None,
+            embedded_error: String::new(),
         }
     }
 
@@ -618,8 +626,68 @@ impl PackState {
                 }
                 Ok(())
             }
+            "broker_start" => self.start_embedded(value),
+            "broker_stop" => {
+                self.stop_embedded();
+                Ok(())
+            }
             other => Err(format!("unknown op '{other}'")),
         }
+    }
+
+    fn start_embedded(&mut self, value: &Value) -> Result<(), String> {
+        self.stop_embedded();
+        let bind = value
+            .get("bind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0.0.0.0");
+        let port = value
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1883) as u16;
+        let users: Vec<(String, String)> = value
+            .get("users")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|u| {
+                        let username = u.get("username")?.as_str()?.to_string();
+                        if username.is_empty() {
+                            return None;
+                        }
+                        let password = u
+                            .get("password")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        Some((username, password))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        match EmbeddedBroker::start(bind, port, &users) {
+            Ok(broker) => {
+                let addr = broker.listen_addr();
+                self.embedded = Some(broker);
+                self.embedded_error.clear();
+                self.log(PB_LOG_INFO, &format!("embedded broker listening on {addr}"));
+                Ok(())
+            }
+            Err(e) => {
+                self.embedded_error = e.clone();
+                self.log(PB_LOG_ERROR, &format!("embedded broker: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    fn stop_embedded(&mut self) {
+        if let Some(broker) = self.embedded.take() {
+            let addr = broker.listen_addr();
+            broker.stop();
+            self.log(PB_LOG_INFO, &format!("embedded broker stopped ({addr})"));
+        }
+        self.embedded_error.clear();
     }
 
     fn any_connected(&self) -> bool {
@@ -627,6 +695,9 @@ impl PackState {
     }
 
     fn aggregate_state(&self) -> String {
+        if self.embedded.is_some() {
+            return "broker".into();
+        }
         if self.clients.is_empty() {
             return "idle".into();
         }
@@ -640,12 +711,16 @@ impl PackState {
     }
 
     fn aggregate_error(&self) -> String {
-        self.clients
-            .values()
-            .filter(|c| !c.last_error.is_empty())
-            .map(|c| format!("{}: {}", c.config.id, c.last_error))
-            .collect::<Vec<_>>()
-            .join("; ")
+        let mut parts = Vec::new();
+        if !self.embedded_error.is_empty() {
+            parts.push(format!("broker: {}", self.embedded_error));
+        }
+        for c in self.clients.values() {
+            if !c.last_error.is_empty() {
+                parts.push(format!("{}: {}", c.config.id, c.last_error));
+            }
+        }
+        parts.join("; ")
     }
 
     fn clients_snapshot_json(&self) -> String {
@@ -786,6 +861,7 @@ unsafe extern "C" fn destroy(handle: *mut c_void) {
         return;
     }
     let mut state = Box::from_raw(handle as *mut PackState);
+    state.stop_embedded();
     for rt in state.clients.values_mut() {
         PackState::stop_client(rt);
     }

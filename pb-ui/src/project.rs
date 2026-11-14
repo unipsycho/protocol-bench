@@ -13,7 +13,7 @@ use crate::mqtt_panel::{
 };
 use pb_points::{is_address_path, is_short_point_id, PointBinding, PointStore};
 
-/// v5: additive `mqtt.embedded` hub broker config (LAN listen stub).
+/// v5: additive `mqtt.embedded` hub broker config (rumqttd LAN listen).
 pub const PROJECT_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

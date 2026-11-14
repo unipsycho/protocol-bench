@@ -10,7 +10,7 @@ Entitlements are license-driven: **no fixed free protocol list** — the license
 
 ## MQTT client pack (first implementation)
 
-**Client-first.** `pb-mqtt` is a `cdylib` (+ `rlib` for unit tests) that speaks MQTT via **rumqttc 0.24** (`websocket` + `use-rustls`). It is a **source / output** client — **not** an embedded broker. Hub MQTT broker role is **deferred**.
+**Client-first + optional embed.** `pb-mqtt` is a `cdylib` (+ `rlib` for unit tests) that speaks MQTT via **rumqttc 0.24** (`websocket` + `use-rustls`) for source/output clients, and can start an optional **rumqttd 0.20** LAN listener from `mqtt.embedded` (Start/Stop in the MQTT panel).
 
 | Piece | Role |
 | --- | --- |
@@ -62,7 +62,7 @@ If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use th
 Editable wire config (not dock layout). Default path: `…/ProtocolBench/project.json` (via `directories` — e.g. `~/.config/protocolbench/project.json`). File → Open / Save as project uses a path dialog (non-blocking). MQTT panel and hub Input/Output bind changes autosave here.
 
 - **`mqtt.clients[]`** — connections + wide subscribe only (no Inputs/Outputs editors on the panel).  
-- **`mqtt.embedded`** — single hub broker listen config (bind/port/CONNECT users; rumqttd start later). Absent on older files → defaults (`0.0.0.0:1883`, disabled).  
+- **`mqtt.embedded`** — single hub broker listen config (bind/port/Connect users). MQTT panel Start/Stop runs rumqttd. Absent on older files → defaults (`0.0.0.0:1883`, disabled).  
 - **`hubs`** — diagram + per-port `mqtt_connection` / `mqtt_inputs` / `mqtt_outputs` (v4+). Older files without `hubs` keep the diagram from `ui.toml` until the next save.  
 - **`points` / `next_point_seq`** — short id bindings.
 

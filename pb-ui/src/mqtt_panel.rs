@@ -1,8 +1,7 @@
-//! MQTT panel: connections + embedded hub broker config (UI/persist).
+//! MQTT panel: embedded hub broker (rumqttd) + external broker connections.
 //!
 //! Point promotion lives on hub Input / Output nodes — many Inputs may share
 //! one connection; each node owns its own topic/field → point binds.
-//! Embedded rumqttd start/stop is stubbed until the pack wires it.
 
 use egui::{Color32, Layout, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2};
 use pb_engine::{EngineCommand, EngineHandle, EngineId, HostSnapshot};
@@ -44,7 +43,7 @@ pub struct EmbeddedBrokerConfig {
     pub bind: String,
     #[serde(default = "default_broker_listen_port")]
     pub port: u16,
-    /// CONNECT users; empty = anonymous OK (no topic ACL).
+    /// Connect users; empty = anonymous OK.
     #[serde(default)]
     pub users: Vec<BrokerUserStub>,
 }
@@ -127,9 +126,12 @@ pub struct MqttPanelState {
     pub trees: BTreeMap<String, TopicTree>,
     /// Project-wide embedded hub broker (single MQTT broker hub).
     pub embedded: EmbeddedBrokerConfig,
-    /// Draft row for adding a CONNECT user.
+    /// Draft row for adding a Connect user (Enter to add).
     pub draft_broker_user: String,
     pub draft_broker_pass: String,
+    /// Live rumqttd listen state (session UI; not persisted).
+    pub broker_running: bool,
+    pub broker_status: String,
 }
 
 impl Default for MqttPanelState {
@@ -141,6 +143,8 @@ impl Default for MqttPanelState {
             embedded: EmbeddedBrokerConfig::default(),
             draft_broker_user: String::new(),
             draft_broker_pass: String::new(),
+            broker_running: false,
+            broker_status: String::new(),
         }
     }
 }
@@ -368,25 +372,27 @@ fn paint_body(
 ) {
     let slot = host.slot(EngineId::Mqtt);
     let pack_loaded = slot.map(|s| s.pack_loaded).unwrap_or(false);
+    if !pack_loaded {
+        ui.label(
+            egui::RichText::new("MQTT pack not loaded. Build pb-mqtt into modules/.")
+                .font(font_ui(12.5))
+                .color(p.muted),
+        );
+        ui.add_space(8.0);
+    }
+
+    edit_embedded_broker(ui, state, engine, p);
+    ui.add_space(18.0);
+    panel_heading(ui, "External brokers / connections", p.live, p);
+    ui.add_space(4.0);
     ui.label(
-        egui::RichText::new(if pack_loaded {
-            "Clients = subscribe / Input traffic. Embedded hub broker = LAN listen (config only until rumqttd). Point binds live on hub Input / Output nodes."
-        } else {
-            "MQTT pack not loaded. Build pb-mqtt into modules/."
-        })
-        .font(font_ui(12.5))
+        egui::RichText::new(
+            "Outbound clients for subscribe / Input traffic and Output publish. Point binds live on hub nodes.",
+        )
+        .font(font_ui(12.0))
         .color(p.muted),
     );
     ui.add_space(8.0);
-
-    edit_embedded_broker(
-        ui,
-        &mut state.embedded,
-        &mut state.draft_broker_user,
-        &mut state.draft_broker_pass,
-        p,
-    );
-    ui.add_space(12.0);
 
     clients_bar(ui, state, engine, hubs, p);
     ui.add_space(10.0);
@@ -466,7 +472,6 @@ fn clients_bar(
     hubs: &HubModel,
     p: &ThemePalette,
 ) {
-    section(ui, "CONNECTIONS", p);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
         let mut select = None;
@@ -659,59 +664,64 @@ fn topic_tree_preview(
         });
 }
 
-/// Shared embedded-broker editor (MQTT panel + Hub MQTT props).
-/// Returns true when any field changed (autosave compares `MqttProject`).
-pub fn edit_embedded_broker(
+/// Strong panel section title (accent / live color).
+fn panel_heading(ui: &mut egui::Ui, title: &str, color: egui::Color32, _p: &ThemePalette) {
+    ui.label(
+        egui::RichText::new(title)
+            .font(font_semi(15.0))
+            .color(color),
+    );
+}
+
+/// Embedded hub broker editor (MQTT panel only). Autosave via `MqttProject`.
+fn edit_embedded_broker(
     ui: &mut egui::Ui,
-    cfg: &mut EmbeddedBrokerConfig,
-    draft_user: &mut String,
-    draft_pass: &mut String,
+    state: &mut MqttPanelState,
+    engine: &EngineHandle,
     p: &ThemePalette,
-) -> bool {
-    let mut dirty = false;
-    section(ui, "EMBEDDED HUB BROKER", p);
+) {
+    panel_heading(ui, "Embedded hub broker", p.accent, p);
+    ui.add_space(4.0);
     ui.label(
         egui::RichText::new(
-            "Single project broker — LAN listen. rumqttd start/stop not wired yet; settings persist in project.json.",
+            "Single project rumqttd listener for LAN. Empty Connect users allow anonymous.",
         )
         .font(font_ui(12.0))
         .color(p.muted),
     );
     ui.add_space(6.0);
     if ui
-        .checkbox(&mut cfg.enabled, "Enabled (start when pack supports it)")
+        .checkbox(&mut state.embedded.enabled, "Enabled")
         .changed()
     {
-        dirty = true;
+        // Persist only — Start still required to listen.
     }
     ui.add_space(4.0);
     {
-        let mut bind = cfg.bind.clone();
+        let mut bind = state.embedded.bind.clone();
         field(ui, "Bind", &mut bind, p);
-        if bind != cfg.bind {
-            cfg.bind = bind;
-            dirty = true;
+        if bind != state.embedded.bind {
+            state.embedded.bind = bind;
         }
     }
     {
-        let mut port = cfg.port.to_string();
+        let mut port = state.embedded.port.to_string();
         field(ui, "Port", &mut port, p);
         if let Ok(n) = port.trim().parse::<u16>() {
-            if n != cfg.port {
-                cfg.port = n;
-                dirty = true;
+            if n != state.embedded.port {
+                state.embedded.port = n;
             }
         }
     }
-    ui.add_space(6.0);
+    ui.add_space(8.0);
     ui.label(
-        egui::RichText::new("CONNECT USERS — empty = anonymous OK (no topic ACL)")
+        egui::RichText::new("Connect users")
             .font(font_ui(10.5))
             .color(p.muted),
     );
     ui.add_space(4.0);
     let mut remove = None;
-    for (i, user) in cfg.users.iter().enumerate() {
+    for (i, user) in state.embedded.users.iter().enumerate() {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(format!("{}  ·  ••••", user.username))
@@ -724,42 +734,141 @@ pub fn edit_embedded_broker(
         });
     }
     if let Some(i) = remove {
-        cfg.users.remove(i);
-        dirty = true;
+        state.embedded.users.remove(i);
     }
-    field(ui, "Username", draft_user, p);
-    password(ui, "Password", draft_pass, p);
-    if text_btn(ui, "Add user", false, p).clicked() {
-        let u = draft_user.trim().to_string();
-        if !u.is_empty() {
-            if !cfg.users.iter().any(|x| x.username == u) {
-                cfg.users.push(BrokerUserStub {
-                    username: u,
-                    password: draft_pass.clone(),
-                });
-                dirty = true;
-            }
-            draft_user.clear();
-            draft_pass.clear();
-        }
-    }
-    ui.add_space(4.0);
+    // Draft fields — Enter in either field adds the user (no Add user button).
+    let mut add_user = false;
     ui.horizontal(|ui| {
-        let label = if cfg.enabled {
-            "Start broker (stub)"
-        } else {
-            "Start broker (enable first)"
-        };
-        let r = text_btn(ui, label, cfg.enabled, p);
-        if r.clicked() && cfg.enabled {
-            // Persist intent only — pack start/stop comes later.
-            dirty = true;
+        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.add_sized(
+            [LABEL_W, 20.0],
+            egui::Label::new(
+                egui::RichText::new("Username")
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            ),
+        );
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut state.draft_broker_user).desired_width(f32::INFINITY),
+        );
+        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            add_user = true;
         }
-        r.on_hover_text("rumqttd not wired yet; config is saved for when the pack starts.");
-        let _ = text_btn(ui, "Stop (stub)", false, p)
-            .on_hover_text("No live broker process yet.");
     });
-    dirty
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.add_sized(
+            [LABEL_W, 20.0],
+            egui::Label::new(
+                egui::RichText::new("Password")
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            ),
+        );
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut state.draft_broker_pass)
+                .password(true)
+                .desired_width(f32::INFINITY),
+        );
+        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            add_user = true;
+        }
+    });
+    if add_user {
+        let u = state.draft_broker_user.trim().to_string();
+        if !u.is_empty() && !state.embedded.users.iter().any(|x| x.username == u) {
+            state.embedded.users.push(BrokerUserStub {
+                username: u,
+                password: state.draft_broker_pass.clone(),
+            });
+            state.draft_broker_user.clear();
+            state.draft_broker_pass.clear();
+        }
+    }
+
+    ui.add_space(14.0);
+    if !state.broker_status.is_empty() {
+        let color = if state.broker_running { p.ok } else { p.warn };
+        ui.label(
+            egui::RichText::new(&state.broker_status)
+                .font(font_ui(12.0))
+                .color(color),
+        );
+        ui.add_space(6.0);
+    }
+    let (start, stop) = {
+        let can_start = state.embedded.enabled && !state.broker_running;
+        let running = state.broker_running;
+        let start_label = if running { "Running" } else { "Start broker" };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let start = text_btn(ui, start_label, can_start, p).clicked() && can_start;
+            ui.add_space(18.0);
+            let stop = text_btn(ui, "Stop", running, p).clicked() && running;
+            (start, stop)
+        })
+        .inner
+    };
+    if start {
+        start_embedded_broker(engine, state);
+    }
+    if stop {
+        stop_embedded_broker(engine, state);
+    }
+}
+
+fn start_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState) {
+    let users: Vec<serde_json::Value> = state
+        .embedded
+        .users
+        .iter()
+        .map(|u| {
+            serde_json::json!({
+                "username": u.username,
+                "password": u.password,
+            })
+        })
+        .collect();
+    let json = serde_json::json!({
+        "op": "broker_start",
+        "bind": state.embedded.bind,
+        "port": state.embedded.port,
+        "users": users,
+    })
+    .to_string();
+    engine.submit(EngineId::Mqtt, EngineCommand::Configure { json });
+    let addr = format!("{}:{}", state.embedded.bind, state.embedded.port);
+    // Engine applies configure asynchronously; probe loopback after a short wait.
+    let port = state.embedded.port;
+    let probe = std::thread::spawn(move || {
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let sock = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            if std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(100))
+                .is_ok()
+            {
+                return true;
+            }
+        }
+        false
+    });
+    // Block briefly so the status line is honest before the next frame.
+    let ok = probe.join().unwrap_or(false);
+    if ok {
+        state.broker_running = true;
+        state.broker_status = format!("Listening on {addr}");
+    } else {
+        state.broker_running = false;
+        state.broker_status = format!("Could not confirm listen on {addr}");
+    }
+}
+
+fn stop_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState) {
+    let json = serde_json::json!({ "op": "broker_stop" }).to_string();
+    engine.submit(EngineId::Mqtt, EngineCommand::Configure { json });
+    state.broker_running = false;
+    state.broker_status = "Stopped".into();
 }
 
 fn section(ui: &mut egui::Ui, label: &str, p: &ThemePalette) {

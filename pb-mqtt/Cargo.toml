@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 publish.workspace = true
-description = "MQTT client protocol pack for Protocol Bench (rumqttc)"
+description = "MQTT protocol pack for Protocol Bench (rumqttc client + rumqttd embedded broker)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -14,5 +14,7 @@ name = "pb_mqtt"
 [dependencies]
 pb-abi = { workspace = true }
 rumqttc = { workspace = true }
+rumqttd = { workspace = true }
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

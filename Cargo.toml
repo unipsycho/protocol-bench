@@ -34,5 +34,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 libloading = "0.8"
 # websocket = MQTT over WS/WSS; use-rustls is rumqttc default (TLS + WSS).
 rumqttc = { version = "0.24", features = ["websocket", "use-rustls"] }
+# Embedded MQTT hub broker (LAN listen). Default features: rustls + websocket.
+rumqttd = { version = "0.20", default-features = true }
+tokio = { version = "1", features = ["rt", "sync", "macros", "net", "time"] }
 ctrlc = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

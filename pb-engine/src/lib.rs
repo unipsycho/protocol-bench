@@ -61,7 +61,7 @@ impl EngineId {
             Self::Streams => "Owns serial ports and TCP sockets. No port is open in this build.",
             Self::Modbus => "Owns Modbus RTU and TCP sessions. No session is open in this build.",
             Self::Mqtt => {
-                "MQTT client pack (source/output). Embedded broker / hub role is not active yet."
+                "MQTT client pack (source/output) plus optional embedded rumqttd LAN broker."
             }
             Self::OpcUa => {
                 "Owns OPC UA client and server sessions. No session is open in this build."
