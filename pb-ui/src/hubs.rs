@@ -2130,7 +2130,13 @@ fn diagram_view(
                 })
             {
                 feed_hit = Some(idx);
-                child.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                // Endpoint grab → wire cursor; curve body stays a select hand (PB-86).
+                let on_end = hit_feed_endpoint(model, &screen, pos, zoom).is_some();
+                child.ctx().set_cursor_icon(if on_end {
+                    egui::CursorIcon::Crosshair
+                } else {
+                    egui::CursorIcon::PointingHand
+                });
                 if canvas.clicked() || canvas.secondary_clicked() {
                     model.select_feed(Some(idx));
                     change.dirty = true;
@@ -2251,6 +2257,7 @@ fn diagram_view(
     if rewiring.is_some() {
         gesture.drag = None;
         gesture.drag_started = false;
+        child.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
     }
     if let Some(state) = rewiring {
         if let Some(pos) = pointer {
@@ -2870,20 +2877,24 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
             node.port_id.unwrap_or(0),
             node.role as u8,
         ));
-        // Hub / Input / Calc / Agg can start wires (PB-73).
-        let can_feed = matches!(
+        // Hub / Input / Output / Calc / Agg can start a wire either direction (PB-85).
+        let can_wire = matches!(
             node.role,
-            Role::Hub | Role::Source | Role::Aggregator | Role::Calculation
+            Role::Hub
+                | Role::Source
+                | Role::Output
+                | Role::Aggregator
+                | Role::Calculation
         );
         let tip = match node.role {
             Role::Source | Role::Output => {
-                "Drag to move. Alt-drag or drag a port edge to wire. Grab wire ends to reattach. Click for details."
+                "Drag body to move. Left/right port or Alt-drag to wire. Grab wire ends to reattach. Click for details."
             }
             Role::Aggregator | Role::Calculation => {
-                "Drag to move. Alt-drag or drag a port edge onto Output/Calc/Agg. Click for details."
+                "Drag body to move. Left port ← Hub/Input; right port → Output (either drag direction). Click for details."
             }
             Role::Hub => {
-                "Drag to move. Alt-drag or drag a port edge → Calc/Agg/Output to wire. Click for details."
+                "Drag body to move. Port edge or Alt-drag → Calc/Agg/Output to wire. Click for details."
             }
         };
         let resp = ui
@@ -2895,9 +2906,9 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
         // Sticky wire arm keeps wiring after leaving the edge (PB-75).
         let arm_id = Id::new(("pb_hub_wire_arm", node.hub_id, node.port_id.unwrap_or(0)));
         let move_id = Id::new(("pb_hub_move_only", node.hub_id, node.port_id.unwrap_or(0)));
-        let port_press = can_feed
-            && pointer.is_some_and(|pos| near_port_edge(node.rect, pos));
-        let wire_at_press = can_feed && (alt || port_press);
+        let on_port = pointer.is_some_and(|pos| near_port_edge(node.rect, pos));
+        let port_press = can_wire && on_port;
+        let wire_at_press = can_wire && (alt || port_press);
         if !panning && resp.drag_started() {
             if wire_at_press {
                 ui.ctx().data_mut(|d| d.insert_temp(arm_id, true));
@@ -2914,15 +2925,18 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
         let armed = ui.ctx().data(|d| d.get_temp::<bool>(arm_id)).unwrap_or(false);
         let move_only = ui.ctx().data(|d| d.get_temp::<bool>(move_id)).unwrap_or(false);
         // Mid-gesture: only the latched mode counts — never re-arm from live pointer.
-        let start_wire = can_feed && armed && !move_only;
+        let start_wire = can_wire && armed && !move_only;
         if !panning && (resp.hovered() || resp.dragged()) {
             gesture.hover = Some(key);
+            // PB-86: body = grab; left/right port (or active wire) = crosshair.
             let cursor = if resp.dragged() {
                 if start_wire {
                     egui::CursorIcon::Crosshair
                 } else {
                     egui::CursorIcon::Grabbing
                 }
+            } else if can_wire && on_port {
+                egui::CursorIcon::Crosshair
             } else {
                 egui::CursorIcon::Grab
             };
@@ -3324,23 +3338,11 @@ fn paint_step_node(
     let z = zoom.max(0.35);
     let ink = p.accent;
     paint_card(painter, node.rect, ink, on, hot, p);
-    let bar = Rect::from_min_max(
-        node.rect.min,
-        pos2(node.rect.min.x + 4.0 * z, node.rect.max.y),
-    );
-    painter.rect_filled(
-        bar,
-        Rounding {
-            nw: 7.0 * z,
-            ne: 0.0,
-            sw: 7.0 * z,
-            se: 0.0,
-        },
-        ink,
-    );
+    // PB-85: always both sides — left ← Hub/Input, right → Output — even when unbound.
+    paint_step_ports(painter, node.rect, ink, z);
     let clip = Rect::from_min_max(
         pos2(node.rect.min.x + 12.0 * z, node.rect.min.y),
-        pos2(node.rect.max.x - 8.0 * z, node.rect.max.y),
+        pos2(node.rect.max.x - 12.0 * z, node.rect.max.y),
     );
     let role = if node.role == Role::Aggregator {
         "AGG"
@@ -3361,6 +3363,17 @@ fn paint_step_node(
         font_ui(13.0 * z),
         p.text,
     );
+}
+
+/// Left + right wire knobs on Calc/Agg (always visible, including orphans) (PB-85).
+fn paint_step_ports(painter: &egui::Painter, rect: Rect, ink: Color32, z: f32) {
+    let r = (3.6 * z).clamp(2.5, 5.5);
+    let left = pos2(rect.min.x, rect.center().y);
+    let right = pos2(rect.max.x, rect.center().y);
+    for c in [left, right] {
+        painter.circle_filled(c, r, ink);
+        painter.circle_stroke(c, r + 0.6, Stroke::new(1.1, ink));
+    }
 }
 
 fn paint_card(
@@ -5162,6 +5175,33 @@ mod tests {
         assert!((calc_node.rect.center().y - at[1]).abs() < 0.5);
         assert!((agg_node.rect.center().x - 400.0).abs() < 0.5);
         assert!((agg_node.rect.center().y - 220.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn orphan_agg_wires_to_output_either_direction() {
+        // PB-85: Agg ↔ OUT MQTT sticks both drag directions.
+        let mut model = HubModel::sample();
+        let hub = model.hubs[1].id;
+        let out = model.hubs[1].outputs[0].id;
+        let agg = model
+            .add_orphan_step(hub, true, Some([280.0, 200.0]))
+            .unwrap();
+        assert!(model.is_feeder(hub, agg));
+        assert!(model.is_sink(hub, out));
+        // Agg → Output
+        assert!(model.connect_wire_nodes(hub, agg, hub, out));
+        assert_eq!(model.feeds.len(), 1);
+        assert_eq!(model.feeds[0].from_node, agg);
+        assert_eq!(model.feeds[0].to_node, out);
+        let nodes = layout_nodes(&model.hubs);
+        assert!(feed_ends(&nodes, &model.feeds[0]).is_some());
+        model.feeds.clear();
+        // Output → Agg (must reverse to Agg → Output)
+        assert!(model.connect_wire_nodes(hub, out, hub, agg));
+        assert_eq!(model.feeds.len(), 1);
+        assert_eq!(model.feeds[0].from_node, agg);
+        assert_eq!(model.feeds[0].to_node, out);
+        assert!(feed_ends(&layout_nodes(&model.hubs), &model.feeds[0]).is_some());
     }
 
     #[test]
