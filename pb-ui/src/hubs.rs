@@ -2603,7 +2603,13 @@ fn hit_wire_target(nodes: &[Placed], pos: Pos2) -> Option<&Placed> {
 }
 
 /// Left/right strip of a node — drag here to start a wire without Alt (PB-73).
+/// Must be inside the node (with a tiny pad); outside the body is never a port hit (PB-82).
 fn near_port_edge(rect: Rect, pos: Pos2) -> bool {
+    let pad = 2.0;
+    let hit = rect.expand(pad);
+    if !hit.contains(pos) {
+        return false;
+    }
     let margin = 18.0;
     pos.x <= rect.min.x + margin || pos.x >= rect.max.x - margin
 }
@@ -2824,19 +2830,31 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
             .interact(node.rect, id, Sense::click_and_drag())
             .on_hover_text(tip);
         let key = (node.hub_id, node.port_id);
-        // Sticky wire arm: once started on port-edge/Alt, keep wiring for this drag (PB-75).
+        // Wire vs move is latched at drag_started only (PB-82). Body drag never
+        // converts to wire when the pointer later crosses a port strip / leaves the rect.
+        // Sticky wire arm keeps wiring after leaving the edge (PB-75).
         let arm_id = Id::new(("pb_hub_wire_arm", node.hub_id, node.port_id.unwrap_or(0)));
-        let port_drag = can_feed
+        let move_id = Id::new(("pb_hub_move_only", node.hub_id, node.port_id.unwrap_or(0)));
+        let port_press = can_feed
             && pointer.is_some_and(|pos| near_port_edge(node.rect, pos));
-        let arm_now = can_feed && (alt || port_drag);
-        if !panning && resp.drag_started() && arm_now {
-            ui.ctx().data_mut(|d| d.insert_temp(arm_id, true));
+        let wire_at_press = can_feed && (alt || port_press);
+        if !panning && resp.drag_started() {
+            if wire_at_press {
+                ui.ctx().data_mut(|d| d.insert_temp(arm_id, true));
+            } else {
+                ui.ctx().data_mut(|d| d.insert_temp(move_id, true));
+            }
         }
         if resp.drag_stopped() || ui.input(|i| i.pointer.any_released()) {
-            ui.ctx().data_mut(|d| d.remove_temp::<bool>(arm_id));
+            ui.ctx().data_mut(|d| {
+                d.remove_temp::<bool>(arm_id);
+                d.remove_temp::<bool>(move_id);
+            });
         }
         let armed = ui.ctx().data(|d| d.get_temp::<bool>(arm_id)).unwrap_or(false);
-        let start_wire = can_feed && (arm_now || armed);
+        let move_only = ui.ctx().data(|d| d.get_temp::<bool>(move_id)).unwrap_or(false);
+        // Mid-gesture: only the latched mode counts — never re-arm from live pointer.
+        let start_wire = can_feed && armed && !move_only;
         if !panning && (resp.hovered() || resp.dragged()) {
             gesture.hover = Some(key);
             let cursor = if resp.dragged() {
@@ -5242,5 +5260,17 @@ mod tests {
         let b = half[0].rect;
         assert!((b.width() - a.width() * 0.5).abs() < 0.01);
         assert!((b.center().x - a.center().x * 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn port_edge_hit_stays_inside_node() {
+        // PB-82: leaving the body must not count as a port-edge press.
+        let rect = Rect::from_min_size(pos2(100.0, 100.0), vec2(160.0, 68.0));
+        assert!(near_port_edge(rect, pos2(105.0, 130.0))); // left strip
+        assert!(near_port_edge(rect, pos2(255.0, 130.0))); // right strip
+        assert!(!near_port_edge(rect, pos2(180.0, 130.0))); // body center
+        assert!(!near_port_edge(rect, pos2(50.0, 130.0))); // outside left
+        assert!(!near_port_edge(rect, pos2(300.0, 130.0))); // outside right
+        assert!(!near_port_edge(rect, pos2(105.0, 50.0))); // outside above strip
     }
 }

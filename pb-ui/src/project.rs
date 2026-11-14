@@ -707,6 +707,7 @@ mod tests {
             }],
             next_point_seq: 2,
             mqtt: MqttProject::from_panel(&panel),
+            opcua: OpcUaProject::default(),
             hubs: None,
             settings: ProjectSettings {
                 auto_run_embedded_broker: true,
