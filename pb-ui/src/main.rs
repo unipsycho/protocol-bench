@@ -5,6 +5,7 @@
 mod app;
 mod art;
 mod brand_logo;
+mod calc_panel;
 mod dnd;
 mod dock;
 mod hubs;

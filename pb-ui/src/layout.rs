@@ -110,7 +110,12 @@ impl LayoutNode {
                         SplitDir::Col,
                         0.50,
                         leaf(DockPane::Points),
-                        leaf(DockPane::Mappings),
+                        split(
+                            SplitDir::Col,
+                            0.50,
+                            leaf(DockPane::Calculations),
+                            leaf(DockPane::Mappings),
+                        ),
                     ),
                 ),
                 split(

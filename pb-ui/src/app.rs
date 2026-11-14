@@ -13,11 +13,12 @@ use crate::brand_logo::AaLogoCache;
 use crate::dnd::{self, DropCommit, PaneHit};
 use crate::dock::DockPane;
 use crate::layout::{LayoutNode, SplitDir, TabGroup};
+use crate::calc_panel::CalcPanelState;
 use crate::mqtt_panel::{self, MqttPanelState};
 use crate::panels::PointsPanelState;
 use crate::panels;
 use crate::persist::{self, UiState};
-use crate::project::{self, MqttProject, ProjectFile};
+use crate::project::{self, MqttProject, ProjectFile, ProjectSettings};
 use crate::theme::{
     self, divider_bar, font_semi, font_ui, tint, AppTheme, ThemePalette, BAR_H, HEADER_H, MIN_PANE,
     RADIUS, RAIL_W, SEP, STATUS_H,
@@ -45,6 +46,11 @@ pub struct ProtocolBenchApp {
     last_save: Instant,
     mqtt: MqttPanelState,
     points: PointsPanelState,
+    calc: CalcPanelState,
+    /// Project-level options (Project panel / project.json).
+    project_settings: ProjectSettings,
+    /// Last settings snapshot written to the project file.
+    settings_saved: ProjectSettings,
     /// Current JSON project path (MQTT + hubs + points).
     project_path: PathBuf,
     /// Last MQTT snapshot written to the project file.
@@ -98,6 +104,7 @@ impl ProtocolBenchApp {
         });
         let mut mqtt = MqttPanelState::default();
         let mut mqtt_saved = MqttProject::default();
+        let mut project_settings = ProjectSettings::default();
         let mut status = "Ready".into();
         let engine = EngineHandle::spawn();
         let mut ui_state = ui_state;
@@ -105,6 +112,7 @@ impl ProtocolBenchApp {
             match project::load(&project_path) {
                 Ok(file) => {
                     file.mqtt.apply_to_panel(&mut mqtt);
+                    project_settings = file.settings.clone();
                     if let Some(hubs) = file.hubs {
                         ui_state.hubs = hubs;
                         // Rebuild ephemeral canvas selection from persisted selected/port.
@@ -121,6 +129,12 @@ impl ProtocolBenchApp {
                     project::migrate_client_binds_to_hubs(&mut mqtt, &mut ui_state.hubs);
                     mqtt_saved = MqttProject::from_panel(&mqtt);
                     mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &ui_state.hubs);
+                    mqtt_panel::maybe_auto_start_embedded(
+                        &engine,
+                        &mut mqtt,
+                        &ui_state.hubs,
+                        project_settings.auto_run_embedded_broker,
+                    );
                     status = format!("Loaded project {}", project_path.display());
                 }
                 Err(err) => {
@@ -129,6 +143,7 @@ impl ProtocolBenchApp {
             }
         }
         let hubs_saved = ui_state.hubs.clone();
+        let settings_saved = project_settings.clone();
         Self {
             engine,
             ui_state,
@@ -146,6 +161,9 @@ impl ProtocolBenchApp {
             last_save: Instant::now(),
             mqtt,
             points: PointsPanelState::default(),
+            calc: CalcPanelState::default(),
+            project_settings,
+            settings_saved,
             project_path,
             mqtt_saved,
             hubs_saved,
@@ -175,7 +193,8 @@ impl ProtocolBenchApp {
         let current = MqttProject::from_panel(&self.mqtt);
         let mqtt_dirty = current != self.mqtt_saved;
         let hubs_dirty = self.ui_state.hubs != self.hubs_saved;
-        let min_age = if mqtt_dirty || hubs_dirty {
+        let settings_dirty = self.project_settings != self.settings_saved;
+        let min_age = if mqtt_dirty || hubs_dirty || settings_dirty {
             Duration::from_millis(500)
         } else {
             // Flush new short-id bindings from live traffic.
@@ -209,10 +228,12 @@ impl ProtocolBenchApp {
             next_point_seq,
             mqtt: mqtt.clone(),
             hubs: Some(self.ui_state.hubs.clone()),
+            settings: self.project_settings.clone(),
         };
         project::save(&self.project_path, &file)?;
         self.mqtt_saved = mqtt;
         self.hubs_saved = self.ui_state.hubs.clone();
+        self.settings_saved = self.project_settings.clone();
         self.last_project_save = Instant::now();
         Ok(())
     }
@@ -220,6 +241,7 @@ impl ProtocolBenchApp {
     fn load_project_from_path(&mut self, path: PathBuf) -> Result<(), String> {
         let file = project::load(&path)?;
         file.mqtt.apply_to_panel(&mut self.mqtt);
+        self.project_settings = file.settings.clone();
         if let Some(hubs) = file.hubs {
             self.ui_state.hubs = hubs;
             self.ui_state.hubs.sanitize();
@@ -231,8 +253,15 @@ impl ProtocolBenchApp {
         project::migrate_client_binds_to_hubs(&mut self.mqtt, &mut self.ui_state.hubs);
         self.mqtt_saved = MqttProject::from_panel(&self.mqtt);
         self.hubs_saved = self.ui_state.hubs.clone();
+        self.settings_saved = self.project_settings.clone();
         self.project_path = path;
         mqtt_panel::apply_mqtt_session(&self.engine, &mut self.mqtt, &self.ui_state.hubs);
+        mqtt_panel::maybe_auto_start_embedded(
+            &self.engine,
+            &mut self.mqtt,
+            &self.ui_state.hubs,
+            self.project_settings.auto_run_embedded_broker,
+        );
         self.status = format!("Opened {}", self.project_path.display());
         Ok(())
     }
@@ -1249,6 +1278,7 @@ impl ProtocolBenchApp {
                     .layout(Layout::top_down(egui::Align::Min)),
             );
             body_ui.set_clip_rect(body.expand(2.0).intersect(clip));
+            let prev_auto = self.project_settings.auto_run_embedded_broker;
             let hub_change = panels::paint(
                 &mut body_ui,
                 active,
@@ -1258,6 +1288,9 @@ impl ProtocolBenchApp {
                 &self.engine,
                 &mut self.mqtt,
                 &mut self.points,
+                &mut self.calc,
+                &mut self.project_settings,
+                &self.project_path,
             );
             if hub_change.dirty {
                 self.mark_dirty();
@@ -1266,6 +1299,15 @@ impl ProtocolBenchApp {
                     &self.engine,
                     &mut self.mqtt,
                     &self.ui_state.hubs,
+                );
+            }
+            // Honor auto-run when the Project checkbox is turned on.
+            if self.project_settings.auto_run_embedded_broker && !prev_auto {
+                mqtt_panel::maybe_auto_start_embedded(
+                    &self.engine,
+                    &mut self.mqtt,
+                    &self.ui_state.hubs,
+                    true,
                 );
             }
             if let Some(pane) = hub_change.open {

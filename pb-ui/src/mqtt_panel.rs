@@ -962,6 +962,19 @@ fn stop_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState, hubs:
     apply_mqtt_session(engine, state, hubs);
 }
 
+/// Start the embedded hub broker when project settings ask for it and config is enabled.
+pub fn maybe_auto_start_embedded(
+    engine: &EngineHandle,
+    state: &mut MqttPanelState,
+    hubs: &HubModel,
+    auto_run: bool,
+) {
+    if !auto_run || !state.embedded.enabled || state.broker_running {
+        return;
+    }
+    start_embedded_broker(engine, state, hubs);
+}
+
 fn section(ui: &mut egui::Ui, label: &str, p: &ThemePalette) {
     ui.label(
         egui::RichText::new(label)

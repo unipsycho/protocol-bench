@@ -13,8 +13,16 @@ use crate::mqtt_panel::{
 };
 use pb_points::{is_address_path, is_short_point_id, PointBinding, PointStore};
 
-/// v5: additive `mqtt.embedded` hub broker config (rumqttd LAN listen).
-pub const PROJECT_VERSION: u32 = 5;
+/// v6: additive `settings.auto_run_embedded_broker`.
+pub const PROJECT_VERSION: u32 = 6;
+
+/// Project-level options (Project panel).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ProjectSettings {
+    /// When true, start the embedded hub broker on load if `mqtt.embedded.enabled`.
+    #[serde(default)]
+    pub auto_run_embedded_broker: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectFile {
@@ -31,6 +39,8 @@ pub struct ProjectFile {
     /// Hub diagram + Input/Output MQTT binds. Absent on older files → keep ui.toml hubs.
     #[serde(default)]
     pub hubs: Option<HubModel>,
+    #[serde(default)]
+    pub settings: ProjectSettings,
 }
 
 fn default_next_point_seq() -> u64 {
@@ -49,6 +59,7 @@ impl Default for ProjectFile {
             next_point_seq: 1,
             mqtt: MqttProject::default(),
             hubs: None,
+            settings: ProjectSettings::default(),
         }
     }
 }
@@ -456,6 +467,7 @@ pub fn load(path: &Path) -> Result<ProjectFile, String> {
                 embedded: EmbeddedBrokerConfig::default(),
             },
             hubs: None,
+            settings: ProjectSettings::default(),
         });
     }
     let mut project: ProjectFile = serde_json::from_value(value).map_err(|e| e.to_string())?;
@@ -530,6 +542,9 @@ mod tests {
             next_point_seq: 2,
             mqtt: MqttProject::from_panel(&panel),
             hubs: None,
+            settings: ProjectSettings {
+                auto_run_embedded_broker: true,
+            },
         };
         let text = serde_json::to_string_pretty(&project).unwrap();
         let back: ProjectFile = serde_json::from_str(&text).unwrap();

@@ -5,10 +5,12 @@ use egui::{Align2, Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
 use pb_engine::{EngineHandle, HostSnapshot};
 
 use crate::art;
+use crate::calc_panel::{self, CalcPanelState};
 use crate::dock::DockPane;
 use crate::hubs::HubModel;
 use crate::mqtt_panel::{self, MqttPanelState};
 use crate::point_rows::{self, PointsTableRow, PointsTableState};
+use crate::project::ProjectSettings;
 use crate::theme::{font_semi, font_ui, scope, tint, ThemePalette};
 
 /// Points panel filter + sort (session UI state).
@@ -37,9 +39,12 @@ pub fn paint(
     engine: &EngineHandle,
     mqtt: &mut MqttPanelState,
     points: &mut PointsPanelState,
+    calc: &mut CalcPanelState,
+    settings: &mut ProjectSettings,
+    project_path: &std::path::Path,
 ) -> crate::hubs::HubChange {
     match pane {
-        DockPane::Project => project_panel(ui, hubs, p),
+        DockPane::Project => project_panel(ui, hubs, settings, project_path, p),
         DockPane::Hubs => {
             // Sync trees so Input inspector can pick topics from live traffic.
             mqtt.sync_trees_from_host(host);
@@ -54,6 +59,13 @@ pub fn paint(
             points_panel(ui, host, p, points);
             crate::hubs::HubChange::quiet()
         }
+        DockPane::Calculations => {
+            let mut change = crate::hubs::HubChange::quiet();
+            if calc_panel::paint_panel(ui, hubs, calc, p) {
+                change.dirty = true;
+            }
+            change
+        } // hubs mut passed for Apply-to-selection
         _ => {
             scaffold_panel(ui, pane, host, p);
             crate::hubs::HubChange::quiet()
@@ -189,6 +201,9 @@ fn blurb(pane: DockPane, host: &HostSnapshot) -> String {
     match pane {
         DockPane::Project => "Hubs, inputs, outputs, and edge transforms for this project.".into(),
         DockPane::Points => "Live values from every wired protocol input.".into(),
+        DockPane::Calculations => {
+            "Edge transforms between Input/node and Output — scale, filter, formula.".into()
+        }
         DockPane::Mappings => "A point that arrives on one link can leave on another.".into(),
         DockPane::Traffic => "Bytes and frames from every link, when capture exists.".into(),
         _ => String::new(),
@@ -337,7 +352,7 @@ fn columns(pane: DockPane) -> &'static [(&'static str, f32)] {
         DockPane::Mqtt => &[("TOPIC", 0.50), ("DIR", 0.22), ("QOS", 0.28)],
         DockPane::OpcUa => &[("NODE", 0.42), ("ACCESS", 0.24), ("POINT", 0.34)],
         DockPane::Files => &[("PATH", 0.48), ("PARSER", 0.24), ("OFFSET", 0.28)],
-        DockPane::Project | DockPane::Hubs => &[("NAME", 1.0)],
+        DockPane::Project | DockPane::Hubs | DockPane::Calculations => &[("NAME", 1.0)],
     }
 }
 
@@ -351,23 +366,51 @@ fn empty_message(pane: DockPane) -> &'static str {
         DockPane::Mqtt => "No topics yet",
         DockPane::OpcUa => "No nodes yet",
         DockPane::Files => "No files yet",
-        DockPane::Project | DockPane::Hubs => "",
+        DockPane::Project | DockPane::Hubs | DockPane::Calculations => "",
     }
 }
 
 fn project_panel(
     ui: &mut egui::Ui,
     hubs: &HubModel,
+    settings: &mut ProjectSettings,
+    project_path: &std::path::Path,
     p: &ThemePalette,
 ) -> crate::hubs::HubChange {
+    let mut change = crate::hubs::HubChange::quiet();
     egui::ScrollArea::vertical()
         .id_salt("pb_project_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            title_row(ui, p);
+            title_row(ui, project_path, p);
             ui.add_space(10.0);
             stat_row(ui, hubs, p);
-            ui.add_space(14.0);
+            ui.add_space(16.0);
+            ui.label(
+                egui::RichText::new("OPTIONS")
+                    .font(font_ui(10.5))
+                    .color(p.muted),
+            );
+            ui.add_space(6.0);
+            if ui
+                .checkbox(
+                    &mut settings.auto_run_embedded_broker,
+                    "Auto-run embedded broker when present",
+                )
+                .changed()
+            {
+                change.dirty = true;
+            }
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "When enabled, Protocol Bench starts the hub MQTT broker on project load \
+if the MQTT panel has an embedded broker configured.",
+                )
+                .font(font_ui(11.5))
+                .color(p.muted),
+            );
+            ui.add_space(16.0);
             list_section(
                 ui,
                 "INPUTS",
@@ -390,7 +433,7 @@ fn project_panel(
             ui.add_space(10.0);
             list_section(ui, "CALCULATIONS", &step_names(hubs, false), p.accent, p);
         });
-    crate::hubs::HubChange::quiet()
+    change
 }
 
 fn hub_names(hubs: &HubModel) -> Vec<String> {
@@ -454,19 +497,23 @@ fn calculation_count(hubs: &HubModel) -> usize {
     hubs.hubs.iter().map(|hub| hub.calculations.len()).sum()
 }
 
-fn title_row(ui: &mut egui::Ui, p: &ThemePalette) {
+fn title_row(ui: &mut egui::Ui, project_path: &std::path::Path, p: &ThemePalette) {
+    let name = project_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Project");
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
         art::paint_mark(ui.painter(), rect, p);
         ui.add_space(4.0);
         ui.vertical(|ui| {
             ui.label(
-                egui::RichText::new("Untitled")
+                egui::RichText::new(name)
                     .font(font_semi(16.0))
                     .color(p.text),
             );
             ui.label(
-                egui::RichText::new("Scaffold — nothing is stored yet")
+                egui::RichText::new(project_path.display().to_string())
                     .font(font_ui(11.5))
                     .color(p.muted),
             );

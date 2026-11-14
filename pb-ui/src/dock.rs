@@ -11,6 +11,7 @@ pub enum DockPane {
     Project,
     Hubs,
     Points,
+    Calculations,
     Mappings,
     Traffic,
     Streams,
@@ -22,10 +23,11 @@ pub enum DockPane {
 
 impl DockPane {
     /// Rail order: bench views, then protocol links.
-    pub const ALL: [DockPane; 10] = [
+    pub const ALL: [DockPane; 11] = [
         DockPane::Project,
         DockPane::Hubs,
         DockPane::Points,
+        DockPane::Calculations,
         DockPane::Mappings,
         DockPane::Traffic,
         DockPane::Streams,
@@ -40,6 +42,7 @@ impl DockPane {
             Self::Project => "Project",
             Self::Hubs => "Hubs",
             Self::Points => "Points",
+            Self::Calculations => "Calculations",
             Self::Mappings => "Mappings",
             Self::Traffic => "Traffic",
             Self::Streams => "Streams",
@@ -55,6 +58,7 @@ impl DockPane {
             Self::Project => "project",
             Self::Hubs => "hubs",
             Self::Points => "points",
+            Self::Calculations => "calculations",
             Self::Mappings => "mappings",
             Self::Traffic => "traffic",
             Self::Streams => "streams",
@@ -93,6 +97,7 @@ impl DockPane {
             Self::Project => Proto::COPPER,
             Self::Hubs => Proto::COPPER,
             Self::Points => Proto::TEAL,
+            Self::Calculations => Proto::INDIGO,
             Self::Mappings => Proto::INDIGO,
             Self::Traffic => Proto::SAGE,
             Self::Streams => Proto::STREAMS,
@@ -112,6 +117,7 @@ impl DockPane {
             Self::Project => Proto::COPPER_DEEP,
             Self::Hubs => Proto::COPPER_DEEP,
             Self::Points => Proto::TEAL_DEEP,
+            Self::Calculations => Proto::INDIGO_DEEP,
             Self::Mappings => Proto::INDIGO_DEEP,
             Self::Traffic => Proto::SAGE_DEEP,
             Self::Streams => Proto::STREAMS_DEEP,
