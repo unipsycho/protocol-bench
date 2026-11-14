@@ -371,16 +371,14 @@ fn catalog_card(ui: &mut egui::Ui, kind: &CalcKind, active: bool, p: &ThemePalet
         .clicked()
 }
 
-fn source_point_picker(
+fn source_point_combo(
     ui: &mut egui::Ui,
     value: &mut String,
     point_names: &[String],
     step_id: u64,
-    p: &ThemePalette,
+    width: f32,
 ) -> bool {
     let mut dirty = false;
-    ui.label(RichText::new("SOURCE POINT").font(font_ui(10.5)).color(p.muted));
-    ui.add_space(2.0);
     let mut pick = value.clone();
     // Keep a stale selection visible until the operator picks again.
     let label = if pick.is_empty() {
@@ -392,7 +390,7 @@ fn source_point_picker(
     };
     egui::ComboBox::from_id_salt(("pb_calc_src_point", step_id))
         .selected_text(label)
-        .width(ui.available_width().max(120.0))
+        .width(width.max(100.0))
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut pick, String::new(), "(none)");
             for name in point_names {
@@ -663,18 +661,40 @@ fn detail_editor(
     let step_id = step.id;
     heading(ui, "Configure", p.accent, p);
     ui.add_space(8.0);
-    ui.label(RichText::new("TYPE").font(font_ui(10.5)).color(p.muted));
-    ui.add_space(2.0);
+    // Type + source on one row; blurb under.
     let mut kind_id = step.calc_kind.clone();
-    // List shows short names only; blurb sits under the selection.
-    egui::ComboBox::from_id_salt(("pb_calc_type", step_id))
-        .selected_text(kind.name)
-        .width(ui.available_width().max(160.0))
-        .show_ui(ui, |ui| {
-            for k in CALC_KINDS {
-                ui.selectable_value(&mut kind_id, k.id.to_string(), k.name);
+    let gap = 12.0;
+    let half = ((ui.available_width() - gap) * 0.5).max(120.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        ui.vertical(|ui| {
+            ui.set_width(half);
+            ui.label(RichText::new("TYPE").font(font_ui(10.5)).color(p.muted));
+            ui.add_space(2.0);
+            egui::ComboBox::from_id_salt(("pb_calc_type", step_id))
+                .selected_text(kind.name)
+                .width(ui.available_width().max(100.0))
+                .show_ui(ui, |ui| {
+                    for k in CALC_KINDS {
+                        ui.selectable_value(&mut kind_id, k.id.to_string(), k.name);
+                    }
+                });
+        });
+        ui.vertical(|ui| {
+            ui.set_width(half);
+            ui.label(RichText::new("SOURCE POINT").font(font_ui(10.5)).color(p.muted));
+            ui.add_space(2.0);
+            if source_point_combo(
+                ui,
+                &mut step.source_point,
+                point_names,
+                step_id,
+                ui.available_width(),
+            ) {
+                dirty = true;
             }
         });
+    });
     if kind_id != step.calc_kind {
         if let Some(next) = kind_by_id(&kind_id) {
             apply_kind_example(step, next);
@@ -687,19 +707,6 @@ fn detail_editor(
         RichText::new(kind.blurb)
             .font(font_ui(12.0))
             .color(p.muted),
-    );
-    ui.add_space(10.0);
-    if source_point_picker(ui, &mut step.source_point, point_names, step_id, p) {
-        dirty = true;
-    }
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new(
-            "Transforms this point in place on its path to the Output node. \
-The Output node owns the destination topic / bind.",
-        )
-        .font(font_ui(11.0))
-        .color(p.muted),
     );
     ui.add_space(10.0);
 
