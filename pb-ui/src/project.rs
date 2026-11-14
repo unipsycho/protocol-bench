@@ -11,10 +11,11 @@ use crate::hubs::{HubModel, MqttInputBind, MqttOutputBind};
 use crate::mqtt_panel::{
     EmbeddedBrokerConfig, MqttClient, MqttOutput, MqttPanelState, MqttParseRule,
 };
+use crate::opcua_panel::{EmbeddedOpcUaConfig, OpcUaClient, OpcUaPanelState};
 use pb_points::{is_address_path, is_short_point_id, PointBinding, PointStore};
 
-/// v6: additive `settings.auto_run_embedded_broker`.
-pub const PROJECT_VERSION: u32 = 6;
+/// v7: additive `opcua` clients + embedded UA server hub.
+pub const PROJECT_VERSION: u32 = 7;
 
 /// Project-level options (Project panel).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -36,6 +37,9 @@ pub struct ProjectFile {
     pub next_point_seq: u64,
     #[serde(default)]
     pub mqtt: MqttProject,
+    /// OPC UA clients + embedded UA server. Absent on older files → defaults.
+    #[serde(default)]
+    pub opcua: OpcUaProject,
     /// Hub diagram + Input/Output MQTT binds. Absent on older files → keep ui.toml hubs.
     #[serde(default)]
     pub hubs: Option<HubModel>,
@@ -58,9 +62,160 @@ impl Default for ProjectFile {
             points: Vec::new(),
             next_point_seq: 1,
             mqtt: MqttProject::default(),
+            opcua: OpcUaProject::default(),
             hubs: None,
             settings: ProjectSettings::default(),
         }
+    }
+}
+
+/// OPC UA section (v7+).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpcUaProject {
+    #[serde(default)]
+    pub selected_client_id: String,
+    #[serde(default)]
+    pub embedded: EmbeddedOpcUaConfig,
+    #[serde(default)]
+    pub clients: Vec<OpcUaClientSerde>,
+}
+
+impl Default for OpcUaProject {
+    fn default() -> Self {
+        let client = OpcUaClientSerde::default_plant();
+        Self {
+            selected_client_id: client.id.clone(),
+            embedded: EmbeddedOpcUaConfig::default(),
+            clients: vec![client],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpcUaClientSerde {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default = "default_opcua_endpoint")]
+    pub endpoint_url: String,
+    #[serde(default = "default_opcua_policy")]
+    pub security_policy: String,
+    #[serde(default = "default_opcua_mode")]
+    pub security_mode: String,
+    #[serde(default = "default_opcua_auth")]
+    pub auth: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_opcua_trust")]
+    pub trust_server: String,
+    #[serde(default)]
+    pub pki_dir: String,
+    #[serde(default = "default_opcua_interval")]
+    pub subscription_interval_ms: u64,
+    #[serde(default)]
+    pub auto_connect: bool,
+}
+
+fn default_opcua_endpoint() -> String {
+    "opc.tcp://127.0.0.1:4840".into()
+}
+fn default_opcua_policy() -> String {
+    "None".into()
+}
+fn default_opcua_mode() -> String {
+    "None".into()
+}
+fn default_opcua_auth() -> String {
+    "anonymous".into()
+}
+fn default_opcua_trust() -> String {
+    "strict".into()
+}
+fn default_opcua_interval() -> u64 {
+    500
+}
+
+impl OpcUaClientSerde {
+    pub fn default_plant() -> Self {
+        Self {
+            id: "plant".into(),
+            label: "Plant UA".into(),
+            endpoint_url: default_opcua_endpoint(),
+            security_policy: default_opcua_policy(),
+            security_mode: default_opcua_mode(),
+            auth: default_opcua_auth(),
+            username: String::new(),
+            password: String::new(),
+            trust_server: default_opcua_trust(),
+            pki_dir: String::new(),
+            subscription_interval_ms: default_opcua_interval(),
+            auto_connect: false,
+        }
+    }
+
+    fn to_panel(&self) -> OpcUaClient {
+        OpcUaClient {
+            id: self.id.clone(),
+            label: self.label.clone(),
+            endpoint_url: self.endpoint_url.clone(),
+            security_policy: self.security_policy.clone(),
+            security_mode: self.security_mode.clone(),
+            auth: self.auth.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+            trust_server: self.trust_server.clone(),
+            pki_dir: self.pki_dir.clone(),
+            subscription_interval_ms: self.subscription_interval_ms,
+            auto_connect: self.auto_connect,
+            draft_node_id: String::new(),
+            draft_point: String::new(),
+        }
+    }
+
+    fn from_panel(c: &OpcUaClient) -> Self {
+        Self {
+            id: c.id.clone(),
+            label: c.label.clone(),
+            endpoint_url: c.endpoint_url.clone(),
+            security_policy: c.security_policy.clone(),
+            security_mode: c.security_mode.clone(),
+            auth: c.auth.clone(),
+            username: c.username.clone(),
+            password: c.password.clone(),
+            trust_server: c.trust_server.clone(),
+            pki_dir: c.pki_dir.clone(),
+            subscription_interval_ms: c.subscription_interval_ms,
+            auto_connect: c.auto_connect,
+        }
+    }
+}
+
+impl OpcUaProject {
+    pub fn from_panel(state: &OpcUaPanelState) -> Self {
+        let selected_client_id = state
+            .selected()
+            .map(|c| c.id.clone())
+            .unwrap_or_default();
+        Self {
+            selected_client_id,
+            embedded: state.embedded.clone(),
+            clients: state.clients.iter().map(OpcUaClientSerde::from_panel).collect(),
+        }
+    }
+
+    pub fn apply_to_panel(&self, state: &mut OpcUaPanelState) {
+        state.embedded = self.embedded.clone();
+        state.clients = if self.clients.is_empty() {
+            vec![OpcUaClient::default_plant()]
+        } else {
+            self.clients.iter().map(OpcUaClientSerde::to_panel).collect()
+        };
+        state.selected = state
+            .clients
+            .iter()
+            .position(|c| c.id == self.selected_client_id);
     }
 }
 
@@ -467,6 +622,7 @@ pub fn load(path: &Path) -> Result<ProjectFile, String> {
                 clients: vec![client],
                 embedded: EmbeddedBrokerConfig::default(),
             },
+            opcua: OpcUaProject::default(),
             hubs: None,
             settings: ProjectSettings::default(),
         });

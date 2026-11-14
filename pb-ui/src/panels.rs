@@ -8,6 +8,7 @@ use crate::art;
 use crate::dock::DockPane;
 use crate::hubs::HubModel;
 use crate::mqtt_panel::{self, MqttPanelState};
+use crate::opcua_panel::{self, OpcUaPanelState};
 use crate::point_rows::{self, PointsTableRow, PointsTableState};
 use crate::project::ProjectSettings;
 use crate::theme::{font_semi, font_ui, scope, tint, ThemePalette};
@@ -37,6 +38,7 @@ pub fn paint(
     hubs: &mut HubModel,
     engine: &EngineHandle,
     mqtt: &mut MqttPanelState,
+    opcua: &mut OpcUaPanelState,
     points: &mut PointsPanelState,
     settings: &mut ProjectSettings,
     project_path: &std::path::Path,
@@ -51,6 +53,10 @@ pub fn paint(
         }
         DockPane::Mqtt => {
             mqtt_panel::paint(ui, host, p, engine, mqtt, hubs);
+            crate::hubs::HubChange::quiet()
+        }
+        DockPane::OpcUa => {
+            opcua_panel::paint(ui, host, p, engine, opcua, hubs);
             crate::hubs::HubChange::quiet()
         }
         DockPane::Points => {

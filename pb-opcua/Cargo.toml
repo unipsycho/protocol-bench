@@ -1,0 +1,22 @@
+[package]
+name = "pb-opcua"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "OPC UA protocol pack for Protocol Bench (async-opcua client + embedded server)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "pb_opcua"
+
+[dependencies]
+pb-abi = { workspace = true }
+async-opcua = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+directories = { workspace = true }
+log = { workspace = true }
+tokio-util = { workspace = true }

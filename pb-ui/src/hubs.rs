@@ -149,6 +149,22 @@ pub struct MqttOutputBind {
     pub auto: bool,
 }
 
+/// Input node: OPC UA client + NodeId → host point (PB-81).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpcUaInputBind {
+    pub node_id: String,
+    /// Empty = auto address `opcua/<client>/<node_id>`.
+    #[serde(default)]
+    pub point: String,
+    /// `subscribe` preferred; `read_poll` fallback.
+    #[serde(default = "default_opcua_mode")]
+    pub mode: String,
+}
+
+fn default_opcua_mode() -> String {
+    "subscribe".into()
+}
+
 /// Directed wire: feeder → sink (Output, Calc, or Agg). Many→one fan-in allowed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HubFeed {
@@ -178,6 +194,12 @@ pub struct HubPort {
     /// Output binds (outputs with protocol MQTT).
     #[serde(default)]
     pub mqtt_outputs: Vec<MqttOutputBind>,
+    /// OPC UA connection id from the OPC UA panel (external client).
+    #[serde(default)]
+    pub opcua_connection: String,
+    /// Input binds (sources with protocol OPC UA).
+    #[serde(default)]
+    pub opcua_inputs: Vec<OpcUaInputBind>,
     /// Ephemeral inspector drafts — not persisted.
     #[serde(skip)]
     pub draft_mqtt_topic: String,
@@ -205,6 +227,8 @@ impl HubPort {
             mqtt_connection: String::new(),
             mqtt_inputs: Vec::new(),
             mqtt_outputs: Vec::new(),
+            opcua_connection: String::new(),
+            opcua_inputs: Vec::new(),
             draft_mqtt_topic: String::new(),
             draft_mqtt_path: String::new(),
             draft_mqtt_out_point: String::new(),
@@ -3655,6 +3679,10 @@ fn edit_port(
             p,
         ));
     }
+    if proto == HubProto::OpcUa && incoming {
+        ui.add_space(12.0);
+        change = change.join(edit_opcua_input_binds(ui, model, hub_id, port_id, p));
+    }
     // MQTT Input: no Hub details / Remove — delete via diagram select/Delete or right-click.
     if !(proto == HubProto::Mqtt && incoming) {
         ui.add_space(10.0);
@@ -3670,6 +3698,107 @@ fn edit_port(
             }
         });
     }
+    change
+}
+
+/// OPC UA Input: client id + NodeId binds (browse in OPC UA panel; Manual here).
+fn edit_opcua_input_binds(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    hub_id: u64,
+    port_id: u64,
+    p: &ThemePalette,
+) -> HubChange {
+    let mut change = HubChange::quiet();
+    ui.label(
+        egui::RichText::new("OPC UA CONNECTION")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(4.0);
+    {
+        let port = port_field(model, hub_id, port_id);
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut port.opcua_connection)
+                    .hint_text("client id (e.g. plant)")
+                    .desired_width(220.0),
+            )
+            .changed()
+        {
+            change.dirty = true;
+        }
+    }
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new("NODE BINDS — NodeId → point")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(4.0);
+    let binds = port_field(model, hub_id, port_id).opcua_inputs.clone();
+    let mut remove = None;
+    for (i, bind) in binds.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("{} → {}", bind.node_id, if bind.point.is_empty() { "(auto)" } else { &bind.point }))
+                    .font(font_ui(12.0))
+                    .color(p.text),
+            );
+            if text_button(ui, "×", false, p).clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        port_field(model, hub_id, port_id).opcua_inputs.remove(i);
+        change.dirty = true;
+    }
+    ui.add_space(6.0);
+    let draft_id = egui::Id::new(("pb_opcua_draft", port_id));
+    let (mut draft_node, mut draft_point): (String, String) =
+        ui.ctx().data_mut(|d| d.get_temp(draft_id).unwrap_or_default());
+    ui.horizontal(|ui| {
+        let node_changed = ui
+            .add(
+                egui::TextEdit::singleline(&mut draft_node)
+                    .hint_text("ns=2;s=Temperature")
+                    .desired_width(180.0),
+            )
+            .changed();
+        let point_changed = ui
+            .add(
+                egui::TextEdit::singleline(&mut draft_point)
+                    .hint_text("point (optional)")
+                    .desired_width(100.0),
+            )
+            .changed();
+        if node_changed || point_changed {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(draft_id, (draft_node.clone(), draft_point.clone())));
+        }
+        if text_button(ui, "Add bind", false, p).clicked() && !draft_node.trim().is_empty() {
+            port_field(model, hub_id, port_id)
+                .opcua_inputs
+                .push(OpcUaInputBind {
+                    node_id: draft_node.trim().to_string(),
+                    point: draft_point.trim().to_string(),
+                    mode: "subscribe".into(),
+                });
+            draft_node.clear();
+            draft_point.clear();
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(draft_id, (draft_node.clone(), draft_point.clone())));
+            change.dirty = true;
+        }
+    });
+    ui.label(
+        egui::RichText::new(
+            "Tip: browse variables in the OPC UA panel, then paste the NodeId here.",
+        )
+        .font(font_ui(11.0))
+        .color(p.muted),
+    );
     change
 }
 

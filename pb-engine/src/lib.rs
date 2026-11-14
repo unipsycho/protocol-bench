@@ -59,7 +59,8 @@ impl EngineId {
     pub fn pack_id(self) -> Option<&'static str> {
         match self {
             Self::Mqtt => Some("mqtt"),
-            Self::Streams | Self::Modbus | Self::OpcUa | Self::FileFollow => None,
+            Self::OpcUa => Some("opcua"),
+            Self::Streams | Self::Modbus | Self::FileFollow => None,
         }
     }
 
@@ -72,7 +73,7 @@ impl EngineId {
                 "MQTT client pack (source/output) plus optional embedded rumqttd LAN broker."
             }
             Self::OpcUa => {
-                "Owns OPC UA client and server sessions. No session is open in this build."
+                "OPC UA client pack plus optional embedded UA server hub (async-opcua)."
             }
             Self::FileFollow => {
                 "Owns file tails and CSV / JSON-lines parsers. No file is open in this build."

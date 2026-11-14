@@ -16,6 +16,7 @@ use crate::dnd::{self, DropCommit, PaneHit};
 use crate::dock::DockPane;
 use crate::layout::{LayoutNode, SplitDir, TabGroup};
 use crate::mqtt_panel::{self, MqttPanelState};
+use crate::opcua_panel::{self, OpcUaPanelState};
 use crate::panels::PointsPanelState;
 use crate::panels;
 use crate::persist::{self, UiState};
@@ -46,6 +47,7 @@ pub struct ProtocolBenchApp {
     dirty: bool,
     last_save: Instant,
     mqtt: MqttPanelState,
+    opcua: OpcUaPanelState,
     points: PointsPanelState,
     /// Project-level options (Project panel / project.json).
     project_settings: ProjectSettings,
@@ -107,6 +109,7 @@ impl ProtocolBenchApp {
             PathBuf::from("protocol-bench-project.json")
         });
         let mut mqtt = MqttPanelState::default();
+        let mut opcua = OpcUaPanelState::default();
         let mut mqtt_saved = MqttProject::default();
         let mut project_settings = ProjectSettings::default();
         let mut status = "Ready".into();
@@ -116,6 +119,7 @@ impl ProtocolBenchApp {
             match project::load(&project_path) {
                 Ok(file) => {
                     file.mqtt.apply_to_panel(&mut mqtt);
+                    file.opcua.apply_to_panel(&mut opcua);
                     project_settings = file.settings.clone();
                     if let Some(hubs) = file.hubs {
                         ui_state.hubs = hubs;
@@ -137,6 +141,12 @@ impl ProtocolBenchApp {
                         &engine,
                         &mut mqtt,
                         &ui_state.hubs,
+                        project_settings.auto_run_embedded_broker,
+                    );
+                    opcua_panel::apply_opcua_session(&engine, &mut opcua, &ui_state.hubs);
+                    opcua_panel::maybe_auto_start_embedded(
+                        &engine,
+                        &mut opcua,
                         project_settings.auto_run_embedded_broker,
                     );
                     status = format!("Loaded project {}", project_path.display());
@@ -166,6 +176,7 @@ impl ProtocolBenchApp {
             dirty: false,
             last_save: Instant::now(),
             mqtt,
+            opcua,
             points: PointsPanelState::default(),
             project_settings,
             settings_saved,
@@ -256,6 +267,7 @@ impl ProtocolBenchApp {
             points,
             next_point_seq,
             mqtt: mqtt.clone(),
+            opcua: project::OpcUaProject::from_panel(&self.opcua),
             hubs: Some(self.ui_state.hubs.clone()),
             settings: self.project_settings.clone(),
         };
@@ -270,6 +282,7 @@ impl ProtocolBenchApp {
     fn load_project_from_path(&mut self, path: PathBuf) -> Result<(), String> {
         let file = project::load(&path)?;
         file.mqtt.apply_to_panel(&mut self.mqtt);
+        file.opcua.apply_to_panel(&mut self.opcua);
         self.project_settings = file.settings.clone();
         if let Some(hubs) = file.hubs {
             self.ui_state.hubs = hubs;
@@ -284,6 +297,12 @@ impl ProtocolBenchApp {
         self.hubs_saved = self.ui_state.hubs.clone();
         self.settings_saved = self.project_settings.clone();
         self.project_path = path;
+        opcua_panel::apply_opcua_session(&self.engine, &mut self.opcua, &self.ui_state.hubs);
+        opcua_panel::maybe_auto_start_embedded(
+            &self.engine,
+            &mut self.opcua,
+            self.project_settings.auto_run_embedded_broker,
+        );
         mqtt_panel::apply_mqtt_session(&self.engine, &mut self.mqtt, &self.ui_state.hubs);
         mqtt_panel::maybe_auto_start_embedded(
             &self.engine,
@@ -1334,6 +1353,7 @@ impl ProtocolBenchApp {
                 &mut self.ui_state.hubs,
                 &self.engine,
                 &mut self.mqtt,
+                &mut self.opcua,
                 &mut self.points,
                 &mut self.project_settings,
                 &self.project_path,
@@ -1346,6 +1366,11 @@ impl ProtocolBenchApp {
                     &mut self.mqtt,
                     &self.ui_state.hubs,
                 );
+                opcua_panel::apply_opcua_session(
+                    &self.engine,
+                    &mut self.opcua,
+                    &self.ui_state.hubs,
+                );
             }
             // Honor auto-run when the Project checkbox is turned on.
             if self.project_settings.auto_run_embedded_broker && !prev_auto {
@@ -1355,6 +1380,7 @@ impl ProtocolBenchApp {
                     &self.ui_state.hubs,
                     true,
                 );
+                opcua_panel::maybe_auto_start_embedded(&self.engine, &mut self.opcua, true);
             }
             if let Some(pane) = hub_change.open {
                 self.ui_state.reveal_pane(pane);

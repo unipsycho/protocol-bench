@@ -5,6 +5,7 @@ members = [
     "pb-points",
     "pb-engine",
     "pb-mqtt",
+    "pb-opcua",
     "pb-service",
     "pb-ui",
 ]
@@ -24,6 +25,7 @@ pb-abi = { path = "pb-abi" }
 pb-points = { path = "pb-points" }
 pb-engine = { path = "pb-engine" }
 pb-mqtt = { path = "pb-mqtt" }
+pb-opcua = { path = "pb-opcua" }
 eframe = { version = "0.29", default-features = true }
 egui = "0.29"
 serde = { version = "1", features = ["derive"] }
@@ -36,6 +38,9 @@ libloading = "0.8"
 rumqttc = { version = "0.24", features = ["websocket", "use-rustls"] }
 # Embedded MQTT hub broker (LAN listen). Default features: rustls + websocket.
 rumqttd = { version = "0.20", default-features = true }
-tokio = { version = "1", features = ["rt", "sync", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "time"] }
+async-opcua = { version = "0.17", features = ["client", "server"] }
+log = "0.4"
+tokio-util = { version = "0.7", features = ["rt"] }
 ctrlc = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

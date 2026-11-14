@@ -12,6 +12,8 @@ mod dock;
 mod hubs;
 mod layout;
 mod mqtt_panel;
+mod opcua_browse;
+mod opcua_panel;
 mod panels;
 mod persist;
 mod point_rows;
