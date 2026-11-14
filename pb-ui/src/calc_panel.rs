@@ -268,9 +268,8 @@ pub fn paint_node_props(
     }
     if open {
         let mut pick = None;
-        let mut close_clicked = false;
         let mut still_open = open;
-        // Escape always dismisses — even when the title-bar X is off-screen.
+        // Escape dismisses (title-bar X remains the pointer close).
         if ui
             .ctx()
             .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
@@ -281,7 +280,7 @@ pub fn paint_node_props(
         ui.ctx()
             .data_mut(|d| d.insert_temp(Id::new("pb_calc_types_blocking"), true));
 
-        // Size to a 3-column catalog; hard-cap to the viewport so X stays reachable.
+        // Snug around a 3×4 card grid (title bar + padding only).
         const COL: f32 = 220.0;
         const GAP: f32 = 12.0;
         const CARD_H: f32 = 128.0;
@@ -289,80 +288,48 @@ pub fn paint_node_props(
         let screen = ui.ctx().screen_rect().size();
         let max_w = (screen.x - 48.0).max(280.0);
         let max_h = (screen.y - 48.0).max(200.0);
-        let ideal_w = (COL * 3.0 + GAP * 2.0 + 48.0).min(max_w);
-        let ideal_h = (72.0 + ROWS * CARD_H + (ROWS - 1.0) * GAP + 56.0).min(max_h);
+        let ideal_w = (COL * 3.0 + GAP * 2.0 + 24.0).min(max_w);
+        let ideal_h = (32.0 + ROWS * CARD_H + (ROWS - 1.0) * GAP + 16.0).min(max_h);
 
         egui::Window::new("Calculation types")
             .id(Id::new(("pb_calc_types_win", step_id)))
             .open(&mut still_open)
             .collapsible(false)
-            .resizable(true)
+            .resizable(false)
             .constrain(true)
             .order(egui::Order::Foreground)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .default_size([ideal_w, ideal_h])
-            .min_width(280.0_f32.min(max_w))
-            .min_height(200.0_f32.min(max_h))
+            .min_size([ideal_w.min(max_w), ideal_h.min(max_h)])
             .max_size([max_w, max_h])
             .show(ui.ctx(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(
-                            "Twelve operator-ready blocks. Click a type to apply it and pre-fill \
-configuration from the example. Types marked time use a window or time constant.",
-                        )
-                        .font(font_ui(13.0))
-                        .color(p.text),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                        // Extra Close — title-bar X can be unreachable if the window was oversized.
-                        if ui
-                            .add(egui::Button::new(RichText::new("Close").font(font_ui(12.5))))
-                            .clicked()
-                        {
-                            close_clicked = true;
+                // Equal 3-column grid — fixed card size, no staggered flow.
+                let col_w = COL.min((ui.available_width() - GAP * 2.0) / 3.0).max(160.0);
+                egui::Grid::new(("pb_calc_types_grid", step_id))
+                    .num_columns(3)
+                    .spacing([GAP, GAP])
+                    .min_col_width(col_w)
+                    .max_col_width(col_w)
+                    .show(ui, |ui| {
+                        for (i, kind) in CALC_KINDS.iter().enumerate() {
+                            let active = step.calc_kind == kind.id;
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(col_w, CARD_H),
+                                Layout::top_down(Align::Min),
+                                |ui| {
+                                    ui.set_min_size(Vec2::new(col_w, CARD_H));
+                                    ui.set_max_size(Vec2::new(col_w, CARD_H));
+                                    if catalog_card(ui, kind, active, p) {
+                                        pick = Some(kind.id);
+                                    }
+                                },
+                            );
+                            if (i + 1) % 3 == 0 {
+                                ui.end_row();
+                            }
                         }
                     });
-                });
-                ui.add_space(10.0);
-                // Bound the scroll body so the grid cannot inflate the window past max_size.
-                let body_h = (ui.available_height() - 8.0).max(80.0);
-                egui::ScrollArea::vertical()
-                    .id_salt(("pb_calc_types_scroll", step_id))
-                    .max_height(body_h)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        // Equal 3-column grid — fixed card size, no staggered flow.
-                        let col_w = ((ui.available_width() - GAP * 2.0) / 3.0).clamp(160.0, COL);
-                        egui::Grid::new(("pb_calc_types_grid", step_id))
-                            .num_columns(3)
-                            .spacing([GAP, GAP])
-                            .min_col_width(col_w)
-                            .max_col_width(col_w)
-                            .show(ui, |ui| {
-                                for (i, kind) in CALC_KINDS.iter().enumerate() {
-                                    let active = step.calc_kind == kind.id;
-                                    ui.allocate_ui_with_layout(
-                                        Vec2::new(col_w, CARD_H),
-                                        Layout::top_down(Align::Min),
-                                        |ui| {
-                                            ui.set_min_size(Vec2::new(col_w, CARD_H));
-                                            ui.set_max_size(Vec2::new(col_w, CARD_H));
-                                            if catalog_card(ui, kind, active, p) {
-                                                pick = Some(kind.id);
-                                            }
-                                        },
-                                    );
-                                    if (i + 1) % 3 == 0 {
-                                        ui.end_row();
-                                    }
-                                }
-                            });
-                    });
             });
-        if close_clicked {
-            still_open = false;
-        }
         if let Some(id) = pick {
             if let Some(kind) = kind_by_id(id) {
                 apply_kind_example(step, kind);
@@ -664,6 +631,60 @@ fn eval_simple_arith(expr: &str) -> Option<f64> {
     Some(v)
 }
 
+fn preview_output(
+    kind: &CalcKind,
+    step: &HubStep,
+    pt: &PointSnapshot,
+    engine: &EngineHandle,
+) -> String {
+    match kind.id {
+        "deadband" | "rolling_avg" | "rate_of_change" | "hysteresis" | "scale_offset"
+        | "clamp" => {
+            let cfg = config_from_step(step);
+            if let Ok(rt) = engine.calc_runtime().lock() {
+                peek_for_point(&[cfg], &rt, &step.source_point, &pt.value)
+            } else {
+                parse_f64(&pt.value)
+                    .and_then(|x| compute_preview(kind, step, x).ok())
+                    .unwrap_or_else(|| pt.value.clone())
+            }
+        }
+        _ => match parse_f64(&pt.value) {
+            Some(x) => compute_preview(kind, step, x).unwrap_or_else(|m| m),
+            None => "non-numeric".into(),
+        },
+    }
+}
+
+fn cached_calc_preview(
+    ui: &mut egui::Ui,
+    kind: &CalcKind,
+    step: &HubStep,
+    pt: &PointSnapshot,
+    engine: &EngineHandle,
+) -> String {
+    let cache_id = Id::new(("pb_calc_live", step.id));
+    let key = format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        pt.updated_ms,
+        pt.value,
+        step.calc_kind,
+        step.param_a,
+        step.param_b,
+        step.window_secs,
+        step.formula
+    );
+    if let Some((k, out)) = ui.ctx().data(|d| d.get_temp::<(String, String)>(cache_id)) {
+        if k == key {
+            return out;
+        }
+    }
+    let out = preview_output(kind, step, pt, engine);
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(cache_id, (key, out.clone())));
+    out
+}
+
 fn live_preview(
     ui: &mut egui::Ui,
     step: &HubStep,
@@ -702,24 +723,8 @@ fn live_preview(
         return;
     }
 
-    // Stateful kinds peek the shared edge-runner; others stay local.
-    let out = match kind.id {
-        "deadband" | "rolling_avg" | "rate_of_change" | "hysteresis" | "scale_offset"
-        | "clamp" => {
-            let cfg = config_from_step(step);
-            if let Ok(rt) = engine.calc_runtime().lock() {
-                peek_for_point(&[cfg], &rt, &step.source_point, &pt.value)
-            } else {
-                parse_f64(&pt.value)
-                    .and_then(|x| compute_preview(kind, step, x).ok())
-                    .unwrap_or_else(|| pt.value.clone())
-            }
-        }
-        _ => match parse_f64(&pt.value) {
-            Some(x) => compute_preview(kind, step, x).unwrap_or_else(|m| m),
-            None => "non-numeric".into(),
-        },
-    };
+    // PB-64: recompute only when source stamp/value or step config changes.
+    let out = cached_calc_preview(ui, kind, step, pt, engine);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.label(RichText::new("Input").font(font_ui(12.0)).color(p.muted));

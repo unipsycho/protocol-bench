@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, Id, Layout, Pos2, Rect, Rounding, Sense, Stroke, Vec2,
 };
-use pb_engine::EngineHandle;
+use pb_engine::{EngineHandle, HostSnapshot};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use crate::art::{self, ChromeIcon};
 use crate::brand_logo::AaLogoCache;
@@ -57,6 +59,10 @@ pub struct ProtocolBenchApp {
     hubs_saved: crate::hubs::HubModel,
     last_project_save: Instant,
     project_dialog: Option<ProjectDialog>,
+    /// Live host snapshot for Calc/Agg/points — refreshed on poll, not mouse FPS (PB-64).
+    live_host: HostSnapshot,
+    live_points_fp: u64,
+    last_live_poll: Instant,
 }
 
 enum ProjectDialog {
@@ -142,6 +148,8 @@ impl ProtocolBenchApp {
         }
         let hubs_saved = ui_state.hubs.clone();
         let settings_saved = project_settings.clone();
+        let live_host = engine.snapshot();
+        let live_points_fp = Self::points_fingerprint(&live_host);
         Self {
             engine,
             ui_state,
@@ -166,7 +174,31 @@ impl ProtocolBenchApp {
             hubs_saved,
             last_project_save: Instant::now(),
             project_dialog: None,
+            live_host,
+            live_points_fp,
+            last_live_poll: Instant::now(),
         }
+    }
+
+    /// Fingerprint of live point values/stamps (drives preview + table refresh).
+    fn points_fingerprint(host: &HostSnapshot) -> u64 {
+        let mut h = DefaultHasher::new();
+        host.point_count.hash(&mut h);
+        for p in &host.points {
+            p.name.hash(&mut h);
+            p.value.hash(&mut h);
+            p.quality.hash(&mut h);
+            p.updated_ms.hash(&mut h);
+        }
+        // MQTT traffic / connection (not host ticks — those advance every poll).
+        for slot in &host.slots {
+            slot.connected.hash(&mut h);
+            slot.detail_json.hash(&mut h);
+            for topic in &slot.topics {
+                topic.hash(&mut h);
+            }
+        }
+        h.finish()
     }
 
     fn mark_dirty(&mut self) {
@@ -432,24 +464,37 @@ impl eframe::App for ProtocolBenchApp {
             theme::apply_theme(ctx, self.theme);
             self.theme_applied = Some(self.theme);
         }
-        let host = self.engine.snapshot();
-        // Keep edge-runner calc/agg configs in lockstep with the hub diagram.
-        self.engine
-            .set_calcs(crate::calc_panel::configs_from_hubs(&self.ui_state.hubs));
-        self.engine
-            .set_aggs(crate::agg_panel::configs_from_hubs(&self.ui_state.hubs));
+        // PB-64: poll engine on a data timer — mouse frames reuse live_host.
+        const LIVE_POLL: Duration = Duration::from_millis(150);
+        if self.last_live_poll.elapsed() >= LIVE_POLL {
+            self.last_live_poll = Instant::now();
+            self.engine
+                .set_calcs(crate::calc_panel::configs_from_hubs(&self.ui_state.hubs));
+            self.engine
+                .set_aggs(crate::agg_panel::configs_from_hubs(&self.ui_state.hubs));
+            let snap = self.engine.snapshot();
+            let fp = Self::points_fingerprint(&snap);
+            if fp != self.live_points_fp {
+                self.live_points_fp = fp;
+                self.live_host = snap;
+            } else {
+                // Keep point values frozen; still track pack liveness lightly.
+                self.live_host.alive = snap.alive;
+                self.live_host.ticks = snap.ticks;
+                self.live_host.uptime_ms = snap.uptime_ms;
+            }
+        }
         let p = self.theme.palette();
         theme::paint_root_bg(ctx, &p);
         self.pane_hits.clear();
+        let host_for_panes = self.live_host.clone();
 
         self.app_bar(ctx, &p);
         self.status_bar(ctx, &p);
         self.pane_rail(ctx, &p);
-        self.settings_drawer(ctx, &p, &host);
+        self.settings_drawer(ctx, &p, &host_for_panes);
         self.about_window(ctx, &p);
         self.project_dialog_window(ctx, &p);
-
-        let host_for_panes = host;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -484,8 +529,8 @@ impl eframe::App for ProtocolBenchApp {
         self.handle_drop(ctx, &p);
         self.autosave();
         self.autosave_project(&host_for_panes);
-        // Keep MQTT / pack snapshots fresh without pinning the compositor.
-        ctx.request_repaint_after(Duration::from_millis(250));
+        // Next data poll only — do not chase mouse FPS for live values (PB-64).
+        ctx.request_repaint_after(LIVE_POLL);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

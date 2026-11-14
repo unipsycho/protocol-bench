@@ -250,6 +250,39 @@ pub fn paint_node_props(
     dirty
 }
 
+fn compute_agg_preview(
+    step: &HubStep,
+    host_points: &[PointSnapshot],
+    engine: &EngineHandle,
+) -> Option<pb_engine::AggOutput> {
+    let cfg = config_from_step(step);
+    let lookup = |name: &str| {
+        host_points.iter().find(|pt| pt.name == name).map(|pt| {
+            let value = pt
+                .value
+                .parse::<f64>()
+                .map(PointValue::F64)
+                .unwrap_or_else(|_| PointValue::String(pt.value.clone()));
+            let quality = match pt.quality.as_str() {
+                "bad" => Quality::Bad,
+                "uncertain" => Quality::Uncertain,
+                _ => Quality::Good,
+            };
+            pb_engine::MemberReading {
+                name: pt.name.clone(),
+                value,
+                quality,
+                updated_ms: pt.updated_ms,
+            }
+        })
+    };
+    if let Ok(rt) = engine.agg_runtime().lock() {
+        peek_agg(&cfg, &rt, &lookup)
+    } else {
+        None
+    }
+}
+
 fn live_preview(
     ui: &mut egui::Ui,
     step: &HubStep,
@@ -274,32 +307,38 @@ fn live_preview(
         return;
     }
 
-    let cfg = config_from_step(step);
-    let lookup = |name: &str| {
-        host_points.iter().find(|pt| pt.name == name).map(|pt| {
-            let value = pt
-                .value
-                .parse::<f64>()
-                .map(PointValue::F64)
-                .unwrap_or_else(|_| PointValue::String(pt.value.clone()));
-            let quality = match pt.quality.as_str() {
-                "bad" => Quality::Bad,
-                "uncertain" => Quality::Uncertain,
-                _ => Quality::Good,
-            };
-            pb_engine::MemberReading {
-                name: pt.name.clone(),
-                value,
-                quality,
-                updated_ms: pt.updated_ms,
-            }
-        })
-    };
-
-    let out = if let Ok(rt) = engine.agg_runtime().lock() {
-        peek_agg(&cfg, &rt, &lookup)
+    // PB-64: cache preview until member stamps/values or config change.
+    let mut key = format!(
+        "{}|{}|{}",
+        step.agg_mode,
+        step.agg_window,
+        step.members.join(",")
+    );
+    for name in &filled {
+        if let Some(pt) = host_points.iter().find(|pt| pt.name == *name) {
+            key.push_str(&format!("|{}:{}:{}", pt.name, pt.updated_ms, pt.value));
+        } else {
+            key.push_str(&format!("|{name}:missing"));
+        }
+    }
+    let cache_id = egui::Id::new(("pb_agg_live", step.id));
+    let out = if let Some((k, cached)) = ui
+        .ctx()
+        .data(|d| d.get_temp::<(String, Option<pb_engine::AggOutput>)>(cache_id))
+    {
+        if k == key {
+            cached
+        } else {
+            let computed = compute_agg_preview(step, host_points, engine);
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(cache_id, (key, computed.clone())));
+            computed
+        }
     } else {
-        None
+        let computed = compute_agg_preview(step, host_points, engine);
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(cache_id, (key, computed.clone())));
+        computed
     };
 
     match out {
