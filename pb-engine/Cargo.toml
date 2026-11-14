@@ -8,3 +8,8 @@ publish.workspace = true
 description = "Protocol Bench engine thread. The UI never performs protocol I/O."
 
 [dependencies]
+pb-abi = { workspace = true }
+pb-points = { workspace = true }
+libloading = { workspace = true }
+
+[dev-dependencies]
