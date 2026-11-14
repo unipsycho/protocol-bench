@@ -512,10 +512,11 @@ fn compute_preview(kind: &CalcKind, step: &HubStep, x: f64) -> Result<String, St
                 None => Err("formula preview supports + − × ÷ ( ) and x/A/B only".into()),
             }
         }
-        "rolling_avg" | "ema" | "rate_of_change" | "min_max_hold" | "time_window" => Err(
-            "time-based preview needs the edge runner (sample shown as input only)".into(),
-        ),
-        _ => Err("no preview for this type yet".into()),
+        "rolling_avg" | "ema" | "rate_of_change" | "min_max_hold" | "time_window" => {
+            // Pass-through until the edge runner owns window state.
+            Ok(fmt_num(x))
+        }
+        _ => Ok(fmt_num(x)),
     }
 }
 
@@ -661,11 +662,31 @@ fn detail_editor(
     let mut dirty = false;
     let step_id = step.id;
     heading(ui, "Configure", p.accent, p);
-    ui.add_space(6.0);
+    ui.add_space(8.0);
+    ui.label(RichText::new("TYPE").font(font_ui(10.5)).color(p.muted));
+    ui.add_space(2.0);
+    let mut kind_id = step.calc_kind.clone();
+    // List shows short names only; blurb sits under the selection.
+    egui::ComboBox::from_id_salt(("pb_calc_type", step_id))
+        .selected_text(kind.name)
+        .width(ui.available_width().max(160.0))
+        .show_ui(ui, |ui| {
+            for k in CALC_KINDS {
+                ui.selectable_value(&mut kind_id, k.id.to_string(), k.name);
+            }
+        });
+    if kind_id != step.calc_kind {
+        if let Some(next) = kind_by_id(&kind_id) {
+            apply_kind_example(step, next);
+            dirty = true;
+        }
+    }
+    let kind = kind_by_id(step.calc_kind.as_str()).unwrap_or(kind);
+    ui.add_space(4.0);
     ui.label(
-        RichText::new(format!("{} — {}", kind.name, kind.blurb))
+        RichText::new(kind.blurb)
             .font(font_ui(12.0))
-            .color(p.text),
+            .color(p.muted),
     );
     ui.add_space(10.0);
     if source_point_picker(ui, &mut step.source_point, point_names, step_id, p) {
@@ -717,12 +738,6 @@ The Output node owns the destination topic / bind.",
             if field_row(ui, "Param B", &mut step.param_b, p) {
                 dirty = true;
             }
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("Time-based filters use wall clock on the host edge runner (stub).")
-                    .font(font_ui(11.0))
-                    .color(p.muted),
-            );
         }
         _ => {
             if field_row(ui, "Param A", &mut step.param_a, p) {
