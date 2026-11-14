@@ -452,7 +452,9 @@ fn host_main(
                     continue;
                 }
                 let raw = p.value.as_display();
-                let value = calc::apply_for_egress(&calc_cfgs, &mut rt, &p.name, &raw);
+                // Sample time = point stamp so the rolling window follows the signal clock.
+                let value =
+                    calc::apply_at(&calc_cfgs, &mut rt, &p.name, &raw, p.updated_ms);
                 calc_stamp.insert(p.name.clone(), p.updated_ms);
                 last_out.insert(p.name.clone(), value.clone());
                 dirty_out.push((p.name.clone(), value));

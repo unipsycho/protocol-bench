@@ -238,12 +238,16 @@ pub fn paint_node_props(
 
     ui.add_space(14.0);
     ui.horizontal(|ui| {
-        if ui
-            .add(egui::Button::new(
-                RichText::new("Calculation types").font(font_ui(13.0)),
-            ))
-            .clicked()
-        {
+        // Accent CTA — distinct from primary form/save buttons (dark label on accent fill).
+        let types_btn = egui::Button::new(
+            RichText::new("Calculation types")
+                .font(font_semi(13.0))
+                .color(Color32::from_rgb(0x12, 0x14, 0x18)),
+        )
+        .fill(p.accent)
+        .stroke(egui::Stroke::new(1.0, p.accent))
+        .min_size(Vec2::new(0.0, 28.0));
+        if ui.add(types_btn).clicked() {
             ui.ctx().data_mut(|d| d.insert_temp(modal_id, true));
         }
         ui.label(
@@ -698,9 +702,10 @@ fn live_preview(
         return;
     }
 
-    // Deadband / rolling avg peek the shared edge-runner state; other kinds stay local.
+    // Stateful kinds peek the shared edge-runner; others stay local.
     let out = match kind.id {
-        "deadband" | "rolling_avg" | "scale_offset" | "clamp" => {
+        "deadband" | "rolling_avg" | "rate_of_change" | "hysteresis" | "scale_offset"
+        | "clamp" => {
             let cfg = config_from_step(step);
             if let Ok(rt) = engine.calc_runtime().lock() {
                 peek_for_point(&[cfg], &rt, &step.source_point, &pt.value)

@@ -1,5 +1,5 @@
 //! Edge calculation transforms applied before Output MQTT egress.
-//! UI preview peeks the same runtime so deadband / rolling avg match publish.
+//! UI preview peeks the same runtime so stateful kinds match publish.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,14 +27,20 @@ struct Sample {
 pub struct CalcRuntime {
     /// Last deadband output per calculation step id.
     pub deadband_hold: HashMap<u64, f64>,
-    /// Rolling-average sample buffers per step id.
+    /// Rolling-average sample buffers (zero-order-hold timeline).
     rolling: HashMap<u64, Vec<Sample>>,
+    /// Last sample for rate-of-change.
+    roc_prev: HashMap<u64, Sample>,
+    /// Last digital state for hysteresis.
+    hyst_on: HashMap<u64, bool>,
 }
 
 impl CalcRuntime {
     pub fn clear(&mut self) {
         self.deadband_hold.clear();
         self.rolling.clear();
+        self.roc_prev.clear();
+        self.hyst_on.clear();
     }
 }
 
@@ -88,55 +94,193 @@ fn rolling_max_n(param_a: &str) -> Option<usize> {
     t.parse::<usize>().ok().filter(|n| *n > 0)
 }
 
-/// Push a sample and return the mean over the time window (and optional max N).
-fn rolling_avg_step(
-    buf: &mut Vec<Sample>,
-    x: f64,
-    now_ms: u64,
-    window_secs: f64,
-    max_n: Option<usize>,
-) -> f64 {
-    buf.push(Sample { t_ms: now_ms, v: x });
-    let win_ms = (window_secs.max(0.001) * 1000.0) as u64;
+fn window_ms(window_secs: f64) -> u64 {
+    (window_secs.max(0.001) * 1000.0).round() as u64
+}
+
+/// Drop samples older than the window, but keep one at-or-before cutoff for ZOH.
+fn trim_rolling(buf: &mut Vec<Sample>, now_ms: u64, win_ms: u64) {
     let cutoff = now_ms.saturating_sub(win_ms);
-    buf.retain(|s| s.t_ms >= cutoff);
+    let mut keep_from = 0usize;
+    for (i, s) in buf.iter().enumerate() {
+        if s.t_ms <= cutoff {
+            keep_from = i;
+        } else {
+            break;
+        }
+    }
+    if keep_from > 0 {
+        buf.drain(..keep_from);
+    }
+}
+
+fn cap_rolling(buf: &mut Vec<Sample>, max_n: Option<usize>) {
     if let Some(n) = max_n {
-        while buf.len() > n {
+        let limit = n.saturating_add(1);
+        while buf.len() > limit {
             buf.remove(0);
         }
     }
-    if buf.is_empty() {
-        return x;
-    }
-    buf.iter().map(|s| s.v).sum::<f64>() / buf.len() as f64
 }
 
-fn mean_buf(buf: &[Sample]) -> Option<f64> {
+/// Time-weighted zero-order-hold mean over `[now - window, now]`.
+fn time_weighted_avg(buf: &[Sample], now_ms: u64, win_ms: u64) -> Option<f64> {
+    if buf.is_empty() || win_ms == 0 {
+        return None;
+    }
+    let start = now_ms.saturating_sub(win_ms);
+    let mut v = buf[0].v;
+    for s in buf {
+        if s.t_ms <= start {
+            v = s.v;
+        } else {
+            break;
+        }
+    }
+    let mut t = start;
+    let mut area = 0.0_f64;
+    for s in buf.iter().filter(|s| s.t_ms > start && s.t_ms <= now_ms) {
+        if s.t_ms > t {
+            area += v * (s.t_ms - t) as f64;
+            t = s.t_ms;
+        }
+        v = s.v;
+    }
+    if now_ms > t {
+        area += v * (now_ms - t) as f64;
+    }
+    Some(area / win_ms as f64)
+}
+
+fn rolling_avg_step(
+    buf: &mut Vec<Sample>,
+    x: f64,
+    at_ms: u64,
+    window_secs: f64,
+    max_n: Option<usize>,
+) -> f64 {
+    let win_ms = window_ms(window_secs);
+    let last_t = buf.last().map(|s| s.t_ms);
+    match last_t {
+        Some(t) if t == at_ms => {
+            if let Some(last) = buf.last_mut() {
+                last.v = x;
+            }
+        }
+        Some(t) if at_ms > t => {
+            buf.push(Sample {
+                t_ms: at_ms,
+                v: x,
+            });
+        }
+        Some(t) => {
+            // Out-of-order: keep timeline, eval at last stamp.
+            return time_weighted_avg(buf, t, win_ms).unwrap_or(x);
+        }
+        None => {
+            buf.push(Sample {
+                t_ms: at_ms,
+                v: x,
+            });
+        }
+    }
+    trim_rolling(buf, at_ms, win_ms);
+    cap_rolling(buf, max_n);
+    time_weighted_avg(buf, at_ms, win_ms).unwrap_or(x)
+}
+
+fn rolling_avg_peek(
+    buf: &[Sample],
+    tip: Option<(u64, f64)>,
+    now_ms: u64,
+    window_secs: f64,
+) -> Option<f64> {
+    let win_ms = window_ms(window_secs);
     if buf.is_empty() {
-        None
-    } else {
-        Some(buf.iter().map(|s| s.v).sum::<f64>() / buf.len() as f64)
+        return tip.map(|(_, v)| v);
+    }
+    if let Some((tip_ms, tip_v)) = tip {
+        let last_t = buf.last().map(|s| s.t_ms).unwrap_or(0);
+        if tip_ms > last_t {
+            let mut tmp = buf.to_vec();
+            tmp.push(Sample {
+                t_ms: tip_ms,
+                v: tip_v,
+            });
+            trim_rolling(&mut tmp, now_ms, win_ms);
+            return time_weighted_avg(&tmp, now_ms, win_ms);
+        }
+    }
+    let cutoff = now_ms.saturating_sub(win_ms);
+    let start = buf.iter().rposition(|s| s.t_ms <= cutoff).unwrap_or(0);
+    time_weighted_avg(&buf[start..], now_ms, win_ms)
+}
+
+/// Seconds-scale factor for rate units (`/s`, `/min`, `/h`).
+fn roc_per_sec_scale(units: &str) -> f64 {
+    match units.trim() {
+        "/min" => 60.0,
+        "/h" => 3600.0,
+        _ => 1.0, // /s default
+    }
+}
+
+fn rate_of_change(prev: Option<Sample>, x: f64, at_ms: u64, units: &str, abs: bool) -> (f64, Sample) {
+    let cur = Sample {
+        t_ms: at_ms,
+        v: x,
+    };
+    let Some(p) = prev else {
+        return (0.0, cur);
+    };
+    if at_ms <= p.t_ms {
+        return (0.0, p);
+    }
+    let dt_s = (at_ms - p.t_ms) as f64 / 1000.0;
+    if dt_s <= 0.0 {
+        return (0.0, cur);
+    }
+    let mut rate = (x - p.v) / dt_s * roc_per_sec_scale(units);
+    if abs {
+        rate = rate.abs();
+    }
+    (rate, cur)
+}
+
+fn hysteresis_step(prev: Option<bool>, x: f64, on_at: f64, off_at: f64) -> bool {
+    match prev {
+        None => x >= on_at,
+        Some(true) => !(x <= off_at),
+        Some(false) => x >= on_at,
     }
 }
 
 /// Transform a point value through every calc that targets `point_name`.
-/// Updates runtime state (deadband hold, rolling buffers).
 pub fn apply_for_egress(
     configs: &[CalcConfig],
     rt: &mut CalcRuntime,
     point_name: &str,
     raw: &str,
 ) -> String {
+    apply_at(configs, rt, point_name, raw, now_ms())
+}
+
+/// Same as [`apply_for_egress`] with an explicit sample timestamp (tests + host).
+pub fn apply_at(
+    configs: &[CalcConfig],
+    rt: &mut CalcRuntime,
+    point_name: &str,
+    raw: &str,
+    at_ms: u64,
+) -> String {
     let mut out = raw.to_string();
-    let t = now_ms();
     for cfg in configs.iter().filter(|c| c.source_point == point_name) {
-        out = apply_one(cfg, rt, &out, t);
+        out = apply_one(cfg, rt, &out, at_ms);
     }
     out
 }
 
 /// Peek transformed output without mutating runtime.
-/// Deadband: next hold step from current held. Rolling: current window mean.
 pub fn peek_for_point(
     configs: &[CalcConfig],
     rt: &CalcRuntime,
@@ -144,13 +288,14 @@ pub fn peek_for_point(
     raw: &str,
 ) -> String {
     let mut out = raw.to_string();
+    let t = now_ms();
     for cfg in configs.iter().filter(|c| c.source_point == point_name) {
-        out = peek_one(cfg, rt, &out);
+        out = peek_one(cfg, rt, &out, t);
     }
     out
 }
 
-fn peek_one(cfg: &CalcConfig, rt: &CalcRuntime, raw: &str) -> String {
+fn peek_one(cfg: &CalcConfig, rt: &CalcRuntime, raw: &str, now_ms: u64) -> String {
     let Some(x) = parse_f64(raw) else {
         return raw.to_string();
     };
@@ -162,10 +307,26 @@ fn peek_one(cfg: &CalcConfig, rt: &CalcRuntime, raw: &str) -> String {
             fmt_num(y)
         }
         "rolling_avg" => {
-            if let Some(buf) = rt.rolling.get(&cfg.id) {
-                fmt_num(mean_buf(buf).unwrap_or(x))
+            let window = parse_f64(&cfg.window_secs).unwrap_or(10.0);
+            let buf = rt.rolling.get(&cfg.id).map(|b| b.as_slice()).unwrap_or(&[]);
+            let y = rolling_avg_peek(buf, Some((now_ms, x)), now_ms, window).unwrap_or(x);
+            fmt_num(y)
+        }
+        "rate_of_change" => {
+            let abs = cfg.param_b.trim().eq_ignore_ascii_case("abs");
+            let prev = rt.roc_prev.get(&cfg.id).copied();
+            let (rate, _) = rate_of_change(prev, x, now_ms, &cfg.param_a, abs);
+            fmt_num(rate)
+        }
+        "hysteresis" => {
+            let on_at = parse_f64(&cfg.param_a).unwrap_or(80.0);
+            let off_at = parse_f64(&cfg.param_b).unwrap_or(70.0);
+            let prev = rt.hyst_on.get(&cfg.id).copied();
+            let on = hysteresis_step(prev, x, on_at, off_at);
+            if on {
+                "1".into()
             } else {
-                fmt_num(x)
+                "0".into()
             }
         }
         "scale_offset" => {
@@ -182,7 +343,7 @@ fn peek_one(cfg: &CalcConfig, rt: &CalcRuntime, raw: &str) -> String {
     }
 }
 
-fn apply_one(cfg: &CalcConfig, rt: &mut CalcRuntime, raw: &str, now_ms: u64) -> String {
+fn apply_one(cfg: &CalcConfig, rt: &mut CalcRuntime, raw: &str, at_ms: u64) -> String {
     let Some(x) = parse_f64(raw) else {
         return raw.to_string();
     };
@@ -195,11 +356,30 @@ fn apply_one(cfg: &CalcConfig, rt: &mut CalcRuntime, raw: &str, now_ms: u64) -> 
             fmt_num(y)
         }
         "rolling_avg" => {
-            let window = parse_f64(&cfg.window_secs).unwrap_or(10.0).max(0.001);
+            let window = parse_f64(&cfg.window_secs).unwrap_or(10.0);
             let max_n = rolling_max_n(&cfg.param_a);
             let buf = rt.rolling.entry(cfg.id).or_default();
-            let y = rolling_avg_step(buf, x, now_ms, window, max_n);
+            let y = rolling_avg_step(buf, x, at_ms, window, max_n);
             fmt_num(y)
+        }
+        "rate_of_change" => {
+            let abs = cfg.param_b.trim().eq_ignore_ascii_case("abs");
+            let prev = rt.roc_prev.get(&cfg.id).copied();
+            let (rate, cur) = rate_of_change(prev, x, at_ms, &cfg.param_a, abs);
+            rt.roc_prev.insert(cfg.id, cur);
+            fmt_num(rate)
+        }
+        "hysteresis" => {
+            let on_at = parse_f64(&cfg.param_a).unwrap_or(80.0);
+            let off_at = parse_f64(&cfg.param_b).unwrap_or(70.0);
+            let prev = rt.hyst_on.get(&cfg.id).copied();
+            let on = hysteresis_step(prev, x, on_at, off_at);
+            rt.hyst_on.insert(cfg.id, on);
+            if on {
+                "1".into()
+            } else {
+                "0".into()
+            }
         }
         "scale_offset" => {
             let scale = parse_f64(&cfg.param_a).unwrap_or(1.0);
@@ -242,43 +422,161 @@ mod tests {
             ..Default::default()
         }];
         let mut rt = CalcRuntime::default();
-        let a = apply_for_egress(&configs, &mut rt, "mqtt_1", "100.0");
+        let a = apply_at(&configs, &mut rt, "mqtt_1", "100.0", 1_000);
         assert_eq!(a, "100");
-        let b = apply_for_egress(&configs, &mut rt, "mqtt_1", "100.4");
+        let b = apply_at(&configs, &mut rt, "mqtt_1", "100.4", 1_100);
         assert_eq!(b, "100");
-        let c = apply_for_egress(&configs, &mut rt, "mqtt_1", "141");
+        let c = apply_at(&configs, &mut rt, "mqtt_1", "141", 1_200);
         assert_eq!(c, "141");
     }
 
     #[test]
-    fn rolling_avg_means_samples() {
+    fn rolling_step_holds_previous_across_window() {
         let mut buf = Vec::new();
         let t0 = 1_000_000u64;
-        let a = rolling_avg_step(&mut buf, 10.0, t0, 10.0, None);
-        assert_eq!(a, 10.0);
-        let b = rolling_avg_step(&mut buf, 20.0, t0 + 100, 10.0, None);
-        assert_eq!(b, 15.0);
-        let c = rolling_avg_step(&mut buf, 30.0, t0 + 200, 10.0, Some(2));
-        // max 2 samples → 20 and 30
-        assert_eq!(c, 25.0);
+        let _ = rolling_avg_step(&mut buf, 10.0, t0, 10.0, None);
+        let y = rolling_avg_step(&mut buf, 100.0, t0 + 9_000, 10.0, None);
+        assert!((y - 10.0).abs() < 0.05, "step must not jump avg, got {y}");
+        let y2 = rolling_avg_step(&mut buf, 100.0, t0 + 9_500, 10.0, None);
+        assert!(
+            (y2 - 14.5).abs() < 0.05,
+            "expected ~14.5 after 0.5s at 100, got {y2}"
+        );
     }
 
     #[test]
-    fn rolling_avg_egress() {
+    fn rolling_avg_egress_smooths_square_wave() {
         let configs = vec![CalcConfig {
             id: 7,
             kind: "rolling_avg".into(),
             source_point: "mqtt_1".into(),
             param_a: "auto".into(),
-            window_secs: "60".into(),
+            window_secs: "10".into(),
             ..Default::default()
         }];
         let mut rt = CalcRuntime::default();
-        let a = apply_for_egress(&configs, &mut rt, "mqtt_1", "10");
-        let b = apply_for_egress(&configs, &mut rt, "mqtt_1", "20");
-        assert_eq!(a, "10");
-        assert_eq!(b, "15");
-        let peek = peek_for_point(&configs, &rt, "mqtt_1", "99");
-        assert_eq!(peek, "15");
+        let t0 = 5_000_000u64;
+        for i in 0..100 {
+            let v = if i % 2 == 0 { "0" } else { "100" };
+            let _ = apply_at(&configs, &mut rt, "mqtt_1", v, t0 + i * 100);
+        }
+        let mid = apply_at(&configs, &mut rt, "mqtt_1", "100", t0 + 10_000);
+        let mid_n: f64 = mid.parse().unwrap();
+        assert!(
+            (mid_n - 50.0).abs() < 2.0,
+            "10s square wave should average ~50, got {mid_n}"
+        );
+        let after = apply_at(&configs, &mut rt, "mqtt_1", "0", t0 + 10_100);
+        let after_n: f64 = after.parse().unwrap();
+        assert!(
+            after_n > 40.0,
+            "output must not track input jump; got {after_n}"
+        );
+    }
+
+    #[test]
+    fn rolling_avg_gaussian_noise_reduces_variance() {
+        let configs = vec![CalcConfig {
+            id: 9,
+            kind: "rolling_avg".into(),
+            source_point: "mqtt_1".into(),
+            param_a: "auto".into(),
+            window_secs: "10".into(),
+            ..Default::default()
+        }];
+        let mut rt = CalcRuntime::default();
+        let t0 = 9_000_000u64;
+        let mut state = 0xC0FFEEu64;
+        let mut raws = Vec::new();
+        let mut outs = Vec::new();
+        for i in 0..200 {
+            let mut u = 0.0;
+            for _ in 0..6 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                u += (state % 1000) as f64 / 1000.0;
+            }
+            let x = 20.0 + u * (80.0 / 6.0);
+            raws.push(x);
+            let y: f64 = apply_at(
+                &configs,
+                &mut rt,
+                "mqtt_1",
+                &format!("{x:.6}"),
+                t0 + i * 50,
+            )
+            .parse()
+            .unwrap();
+            outs.push(y);
+        }
+        fn variance(xs: &[f64]) -> f64 {
+            let n = xs.len() as f64;
+            let mean = xs.iter().sum::<f64>() / n;
+            xs.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n
+        }
+        let raw_var = variance(&raws[raws.len() - 40..]);
+        let out_var = variance(&outs[outs.len() - 40..]);
+        assert!(
+            out_var < raw_var * 0.35,
+            "10s rolling avg must cut variance: raw={raw_var:.3} out={out_var:.3}"
+        );
+        let last_raw = *raws.last().unwrap();
+        let last_out = *outs.last().unwrap();
+        assert!(
+            (last_out - last_raw).abs() > 0.5,
+            "output tracking input too closely: raw={last_raw} out={last_out}"
+        );
+    }
+
+    #[test]
+    fn rate_of_change_per_second() {
+        let configs = vec![CalcConfig {
+            id: 3,
+            kind: "rate_of_change".into(),
+            source_point: "mqtt_1".into(),
+            param_a: "/s".into(),
+            ..Default::default()
+        }];
+        let mut rt = CalcRuntime::default();
+        let a = apply_at(&configs, &mut rt, "mqtt_1", "10", 1_000);
+        assert_eq!(a, "0");
+        // +10 over 0.5s → 20 /s
+        let b = apply_at(&configs, &mut rt, "mqtt_1", "20", 1_500);
+        assert_eq!(b, "20");
+        // +0 over next 1s → 0 /s
+        let c = apply_at(&configs, &mut rt, "mqtt_1", "20", 2_500);
+        assert_eq!(c, "0");
+        // abs mode
+        let configs_abs = vec![CalcConfig {
+            id: 3,
+            kind: "rate_of_change".into(),
+            source_point: "mqtt_1".into(),
+            param_a: "/s".into(),
+            param_b: "abs".into(),
+            ..Default::default()
+        }];
+        let d = apply_at(&configs_abs, &mut rt, "mqtt_1", "10", 3_500);
+        assert_eq!(d, "10");
+    }
+
+    #[test]
+    fn hysteresis_holds_between_thresholds() {
+        let configs = vec![CalcConfig {
+            id: 4,
+            kind: "hysteresis".into(),
+            source_point: "mqtt_1".into(),
+            param_a: "80".into(),
+            param_b: "70".into(),
+            ..Default::default()
+        }];
+        let mut rt = CalcRuntime::default();
+        assert_eq!(apply_at(&configs, &mut rt, "mqtt_1", "50", 1), "0");
+        assert_eq!(apply_at(&configs, &mut rt, "mqtt_1", "75", 2), "0");
+        assert_eq!(apply_at(&configs, &mut rt, "mqtt_1", "80", 3), "1");
+        assert_eq!(apply_at(&configs, &mut rt, "mqtt_1", "75", 4), "1"); // hold
+        assert_eq!(apply_at(&configs, &mut rt, "mqtt_1", "70", 5), "0");
+        assert_eq!(peek_for_point(&configs, &rt, "mqtt_1", "75"), "0"); // still off until on
+        assert_eq!(peek_for_point(&configs, &rt, "mqtt_1", "80"), "1");
     }
 }
