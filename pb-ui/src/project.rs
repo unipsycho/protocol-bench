@@ -342,6 +342,7 @@ pub fn migrate_client_binds_to_hubs(state: &mut MqttPanelState, hubs: &mut HubMo
                 topic: o.topic.clone(),
                 qos: o.qos,
                 retain: o.retain,
+                auto: false,
             })
             .collect();
         if inputs.is_empty() && outputs.is_empty() {

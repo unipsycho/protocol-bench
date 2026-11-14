@@ -9,7 +9,8 @@ use egui::{
 };
 use serde::Deserialize;
 
-use pb_engine::HostSnapshot;
+use pb_engine::{HostSnapshot, PointSnapshot};
+use std::collections::BTreeMap;
 
 use crate::dock::DockPane;
 use crate::mqtt_panel::MqttPanelState;
@@ -143,6 +144,19 @@ pub struct MqttOutputBind {
     pub qos: u8,
     #[serde(default)]
     pub retain: bool,
+    /// True when this bind was created from an inbound feed wire (PB-63).
+    #[serde(default)]
+    pub auto: bool,
+}
+
+/// Fan-in wire into an MQTT Output (many Sources / Calcs / Aggs → one Output).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HubFeed {
+    pub to_hub: u64,
+    pub to_output: u64,
+    pub from_hub: u64,
+    /// Source port id, or calculation / aggregator step id.
+    pub from_node: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -341,6 +355,9 @@ pub struct HubModel {
     /// Diagram scale. `1.0` is the default (maximum); wheel zooms out toward `ZOOM_MIN`.
     #[serde(default = "default_zoom")]
     pub zoom: f32,
+    /// Inbound feeds into Output ports (PB-63 fan-in). One Output accepts many.
+    #[serde(default)]
+    pub feeds: Vec<HubFeed>,
     #[serde(default)]
     next_id: u64,
 }
@@ -363,6 +380,7 @@ impl HubModel {
             view_pan: None,
             inspector_width: INSPECT_DEFAULT,
             zoom: ZOOM_MAX,
+            feeds: Vec::new(),
             hubs: vec![
                 Hub {
                     id: 1,
@@ -776,6 +794,185 @@ impl HubModel {
         }
     }
 
+    /// Connect a Source / Calc / Agg into an Output (many → one). Returns true if new.
+    pub fn connect_feed(
+        &mut self,
+        from_hub: u64,
+        from_node: u64,
+        to_hub: u64,
+        to_output: u64,
+    ) -> bool {
+        if from_hub == to_hub && from_node == to_output {
+            return false;
+        }
+        let Some(hub) = self.hub(to_hub) else {
+            return false;
+        };
+        if !hub.outputs.iter().any(|p| p.id == to_output) {
+            return false;
+        }
+        // from_node must be a source, calc, or agg on from_hub.
+        let Some(from) = self.hub(from_hub) else {
+            return false;
+        };
+        let ok = from.sources.iter().any(|p| p.id == from_node)
+            || from.calculations.iter().any(|s| s.id == from_node)
+            || from.aggregators.iter().any(|s| s.id == from_node);
+        if !ok {
+            return false;
+        }
+        let feed = HubFeed {
+            to_hub,
+            to_output,
+            from_hub,
+            from_node,
+        };
+        if self.feeds.iter().any(|f| f == &feed) {
+            return false;
+        }
+        self.feeds.push(feed);
+        true
+    }
+
+    pub fn remove_feed(&mut self, idx: usize) {
+        if idx < self.feeds.len() {
+            self.feeds.remove(idx);
+        }
+    }
+
+    /// Resolve host point ids produced by a feeder node.
+    pub fn points_for_node(
+        &self,
+        hub_id: u64,
+        node_id: u64,
+        host_points: &[PointSnapshot],
+    ) -> Vec<String> {
+        let Some(hub) = self.hub(hub_id) else {
+            return Vec::new();
+        };
+        if let Some(step) = hub.calculations.iter().find(|s| s.id == node_id) {
+            let p = step.source_point.trim();
+            return if p.is_empty() {
+                Vec::new()
+            } else {
+                vec![p.to_string()]
+            };
+        }
+        if hub.aggregators.iter().any(|s| s.id == node_id) {
+            return vec![format!("agg_{node_id}")];
+        }
+        let Some(port) = hub.sources.iter().find(|p| p.id == node_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for bind in &port.mqtt_inputs {
+            let point = bind.point.trim();
+            if !point.is_empty() {
+                if !out.iter().any(|p| p == point) {
+                    out.push(point.to_string());
+                }
+                continue;
+            }
+            let topic = bind.topic.trim();
+            if topic.is_empty() {
+                continue;
+            }
+            for hp in host_points {
+                if hp.source.contains(topic) && !out.iter().any(|p| p == &hp.name) {
+                    out.push(hp.name.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Rebuild auto Output binds from inbound feeds; keep manual binds and topic overrides.
+    /// Returns true when feeds or binds changed.
+    pub fn sync_output_feed_binds(&mut self, host_points: &[PointSnapshot]) -> bool {
+        let feeds_before = self.feeds.len();
+        let mut changed = false;
+        // Drop feeds whose endpoints vanished first.
+        let keep: Vec<HubFeed> = self
+            .feeds
+            .iter()
+            .filter(|f| {
+                let Some(to) = self.hub(f.to_hub) else {
+                    return false;
+                };
+                if !to.outputs.iter().any(|p| p.id == f.to_output) {
+                    return false;
+                }
+                let Some(from) = self.hub(f.from_hub) else {
+                    return false;
+                };
+                from.sources.iter().any(|p| p.id == f.from_node)
+                    || from.calculations.iter().any(|s| s.id == f.from_node)
+                    || from.aggregators.iter().any(|s| s.id == f.from_node)
+            })
+            .cloned()
+            .collect();
+        if keep.len() != self.feeds.len() {
+            changed = true;
+        }
+        self.feeds = keep;
+        let mut by_out: BTreeMap<(u64, u64), Vec<String>> = BTreeMap::new();
+        for feed in &self.feeds {
+            let pts = self.points_for_node(feed.from_hub, feed.from_node, host_points);
+            let entry = by_out.entry((feed.to_hub, feed.to_output)).or_default();
+            for p in pts {
+                if !entry.iter().any(|x| x == &p) {
+                    entry.push(p);
+                }
+            }
+        }
+        for hub in &mut self.hubs {
+            for port in &mut hub.outputs {
+                if port.protocol != HubProto::Mqtt {
+                    continue;
+                }
+                let auto_points = by_out
+                    .get(&(hub.id, port.id))
+                    .cloned()
+                    .unwrap_or_default();
+                let old = port.mqtt_outputs.clone();
+                let mut next = Vec::new();
+                for b in &old {
+                    if !b.auto {
+                        next.push(b.clone());
+                    }
+                }
+                for point in auto_points {
+                    if next.iter().any(|b| b.point == point) {
+                        continue;
+                    }
+                    if let Some(prev) = old.iter().find(|b| b.point == point) {
+                        let mut b = prev.clone();
+                        b.auto = true;
+                        next.push(b);
+                    } else {
+                        let topic = if port.draft_mqtt_out_topic.trim().is_empty() {
+                            format!("out/{point}")
+                        } else {
+                            port.draft_mqtt_out_topic.trim().to_string()
+                        };
+                        next.push(MqttOutputBind {
+                            point,
+                            topic,
+                            qos: 0,
+                            retain: false,
+                            auto: true,
+                        });
+                    }
+                }
+                if next != port.mqtt_outputs {
+                    port.mqtt_outputs = next;
+                    changed = true;
+                }
+            }
+        }
+        changed || self.feeds.len() != feeds_before
+    }
+
     /// Collect Input/Output MQTT binds for one connection id.
     /// Many nodes may share the connection; each node's binds are included (overlap OK).
     pub fn mqtt_binds_for_connection(
@@ -825,6 +1022,7 @@ impl HubModel {
                         topic: bind.topic.trim().to_string(),
                         qos: bind.qos,
                         retain: bind.retain,
+                        auto: bind.auto,
                     });
                 }
             }
@@ -1303,6 +1501,10 @@ pub fn paint(
     engine: &pb_engine::EngineHandle,
 ) -> HubChange {
     let mut change = HubChange::quiet();
+    // Keep Output auto-binds aligned with inbound feed wires (PB-63).
+    if model.sync_output_feed_binds(&host.points) {
+        change.dirty = true;
+    }
     // The dock column zeros item spacing, and that style is inherited here.
     // Restore the chrome gap (10×6) so toolbar buttons match the rest of the shell.
     ui.spacing_mut().item_spacing = vec2(10.0, 6.0);
@@ -1322,7 +1524,7 @@ pub fn paint(
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
-                    "Drag empty canvas to box-select. Drag a selection to move as a group. Click a link or node for details. Right-click a connection to add aggregator/calculation. Wheel zooms toward cursor. Middle-drag or Space-drag pans.",
+                    "Alt-drag Input/Calc/Agg onto an Output to fan-in points (one Output, many edges). Drag empty canvas to box-select. Right-click a connection to add aggregator/calculation. Wheel zooms · Middle/Space-drag pans.",
                 )
                 .font(font_ui(12.0))
                 .color(p.muted),
@@ -1342,7 +1544,7 @@ pub fn paint(
         let diagram_w = (total - inspect_w - gap).max(DIAGRAM_MIN);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            change = change.join(diagram_view(ui, model, diagram_w, height, p));
+            change = change.join(diagram_view(ui, model, diagram_w, height, p, host));
             match hub_inspect_splitter(ui, height, gap, p) {
                 SplitCmd::Reset => {
                     model.inspector_width = INSPECT_DEFAULT.clamp(INSPECT_MIN, max_inspect);
@@ -1371,7 +1573,7 @@ pub fn paint(
         });
     } else {
         let height = (ui.available_height() * 0.58).clamp(180.0, 420.0);
-        change = change.join(diagram_view(ui, model, ui.available_width(), height, p));
+        change = change.join(diagram_view(ui, model, ui.available_width(), height, p, host));
         ui.add_space(8.0);
         change = change.join(inspector(
             ui,
@@ -1449,6 +1651,7 @@ fn diagram_view(
     width: f32,
     height: f32,
     p: &ThemePalette,
+    host: &HostSnapshot,
 ) -> HubChange {
     let (rect, _) = ui.allocate_exact_size(vec2(width.max(1.0), height.max(1.0)), Sense::hover());
     let painter = ui.painter().with_clip_rect(rect);
@@ -1637,6 +1840,36 @@ fn diagram_view(
     if let Some(pane) = gesture.open {
         change.open = Some(pane);
     }
+    // PB-63: Alt-drag wire Input/Calc/Agg → Output (persist start across drag frames).
+    let wire_id = Id::new("pb_hub_fan_wire");
+    if let Some(from) = gesture.wire_from {
+        child.ctx().data_mut(|d| d.insert_temp(wire_id, from));
+    }
+    let mut wire_preview: Option<((u64, Option<u64>), Pos2)> = None;
+    if let Some(from) = child.ctx().data(|d| d.get_temp::<(u64, Option<u64>)>(wire_id)) {
+        if let Some(pos) = child.ctx().pointer_interact_pos() {
+            wire_preview = Some((from, pos));
+        }
+        let released = canvas.drag_stopped()
+            || child.ctx().input(|i| i.pointer.any_released());
+        if released {
+            child.ctx().data_mut(|d| d.remove_temp::<(u64, Option<u64>)>(wire_id));
+            if let Some(pos) = child.ctx().pointer_interact_pos() {
+                if let Some(to) = screen
+                    .iter()
+                    .find(|n| n.role == Role::Output && n.rect.contains(pos))
+                {
+                    if let (Some(from_id), Some(out_id)) = (from.1, to.port_id) {
+                        if model.connect_feed(from.0, from_id, to.hub_id, out_id) {
+                            let _ = model.sync_output_feed_binds(&host.points);
+                            change.dirty = true;
+                        }
+                    }
+                }
+            }
+            wire_preview = None;
+        }
+    }
     let target = model
         .selected
         .or_else(|| model.hubs.first().map(|hub| hub.id));
@@ -1663,6 +1896,23 @@ fn diagram_view(
         zoom,
         p,
     );
+    // Fan-in feed wires + live Alt-drag preview.
+    paint_feeds(child.painter(), &screen, model, p);
+    if let Some((from, tip)) = wire_preview {
+        if let Some(src) = screen
+            .iter()
+            .find(|n| n.hub_id == from.0 && n.port_id == from.1)
+        {
+            link_curve(
+                child.painter(),
+                src.rect,
+                Rect::from_center_size(tip, vec2(1.0, 1.0)),
+                p.accent,
+                false,
+                true,
+            );
+        }
+    }
     if let Some(box_drag) = marquee_paint {
         paint_marquee(child.painter(), box_drag.rect(), p);
     }
@@ -1670,6 +1920,41 @@ fn diagram_view(
         child.ctx().set_cursor_icon(egui::CursorIcon::AllScroll);
     }
     change
+}
+
+fn paint_feeds(painter: &egui::Painter, nodes: &[Placed], model: &HubModel, p: &ThemePalette) {
+    for feed in &model.feeds {
+        let Some(from) = nodes
+            .iter()
+            .find(|n| n.hub_id == feed.from_hub && n.port_id == Some(feed.from_node))
+        else {
+            continue;
+        };
+        let Some(to) = nodes.iter().find(|n| {
+            n.hub_id == feed.to_hub
+                && n.port_id == Some(feed.to_output)
+                && n.role == Role::Output
+        }) else {
+            continue;
+        };
+        link_curve(painter, from.rect, to.rect, p.live, false, false);
+    }
+}
+
+fn feeder_label(model: &HubModel, hub_id: u64, node_id: u64) -> String {
+    let Some(hub) = model.hub(hub_id) else {
+        return format!("node {node_id}");
+    };
+    if let Some(p) = hub.sources.iter().find(|p| p.id == node_id) {
+        return format!("IN · {}", p.label);
+    }
+    if let Some(s) = hub.calculations.iter().find(|s| s.id == node_id) {
+        return format!("CALC · {}", s.label);
+    }
+    if let Some(s) = hub.aggregators.iter().find(|s| s.id == node_id) {
+        return format!("AGG · {}", s.label);
+    }
+    format!("node {node_id}")
 }
 
 /// Middle-drag, or Space+left-drag: pointer delta for camera pan.
@@ -1790,6 +2075,8 @@ struct Gesture {
     link_pick: bool,
     /// Hovered / menu-targeted link (hub_id, port_id).
     hot_link: Option<(u64, u64)>,
+    /// Alt-drag fan-in wire from Source/Calc/Agg (PB-63).
+    wire_from: Option<(u64, Option<u64>)>,
 }
 
 fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool) -> Gesture {
@@ -1801,7 +2088,9 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
         menu: None,
         link_pick: false,
         hot_link: None,
+        wire_from: None,
     };
+    let alt = ui.input(|i| i.modifiers.alt);
     for node in nodes {
         let id = Id::new((
             "pb_hub_node",
@@ -1810,9 +2099,16 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
             node.role as u8,
         ));
         let opens = open_target(model, node).is_some();
+        let can_feed = matches!(
+            node.role,
+            Role::Source | Role::Aggregator | Role::Calculation
+        );
         let tip = match node.role {
             Role::Source | Role::Output => {
-                "Drag to move. Click for details. Right-click to add aggregator/calculation on this link."
+                "Drag to move. Alt-drag Input → Output to fan-in points. Click for details. Right-click to add aggregator/calculation."
+            }
+            Role::Aggregator | Role::Calculation => {
+                "Drag to move. Alt-drag onto an Output to publish this point. Click for details."
             }
             _ if opens => {
                 "Drag to move. Click for details. Double-click opens the protocol panel. Right-click to add source/output."
@@ -1826,14 +2122,22 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
         if !panning && (resp.hovered() || resp.dragged()) {
             gesture.hover = Some(key);
             let cursor = if resp.dragged() {
-                egui::CursorIcon::Grabbing
+                if alt && can_feed {
+                    egui::CursorIcon::Crosshair
+                } else {
+                    egui::CursorIcon::Grabbing
+                }
             } else {
                 egui::CursorIcon::Grab
             };
             ui.ctx().set_cursor_icon(cursor);
         }
         if !panning && resp.dragged() {
-            gesture.drag = Some((node.hub_id, node.port_id, resp.drag_delta()));
+            if alt && can_feed {
+                gesture.wire_from = Some(key);
+            } else {
+                gesture.drag = Some((node.hub_id, node.port_id, resp.drag_delta()));
+            }
         } else if resp.clicked() {
             gesture.pick = Some(key);
         }
@@ -2580,6 +2884,15 @@ fn edit_port(
                 .font(font_ui(11.0))
                 .color(p.muted),
         );
+    } else {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "One Output accepts many inbound edges — Alt-drag Input/Calc/Agg here.",
+            )
+            .font(font_ui(11.0))
+            .color(p.muted),
+        );
     }
     // Re-read protocol after possible dropdown change.
     let proto = port_field(model, hub_id, port_id).protocol;
@@ -2858,6 +3171,56 @@ fn edit_mqtt_port_binds(
     } else {
         ui.add_space(10.0);
         ui.label(
+            egui::RichText::new("CONNECTED — inbound edges")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(4.0);
+        let feed_idxs: Vec<usize> = model
+            .feeds
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.to_hub == hub_id && f.to_output == port_id)
+            .map(|(i, _)| i)
+            .collect();
+        if feed_idxs.is_empty() {
+            ui.label(
+                egui::RichText::new("No feeds yet — Alt-drag an Input, Calc, or Agg onto this Output.")
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            );
+        } else {
+            let mut drop_feed = None;
+            for idx in feed_idxs {
+                let feed = model.feeds[idx].clone();
+                let label = feeder_label(model, feed.from_hub, feed.from_node);
+                let pts = model.points_for_node(feed.from_hub, feed.from_node, &host.points);
+                let pts_s = if pts.is_empty() {
+                    "(no point yet)".into()
+                } else {
+                    pts.join(", ")
+                };
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(
+                        egui::RichText::new(format!("{label} → {pts_s}"))
+                            .font(font_ui(12.5))
+                            .color(p.text),
+                    );
+                    if text_button(ui, "×", false, p).clicked() {
+                        drop_feed = Some(idx);
+                    }
+                });
+                ui.add_space(2.0);
+            }
+            if let Some(idx) = drop_feed {
+                model.remove_feed(idx);
+                let _ = model.sync_output_feed_binds(&host.points);
+                change.dirty = true;
+            }
+        }
+        ui.add_space(10.0);
+        ui.label(
             egui::RichText::new("OUTPUT BINDS — point → publish topic")
                 .font(font_ui(10.5))
                 .color(p.muted),
@@ -2865,7 +3228,7 @@ fn edit_mqtt_port_binds(
         ui.add_space(2.0);
         ui.label(
             egui::RichText::new(
-                "Publish via the connection above — hub broker (embedded) or an external Client.",
+                "Auto-filled from connected edges; edit topics as needed. One Output publishes many points.",
             )
             .font(font_ui(11.0))
             .color(p.muted),
@@ -2879,6 +3242,13 @@ fn edit_mqtt_port_binds(
             for (i, bind) in port.mqtt_outputs.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
+                    if bind.auto {
+                        ui.label(
+                            egui::RichText::new("auto")
+                                .font(font_ui(10.5))
+                                .color(p.live),
+                        );
+                    }
                     let point_w = (ui.available_width() * 0.28).clamp(72.0, 140.0);
                     // Focus buffer: commit on blur only — per-keystroke dirty
                     // reconfigures the pack and publishes partial topic roots
@@ -2986,6 +3356,7 @@ fn edit_mqtt_port_binds(
                     topic: topic.clone(),
                     qos: 0,
                     retain: false,
+                    auto: false,
                 };
                 if !port
                     .mqtt_outputs
@@ -3378,6 +3749,33 @@ fn text_button(ui: &mut Ui, label: &str, on: bool, p: &ThemePalette) -> egui::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_accepts_many_inbound_feeds() {
+        let mut model = HubModel::sample();
+        let hub = model.hubs[1].id;
+        let out = model.hubs[1].outputs[0].id;
+        let src = model.hubs[1].sources[0].id;
+        // Add a calc on the source edge with a point.
+        let calc = model.add_step(hub, false, src).expect("calc");
+        if let Some(step) = model
+            .hub_mut(hub)
+            .and_then(|h| h.calculations.iter_mut().find(|s| s.id == calc))
+        {
+            step.source_point = "mqtt_1".into();
+        }
+        assert!(model.connect_feed(hub, src, hub, out));
+        assert!(model.connect_feed(hub, calc, hub, out));
+        assert_eq!(model.feeds.len(), 2);
+        assert!(!model.connect_feed(hub, calc, hub, out)); // duplicate
+        let changed = model.sync_output_feed_binds(&[]);
+        assert!(changed);
+        let binds = &model.hubs[1].outputs[0].mqtt_outputs;
+        assert!(
+            binds.iter().any(|b| b.point == "mqtt_1" && b.auto),
+            "calc point should auto-bind: {binds:?}"
+        );
+    }
 
     #[test]
     fn sample_hubs_are_server_capable_with_mixed_ports() {
