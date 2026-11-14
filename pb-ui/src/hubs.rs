@@ -390,6 +390,9 @@ pub struct HubModel {
     /// PB-66: undo for delete / rearrange / move. Not persisted.
     #[serde(skip)]
     undo: HubUndoStack,
+    /// Selected fan-in wire index (PB-73). Ephemeral.
+    #[serde(skip)]
+    pub selected_feed: Option<usize>,
 }
 
 impl Default for HubModel {
@@ -412,6 +415,7 @@ impl HubModel {
             zoom: ZOOM_MAX,
             feeds: Vec::new(),
             undo: HubUndoStack::default(),
+            selected_feed: None,
             hubs: vec![
                 Hub {
                     id: 1,
@@ -923,11 +927,15 @@ impl HubModel {
         self.keep_focus();
     }
 
-    /// True when `node_id` can start a feed wire (Input / Calc / Agg).
+    /// True when `node_id` can start a feed wire (Hub body / Input / Calc / Agg).
     fn is_feeder(&self, hub_id: u64, node_id: u64) -> bool {
         let Some(hub) = self.hub(hub_id) else {
             return false;
         };
+        // Hub card itself (PB-73): wire Hub → Calc/Agg/Output.
+        if node_id == hub_id {
+            return true;
+        }
         hub.sources.iter().any(|p| p.id == node_id)
             || hub.calculations.iter().any(|s| s.id == node_id)
             || hub.aggregators.iter().any(|s| s.id == node_id)
@@ -1043,7 +1051,37 @@ impl HubModel {
 
     pub fn remove_feed(&mut self, idx: usize) {
         if idx < self.feeds.len() {
+            self.checkpoint();
             self.feeds.remove(idx);
+            if self.selected_feed == Some(idx) {
+                self.selected_feed = None;
+            } else if let Some(sel) = self.selected_feed {
+                if sel > idx {
+                    self.selected_feed = Some(sel - 1);
+                }
+            }
+        }
+    }
+
+    /// Delete the selected feed wire; orphan nodes stay (PB-73).
+    pub fn delete_selected_feed(&mut self) -> bool {
+        let Some(idx) = self.selected_feed else {
+            return false;
+        };
+        if idx >= self.feeds.len() {
+            self.selected_feed = None;
+            return false;
+        }
+        self.remove_feed(idx);
+        true
+    }
+
+    pub fn select_feed(&mut self, idx: Option<usize>) {
+        self.selected_feed = idx.filter(|i| *i < self.feeds.len());
+        if self.selected_feed.is_some() {
+            self.selection.clear();
+            self.selected_port = None;
+            self.selected_link = None;
         }
     }
 
@@ -1057,6 +1095,18 @@ impl HubModel {
         let Some(hub) = self.hub(hub_id) else {
             return Vec::new();
         };
+        // Hub body: union of all Input points (PB-73).
+        if node_id == hub_id {
+            let mut out = Vec::new();
+            for src in &hub.sources {
+                for p in self.points_for_node(hub_id, src.id, host_points) {
+                    if !out.iter().any(|x| x == &p) {
+                        out.push(p);
+                    }
+                }
+            }
+            return out;
+        }
         if let Some(step) = hub.calculations.iter().find(|s| s.id == node_id) {
             let p = step.source_point.trim();
             return if p.is_empty() {
@@ -1761,16 +1811,27 @@ pub fn paint(
         ui.add_space(8.0);
         legend(ui, p);
         ui.add_space(8.0);
+        // PB-71: tips live in a hover tooltip, not a permanent banner.
         ui.add(
             egui::Label::new(
-                egui::RichText::new(
-                    "Alt-drag Input/Calc/Agg onto an Output to fan-in points (one Output, many edges). Drag empty canvas to box-select. Right-click a connection to add aggregator/calculation. Wheel zooms · Middle/Space-drag pans.",
-                )
-                .font(font_ui(12.0))
-                .color(p.muted),
+                egui::RichText::new("Navigation")
+                    .font(font_ui(12.0))
+                    .color(p.muted),
             )
-            .truncate(),
-        );
+            .sense(Sense::hover()),
+        )
+        .on_hover_ui(|ui| {
+            ui.set_max_width(320.0);
+            for line in [
+                "Alt-drag or drag a port edge: wire Hub/Input/Calc/Agg → Output/Calc/Agg",
+                "Grab a wire end to reattach; click a wire then Delete to remove it",
+                "Drag empty canvas to box-select",
+                "Right-click a connection to add aggregator/calculation",
+                "Wheel zooms · Middle or Space-drag pans",
+            ] {
+                ui.label(egui::RichText::new(line).font(font_ui(12.0)).color(p.text));
+            }
+        });
     });
     ui.add_space(8.0);
     let wide = ui.available_width() > 760.0;
@@ -1952,7 +2013,7 @@ fn diagram_view(
             font_ui(14.0),
             p.muted,
         );
-        if let Some(cmd) = canvas_menu(&canvas, None, None) {
+        if let Some(cmd) = canvas_menu(&canvas, None, None, None) {
             apply_menu(model, cmd, &mut change);
         }
         return change;
@@ -1997,14 +2058,36 @@ fn diagram_view(
         if do_undo && model.undo() {
             change.dirty = true;
         }
-        if do_delete && model.delete_selection() {
-            change.dirty = true;
+        // Prefer deleting a selected wire over nodes (PB-73).
+        if do_delete {
+            if model.delete_selected_feed() || model.delete_selection() {
+                change.dirty = true;
+            }
         }
     }
-    // Links only when no node took the pointer (nodes sit on top of edges).
+    // Fan-in wires under the pointer (select / context-delete) — before hub-port links.
+    let mut feed_hit: Option<usize> = None;
+    if gesture.hover.is_none() && gesture.pick.is_none() && !panning {
+        if let Some(pos) = child.ctx().pointer_interact_pos() {
+            if let Some(idx) = hit_feed_curve(model, &screen, pos, zoom)
+                .or_else(|| {
+                    hit_feed_endpoint(model, &screen, pos, zoom).map(|(i, _)| i)
+                })
+            {
+                feed_hit = Some(idx);
+                child.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                if canvas.clicked() || canvas.secondary_clicked() {
+                    model.select_feed(Some(idx));
+                    change.dirty = true;
+                }
+            }
+        }
+    }
+    // Hub↔port links only when no node / feed took the pointer.
     if gesture.hover.is_none()
         && gesture.pick.is_none()
         && gesture.menu.is_none()
+        && feed_hit.is_none()
         && !panning
     {
         if let Some((hub_id, port_id)) = hit_link(&mut child, model, &screen, zoom) {
@@ -2017,13 +2100,25 @@ fn diagram_view(
             }
         }
     }
-    // Bounding-box select on empty canvas (not while panning, on a node, or on a link).
+    // Bounding-box select on empty canvas only — never while wiring / on nodes / wires (PB-72).
     let marquee_id = Id::new("pb_hub_marquee");
     let mut marquee_paint = None;
+    let pointer_pos = child.ctx().pointer_interact_pos();
+    let on_wire_chrome = pointer_pos.is_some_and(|pos| {
+        hit_feed_endpoint(model, &screen, pos, zoom).is_some()
+            || hit_feed_curve(model, &screen, pos, zoom).is_some()
+    });
+    let wiring = gesture.wire_from.is_some()
+        || child
+            .ctx()
+            .data(|d| d.get_temp::<(u64, Option<u64>)>(Id::new("pb_hub_fan_wire")))
+            .is_some();
     let on_empty = gesture.hover.is_none()
         && gesture.drag.is_none()
         && gesture.hot_link.is_none()
-        && !panning;
+        && !panning
+        && !on_wire_chrome
+        && !wiring;
     if on_empty && canvas.drag_started() {
         if let Some(pos) = canvas.interact_pointer_pos() {
             child.ctx().data_mut(|d| {
@@ -2036,6 +2131,9 @@ fn diagram_view(
                 );
             });
         }
+    } else if !on_empty {
+        // Cancel a marquee that started under a port/wire press (PB-72).
+        child.ctx().data_mut(|d| d.remove_temp::<Marquee>(marquee_id));
     }
     if canvas.dragged() {
         if let Some(mut box_drag) = child.ctx().data(|d| d.get_temp::<Marquee>(marquee_id)) {
@@ -2066,8 +2164,10 @@ fn diagram_view(
         && !finished_marquee
         && !gesture.link_pick
         && gesture.pick.is_none()
+        && feed_hit.is_none()
     {
         model.set_selection(Vec::new());
+        model.selected_feed = None;
         change.dirty = true;
     }
     // PB-69: rewire — grab a feed endpoint and drop on another compatible node.
@@ -2114,13 +2214,12 @@ fn diagram_view(
             child.ctx().data_mut(|d| d.remove_temp::<RewireState>(rewire_id));
             if let Some(pos) = pointer {
                 if let Some(target) = screen.iter().find(|n| n.rect.contains(pos)) {
-                    if let Some(node_id) = target.port_id {
-                        let from_end = matches!(state.end, FeedEnd::From);
-                        if model.rewire_feed(state.feed_idx, from_end, target.hub_id, node_id)
-                        {
-                            let _ = model.sync_output_feed_binds(&host.points);
-                            change.dirty = true;
-                        }
+                    // Hub body: port_id None → use hub id as feeder id (PB-73).
+                    let node_id = target.port_id.unwrap_or(target.hub_id);
+                    let from_end = matches!(state.end, FeedEnd::From);
+                    if model.rewire_feed(state.feed_idx, from_end, target.hub_id, node_id) {
+                        let _ = model.sync_output_feed_binds(&host.points);
+                        change.dirty = true;
                     }
                 }
             }
@@ -2155,6 +2254,7 @@ fn diagram_view(
         change.dirty = true;
     }
     if let Some((hub_id, port_id)) = gesture.pick {
+        model.selected_feed = None;
         if gesture.link_pick {
             if let Some(port_id) = port_id {
                 model.focus_link(hub_id, port_id);
@@ -2195,7 +2295,9 @@ fn diagram_view(
                     .iter()
                     .find(|n| sink_role(n.role) && n.rect.contains(pos))
                 {
-                    if let (Some(from_id), Some(to_id)) = (from.1, to.port_id) {
+                    // Hub body uses port_id None → feeder id is the hub id (PB-73).
+                    if let Some(to_id) = to.port_id {
+                        let from_id = from.1.unwrap_or(from.0);
                         if model.connect_feed(from.0, from_id, to.hub_id, to_id) {
                             let _ = model.sync_output_feed_binds(&host.points);
                             change.dirty = true;
@@ -2211,7 +2313,11 @@ fn diagram_view(
         .or_else(|| model.hubs.first().map(|hub| hub.id));
     // Prefer the hovered connection; else the already-selected edge.
     let edge = gesture.hot_link.or_else(|| model.transform_edge());
-    let menu = gesture.menu.or_else(|| canvas_menu(&canvas, target, edge));
+    let feed_for_menu = feed_hit.or(model.selected_feed);
+    let menu =
+        gesture
+            .menu
+            .or_else(|| canvas_menu(&canvas, target, edge, feed_for_menu));
     if let Some(cmd) = menu {
         apply_menu(model, cmd, &mut change);
     }
@@ -2269,16 +2375,18 @@ fn diagram_view(
 }
 
 fn paint_feeds(painter: &egui::Painter, nodes: &[Placed], model: &HubModel, p: &ThemePalette) {
-    for feed in &model.feeds {
+    for (idx, feed) in model.feeds.iter().enumerate() {
         let Some((from_pt, to_pt, from_rect, to_rect)) = feed_ends(nodes, feed) else {
             continue;
         };
-        link_curve(painter, from_rect, to_rect, p.live, false, false);
-        // PB-69: endpoint handles at wire tips (away from node centers).
-        let r = 5.0;
+        let hot = model.selected_feed == Some(idx);
+        let color = if hot { p.accent } else { p.live };
+        link_curve(painter, from_rect, to_rect, color, false, hot);
+        // PB-74: cyan dots, ~half the prior size, matching across-hub arrows.
+        let r = 2.5;
         for c in [from_pt, to_pt] {
-            painter.circle_filled(c, r, p.accent);
-            painter.circle_stroke(c, r, Stroke::new(1.0, p.line));
+            painter.circle_filled(c, r, p.live);
+            painter.circle_stroke(c, r, Stroke::new(1.0, p.live));
         }
     }
 }
@@ -2288,6 +2396,59 @@ enum FeedEnd {
     #[default]
     From,
     To,
+}
+
+/// Distance hit-test along a feed curve (for select / delete).
+fn hit_feed_curve(
+    model: &HubModel,
+    nodes: &[Placed],
+    pos: Pos2,
+    zoom: f32,
+) -> Option<usize> {
+    let thresh = (8.0 * zoom.max(0.35)).max(6.0);
+    let mut best: Option<(f32, usize)> = None;
+    for (idx, feed) in model.feeds.iter().enumerate() {
+        let Some((a, b, from_rect, to_rect)) = feed_ends(nodes, feed) else {
+            continue;
+        };
+        let (_, _, dir) = facing(from_rect, to_rect);
+        let pull = 48.0_f32
+            .max((b - a).length() * 0.35)
+            .min(120.0);
+        let c1 = a + dir * pull;
+        let c2 = b - dir * pull;
+        let mut prev = a;
+        for step in 1..=16 {
+            let t = step as f32 / 16.0;
+            let u = 1.0 - t;
+            let cur = pos2(
+                u * u * u * a.x
+                    + 3.0 * u * u * t * c1.x
+                    + 3.0 * u * t * t * c2.x
+                    + t * t * t * b.x,
+                u * u * u * a.y
+                    + 3.0 * u * u * t * c1.y
+                    + 3.0 * u * t * t * c2.y
+                    + t * t * t * b.y,
+            );
+            let d = dist_to_segment(pos, prev, cur);
+            if d <= thresh && best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, idx));
+            }
+            prev = cur;
+        }
+    }
+    best.map(|(_, idx)| idx)
+}
+
+fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let len2 = ab.length_sq();
+    if len2 <= f32::EPSILON {
+        return p.distance(a);
+    }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    (a + ab * t).distance(p)
 }
 
 fn feed_ends(nodes: &[Placed], feed: &HubFeed) -> Option<(Pos2, Pos2, Rect, Rect)> {
@@ -2335,6 +2496,12 @@ fn sink_role(role: Role) -> bool {
     )
 }
 
+/// Left/right strip of a node — drag here to start a wire without Alt (PB-73).
+fn near_port_edge(rect: Rect, pos: Pos2) -> bool {
+    let margin = 14.0;
+    pos.x <= rect.min.x + margin || pos.x >= rect.max.x - margin
+}
+
 fn feeder_label(model: &HubModel, hub_id: u64, node_id: u64) -> String {
     let Some(hub) = model.hub(hub_id) else {
         return format!("node {node_id}");
@@ -2377,6 +2544,8 @@ enum MenuCmd {
     NewHub,
     /// PB-67: delete one canvas node (hub when `port_id` is None).
     DeleteNode { hub_id: u64, port_id: Option<u64> },
+    /// PB-73: delete one feed wire (orphan nodes stay).
+    DeleteFeed(usize),
 }
 
 fn apply_menu(model: &mut HubModel, cmd: MenuCmd, change: &mut HubChange) {
@@ -2414,6 +2583,10 @@ fn apply_menu(model: &mut HubModel, cmd: MenuCmd, change: &mut HubChange) {
                 Some(id) => model.remove_port(hub_id, id),
                 None => model.remove_hub(hub_id),
             }
+            change.dirty = true;
+        }
+        MenuCmd::DeleteFeed(idx) => {
+            model.remove_feed(idx);
             change.dirty = true;
         }
     }
@@ -2456,10 +2629,19 @@ fn canvas_menu(
     resp: &egui::Response,
     hub_id: Option<u64>,
     edge: Option<(u64, u64)>,
+    feed: Option<usize>,
 ) -> Option<MenuCmd> {
     let mut cmd = None;
     resp.context_menu(|ui| {
         ui.set_min_width(168.0);
+        // PB-73: delete the wire under the pointer / selection.
+        if let Some(idx) = feed {
+            if ui.button("Delete").clicked() {
+                cmd = Some(MenuCmd::DeleteFeed(idx));
+                ui.close_menu();
+            }
+            ui.separator();
+        }
         if let Some((hub_id, edge_port)) = edge {
             edge_transform_menu(ui, hub_id, edge_port, &mut cmd);
             ui.separator();
@@ -2505,6 +2687,7 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
         wire_from: None,
     };
     let alt = ui.input(|i| i.modifiers.alt);
+    let pointer = ui.ctx().pointer_interact_pos();
     for node in nodes {
         let id = Id::new((
             "pb_hub_node",
@@ -2512,31 +2695,34 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
             node.port_id.unwrap_or(0),
             node.role as u8,
         ));
-        let opens = open_target(model, node).is_some();
+        // Hub / Input / Calc / Agg can start wires (PB-73).
         let can_feed = matches!(
             node.role,
-            Role::Source | Role::Aggregator | Role::Calculation
+            Role::Hub | Role::Source | Role::Aggregator | Role::Calculation
         );
         let tip = match node.role {
             Role::Source | Role::Output => {
-                "Drag to move. Alt-drag Input/Calc/Agg → Output/Calc/Agg to wire. Grab wire ends to reattach. Click for details."
+                "Drag to move. Alt-drag or drag a port edge to wire. Grab wire ends to reattach. Click for details."
             }
             Role::Aggregator | Role::Calculation => {
-                "Drag to move. Alt-drag onto Output/Calc/Agg to wire. Drop wires here on the input side. Click for details."
+                "Drag to move. Alt-drag or drag a port edge onto Output/Calc/Agg. Click for details."
             }
-            _ if opens => {
-                "Drag to move. Click for details. Double-click opens the protocol panel. Right-click to add source/output."
+            Role::Hub => {
+                "Drag to move. Alt-drag or drag a port edge → Calc/Agg/Output to wire. Click for details."
             }
-            _ => "Drag to move. Click for details. Right-click to add source/output.",
         };
         let resp = ui
             .interact(node.rect, id, Sense::click_and_drag())
             .on_hover_text(tip);
         let key = (node.hub_id, node.port_id);
+        // Port-edge drag starts a wire without Alt (PB-73).
+        let port_drag = can_feed
+            && pointer.is_some_and(|pos| near_port_edge(node.rect, pos));
+        let start_wire = can_feed && (alt || port_drag);
         if !panning && (resp.hovered() || resp.dragged()) {
             gesture.hover = Some(key);
             let cursor = if resp.dragged() {
-                if alt && can_feed {
+                if start_wire {
                     egui::CursorIcon::Crosshair
                 } else {
                     egui::CursorIcon::Grabbing
@@ -2546,11 +2732,11 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
             };
             ui.ctx().set_cursor_icon(cursor);
         }
-        if !panning && resp.drag_started() && !(alt && can_feed) {
+        if !panning && resp.drag_started() && !start_wire {
             gesture.drag_started = true;
         }
         if !panning && resp.dragged() {
-            if alt && can_feed {
+            if start_wire {
                 gesture.wire_from = Some(key);
             } else {
                 gesture.drag = Some((node.hub_id, node.port_id, resp.drag_delta()));
@@ -4276,6 +4462,34 @@ mod tests {
         assert!(nodes.iter().any(|n| n.port_id == Some(calc)));
         assert!(nodes.iter().any(|n| n.port_id == Some(out_b)));
         assert!(nodes.iter().all(|n| n.port_id != Some(out_a)));
+    }
+
+    #[test]
+    fn hub_body_can_feed_calc() {
+        let mut model = HubModel::sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let calc = model.add_step(hub, false, src).expect("calc");
+        assert!(model.is_feeder(hub, hub), "hub body is a feeder");
+        assert!(model.connect_feed(hub, hub, hub, calc));
+        assert_eq!(model.feeds.len(), 1);
+        assert_eq!(model.feeds[0].from_node, hub);
+        assert_eq!(model.feeds[0].to_node, calc);
+    }
+
+    #[test]
+    fn delete_selected_feed_keeps_nodes() {
+        let mut model = HubModel::sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let out = model.hubs[1].outputs[0].id;
+        let calc = model.add_step(hub, false, src).expect("calc");
+        assert!(model.connect_feed(hub, calc, hub, out));
+        model.select_feed(Some(0));
+        assert!(model.delete_selected_feed());
+        assert!(model.feeds.is_empty());
+        assert!(model.hub(hub).unwrap().calculations.iter().any(|s| s.id == calc));
+        assert!(model.hub(hub).unwrap().outputs.iter().any(|p| p.id == out));
     }
 
     #[test]
