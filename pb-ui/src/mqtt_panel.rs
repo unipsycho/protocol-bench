@@ -617,10 +617,14 @@ fn clients_bar(
     p: &ThemePalette,
 ) {
     ui.horizontal_wrapped(|ui| {
+        // Explicit CHIP gaps so chips never sit flush (PB-88).
         ui.spacing_mut().item_spacing = Vec2::new(space::CHIP, space::CHIP);
         let mut select = None;
         let mut remove = None;
         for (i, client) in state.clients.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(space::CHIP);
+            }
             let selected = state.selected == Some(i);
             let label = if client.label.is_empty() {
                 client.id.as_str()
@@ -656,7 +660,7 @@ fn clients_bar(
             state.ensure_clients();
             apply_mqtt_session(engine, state, hubs);
         }
-        ui.add_space(8.0);
+        ui.add_space(space::CHIP);
         if secondary_btn(ui, "+ Add", p).clicked() {
             let id = state.unique_id("broker");
             let mut c = MqttClient::default_local();

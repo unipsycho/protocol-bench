@@ -613,10 +613,14 @@ fn clients_bar(
     p: &ThemePalette,
 ) {
     ui.horizontal_wrapped(|ui| {
+        // Explicit CHIP gaps — item_spacing alone was collapsing between chips (PB-88).
         ui.spacing_mut().item_spacing = Vec2::new(space::CHIP, space::CHIP);
         let mut select = None;
         let mut remove = None;
         for (i, client) in state.clients.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(space::CHIP);
+            }
             let selected = state.selected == Some(i);
             let label = if client.label.is_empty() {
                 client.id.as_str()
@@ -626,8 +630,11 @@ fn clients_bar(
             if text_btn(ui, label, selected, p).clicked() {
                 select = Some(i);
             }
-            if state.clients.len() > 1 && text_btn(ui, "×", false, p).clicked() {
-                remove = Some(i);
+            if state.clients.len() > 1 {
+                ui.add_space(space::CHIP * 0.5);
+                if text_btn(ui, "×", false, p).clicked() {
+                    remove = Some(i);
+                }
             }
         }
         if let Some(i) = select {
@@ -649,6 +656,7 @@ fn clients_bar(
             };
             apply_opcua_session(engine, state, hubs);
         }
+        ui.add_space(space::CHIP);
         if secondary_btn(ui, "+ Add", p).clicked() {
             let id = state.unique_id("ua");
             let mut c = OpcUaClient::default_plant();
