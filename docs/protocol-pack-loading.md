@@ -1,6 +1,6 @@
 # Protocol Bench — loading protocol packs into a free core
 
-Date: 2026-11-13. Status: **settled — Option A (plugin ABI)**. Complements [free-vs-paid-isolation.md](free-vs-paid-isolation.md) and PRD Settled #1 / #9 / #12 / #13.
+Date: 2026-11-13. Status: **settled — Option A (plugin ABI)**; **MQTT client pack landed first**. Complements [free-vs-paid-isolation.md](free-vs-paid-isolation.md) and PRD Settled #1 / #9 / #12 / #13.
 
 ## Verdict
 
@@ -8,9 +8,140 @@ Date: 2026-11-13. Status: **settled — Option A (plugin ABI)**. Complements [fr
 
 Entitlements are license-driven: **no fixed free protocol list** — the license defines which protocols/packs the customer gets. Offline grace ~**7 days** (phone-home to the license server; not a strict check on every operation).
 
+## MQTT client pack (first implementation)
+
+**Client-first + optional embed.** `pb-mqtt` is a `cdylib` (+ `rlib` for unit tests) that speaks MQTT via **rumqttc 0.24** (`websocket` + `use-rustls`) for source/output clients, and can start an optional **rumqttd 0.20** LAN listener from `mqtt.embedded` (Start/Stop in the MQTT panel).
+
+| Piece | Role |
+| --- | --- |
+| `pb-abi` | C ABI: `pb_pack_abi_version`, `pb_pack_register`, opaque handles, host callbacks (point upsert + log); host refuses load on ABI skew |
+| `pb-points` | Host-owned typed point store; packs upsert only through ABI callbacks |
+| `pb-engine` | `libloading` modules-dir loader, verify stub (signature later), wrap pack as `ProtocolEngine`; commands: configure / connect / disconnect / subscribe / publish / write_point |
+| `pb-mqtt` | Connect / disconnect / reconnect; last error + quality; subscribe → sequential short point ids (`mqtt_1`, `mqtt_2`, …; never reused) with source metadata `mqtt/<client_name>/<topic>` (JSON fields `…::path`); point write / publish → broker; TLS / WSS; password in JSON config (no keyring) |
+| `pb-service` | Headless binary: load `modules/`, run host |
+| UI MQTT panel | Live snapshot (connected, topics, last error) + fields to connect one client |
+
+### Load the pack
+
+```bash
+# From the repo root:
+cargo build -p pb-mqtt
+mkdir -p modules
+cp target/debug/libpb_mqtt.so modules/   # Windows: pb_mqtt.dll → modules/
+
+# Optional smoke (requires Mosquitto or any broker on 1883):
+./scripts/mqtt-smoke.sh
+
+# UI (loads ./modules or $PB_MODULES):
+PB_MODULES="$PWD/modules" DISPLAY=:0 cargo run -p pb-ui
+
+# Headless service:
+PB_MODULES="$PWD/modules" cargo run -p pb-service
+```
+
+If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use the MQTT panel for connections and hub **Input** / **Output** nodes for point binds (or the smoke script).
+
+### MQTT runtime model
+
+1. **MQTT panel — connections only**  
+   Broker, client id (optional Unique / random on connect), credentials, transport, Apply/Connect, Disconnect. Optional **wide subscribe** filters (`pb/#`, `sensor/+/temp`, `#`, …) for traffic / bring-up. Wildcards (`+`, `#`) are supported end-to-end in pack subscribe + sync.
+
+2. **Hub Input / Output nodes — point binds**  
+   - **Input:** pick a connection (many Inputs may share one broker) + topic/field → creates points. Point ids are always auto sequential `mqtt_N` (never reused in a project; no manual picker).  
+   - **Output:** pick connection + publish topic + points.  
+   Overlap of the same topic/field across Inputs is OK.
+
+3. **Topic tree**  
+   TopicBench-style hierarchy from subscribed traffic. Shown in the MQTT panel (preview) and the hub Input inspector (click leaf → bind). Fed from pack `clients[].traffic` in `topics_json`, **merged with live point sources** (`mqtt/<client>/<topic>`) so the tree matches the Points panel even if the traffic snapshot is empty or mid-truncate. Host `read_cstr` grows the buffer (was 512) so `#` floods do not clear the tree.
+
+4. **Points**  
+   Only hub Input–defined paths become host points. Source metadata: `mqtt/<client>/<topic>[::path]`. Persist under `points` + `next_point_seq`.
+
+### Project JSON (MQTT connections + hub binds)
+
+Editable wire config (not dock layout). Default path: `…/ProtocolBench/project.json` (via `directories` — e.g. `~/.config/protocolbench/project.json`). File → Open / Save as project uses a path dialog (non-blocking). MQTT panel and hub Input/Output bind changes autosave here.
+
+- **`mqtt.clients[]`** — connections + wide subscribe only (no Inputs/Outputs editors on the panel).  
+- **`mqtt.embedded`** — single hub broker (`id`/`name`/bind/port/`anonymous` + username/password). Listed in Output/Input connection pickers; MQTT panel Start/Stop runs rumqttd. Absent on older files → defaults (`id=hub`, `name=Hub broker`, anonymous on, `0.0.0.0:1883`, disabled).  
+- **`hubs`** — diagram + per-port `mqtt_connection` / `mqtt_inputs` / `mqtt_outputs` (v4+). Older files without `hubs` keep the diagram from `ui.toml` until the next save.  
+- **`points` / `next_point_seq`** — short id bindings.
+
+```json
+{
+  "version": 5,
+  "points": [
+    { "id": "mqtt_1", "source": "mqtt/local/pb/in" },
+    { "id": "mqtt_2", "source": "mqtt/local/pb/in::temp" }
+  ],
+  "next_point_seq": 3,
+  "mqtt": {
+    "selected_id": "local",
+    "embedded": {
+      "id": "hub",
+      "name": "Hub broker",
+      "enabled": false,
+      "bind": "0.0.0.0",
+      "port": 1883,
+      "anonymous": true,
+      "username": "",
+      "password": ""
+    },
+    "clients": [
+      {
+        "id": "local",
+        "label": "Local broker",
+        "host": "127.0.0.1",
+        "port": 1883,
+        "client_id": "pb-local",
+        "unique_client_id": false,
+        "username": "",
+        "password": "",
+        "transport": "tcp",
+        "subscriptions": ["pb/#"],
+        "auto_connect": true
+      }
+    ]
+  },
+  "hubs": {
+    "hubs": [
+      {
+        "id": 6,
+        "name": "Edge",
+        "protocol": "Mqtt",
+        "sources": [
+          {
+            "id": 7,
+            "protocol": "Mqtt",
+            "label": "Local broker",
+            "mqtt_connection": "local",
+            "mqtt_inputs": [
+              { "topic": "pb/in", "path": "", "point": "" },
+              { "topic": "pb/in", "path": "temp", "point": "" }
+            ]
+          }
+        ],
+        "outputs": [
+          {
+            "id": 8,
+            "protocol": "Mqtt",
+            "label": "Upstream",
+            "mqtt_connection": "local",
+            "mqtt_outputs": [
+              { "point": "mqtt_1", "topic": "out/x", "qos": 0, "retain": false }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Legacy client-level `parse_rules` / `outputs` on MQTT clients migrate onto hub Input/Output nodes on load. `ui.toml` remains layout/theme (and a hub fallback until project v4 hubs are saved). Password is stored in the project JSON for now (no keyring).
+
 ## Option A — in-process `cdylib` + fixed C ABI — **settled**
 
-Pack ships as `pb_modbus.so` / `pb_modbus.dll` (etc.). Core uses `libloading`, calls a versioned entry (`pb_pack_abi_version`, `pb_pack_register`), and gets opaque handles that the host wraps as `pb-engine` trait objects.
+Pack ships as `libpb_mqtt.so` / `pb_mqtt.dll` (and later `pb_modbus.so`, etc.). Core uses `libloading`, calls a versioned entry (`pb_pack_abi_version`, `pb_pack_register`), and gets opaque handles that the host wraps as `pb-engine` trait objects.
 
 **Pros**
 
@@ -84,7 +215,7 @@ Hub canvas and points store never live in the pack. Packs speak into the service
 4. **Defer Option B** (pack sidecars) unless pack crashes or hostile third-party packs force process isolation.
 5. **Do not** implement Option C as the paid-IP path.
 
-No packaging or license-server code in this pass — design only. Windows MSI via WiX / `cargo-wix` is settled (PRD Settled #13). Remaining open: auto-updater poll / UX, Linux installer (later / TBD), and further license-server product details. Offline grace (~7 days) is settled.
+MQTT client pack + ABI/loader/service scaffold are implemented in-tree. License-server download, pack signing enforcement, and MSI remain follow-on. Windows MSI via WiX / `cargo-wix` is settled (PRD Settled #13). Remaining open: auto-updater poll / UX, Linux installer (later / TBD), embedded MQTT broker for hubs, and further license-server product details. Offline grace (~7 days) is settled.
 
 ## Open questions
 

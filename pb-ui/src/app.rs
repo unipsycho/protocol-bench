@@ -1,19 +1,26 @@
 //! Protocol Bench shell: menu bar, icon rail, docked panes, themes.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, Id, Layout, Pos2, Rect, Rounding, Sense, Stroke, Vec2,
 };
-use pb_engine::EngineHandle;
+use pb_engine::{EngineHandle, HostSnapshot};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use crate::art::{self, ChromeIcon};
 use crate::brand_logo::AaLogoCache;
 use crate::dnd::{self, DropCommit, PaneHit};
 use crate::dock::DockPane;
 use crate::layout::{LayoutNode, SplitDir, TabGroup};
+use crate::mqtt_panel::{self, MqttPanelState};
+use crate::opcua_panel::{self, OpcUaPanelState};
+use crate::panels::PointsPanelState;
 use crate::panels;
 use crate::persist::{self, UiState};
+use crate::project::{self, MqttProject, ProjectFile, ProjectSettings};
 use crate::theme::{
     self, divider_bar, font_semi, font_ui, tint, AppTheme, ThemePalette, BAR_H, HEADER_H, MIN_PANE,
     RADIUS, RAIL_W, SEP, STATUS_H,
@@ -39,6 +46,30 @@ pub struct ProtocolBenchApp {
     aa_logo: AaLogoCache,
     dirty: bool,
     last_save: Instant,
+    mqtt: MqttPanelState,
+    opcua: OpcUaPanelState,
+    points: PointsPanelState,
+    /// Project-level options (Project panel / project.json).
+    project_settings: ProjectSettings,
+    /// Last settings snapshot written to the project file.
+    settings_saved: ProjectSettings,
+    /// Current JSON project path (MQTT + hubs + points).
+    project_path: PathBuf,
+    /// Last MQTT snapshot written to the project file.
+    mqtt_saved: MqttProject,
+    /// Last hubs snapshot written to the project file.
+    hubs_saved: crate::hubs::HubModel,
+    last_project_save: Instant,
+    project_dialog: Option<ProjectDialog>,
+    /// Live host snapshot for Calc/Agg/points — refreshed on poll, not mouse FPS (PB-64).
+    live_host: HostSnapshot,
+    live_points_fp: u64,
+    last_live_poll: Instant,
+}
+
+enum ProjectDialog {
+    Open { path: String },
+    SaveAs { path: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,8 +105,63 @@ impl ProtocolBenchApp {
         let ui_state = persist::load();
         let theme = persist::theme_from_state(&ui_state);
         theme::apply_theme(&cc.egui_ctx, theme);
+        let project_path = project::default_project_path().unwrap_or_else(|| {
+            PathBuf::from("protocol-bench-project.json")
+        });
+        let mut mqtt = MqttPanelState::default();
+        let mut opcua = OpcUaPanelState::default();
+        let mut mqtt_saved = MqttProject::default();
+        let mut project_settings = ProjectSettings::default();
+        let mut status = "Ready".into();
+        let engine = EngineHandle::spawn();
+        let mut ui_state = ui_state;
+        if project_path.is_file() {
+            match project::load(&project_path) {
+                Ok(file) => {
+                    file.mqtt.apply_to_panel(&mut mqtt);
+                    file.opcua.apply_to_panel(&mut opcua);
+                    project_settings = file.settings.clone();
+                    if let Some(hubs) = file.hubs {
+                        ui_state.hubs = hubs;
+                        // Rebuild ephemeral canvas selection from persisted selected/port.
+                        ui_state.hubs.sanitize();
+                    }
+                    if let Ok(mut store) = engine.points().lock() {
+                        project::import_bindings_to_store(
+                            &mut store,
+                            &file.points,
+                            file.next_point_seq,
+                        );
+                        project::migrate_panel_point_refs(&mut mqtt, &mut store);
+                    }
+                    project::migrate_client_binds_to_hubs(&mut mqtt, &mut ui_state.hubs);
+                    mqtt_saved = MqttProject::from_panel(&mqtt);
+                    mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &ui_state.hubs);
+                    mqtt_panel::maybe_auto_start_embedded(
+                        &engine,
+                        &mut mqtt,
+                        &ui_state.hubs,
+                        project_settings.auto_run_embedded_broker,
+                    );
+                    opcua_panel::apply_opcua_session(&engine, &mut opcua, &ui_state.hubs);
+                    opcua_panel::maybe_auto_start_embedded(
+                        &engine,
+                        &mut opcua,
+                        project_settings.auto_run_embedded_broker,
+                    );
+                    status = format!("Loaded project {}", project_path.display());
+                }
+                Err(err) => {
+                    status = format!("Project load skipped: {err}");
+                }
+            }
+        }
+        let hubs_saved = ui_state.hubs.clone();
+        let settings_saved = project_settings.clone();
+        let live_host = engine.snapshot();
+        let live_points_fp = Self::points_fingerprint(&live_host);
         Self {
-            engine: EngineHandle::spawn(),
+            engine,
             ui_state,
             theme,
             theme_applied: Some(theme),
@@ -84,12 +170,46 @@ impl ProtocolBenchApp {
             about_open: false,
             settings_open: false,
             menu: None,
-            status: "Ready".into(),
+            status,
             service_connected: true,
             aa_logo: AaLogoCache::default(),
             dirty: false,
             last_save: Instant::now(),
+            mqtt,
+            opcua,
+            points: PointsPanelState::default(),
+            project_settings,
+            settings_saved,
+            project_path,
+            mqtt_saved,
+            hubs_saved,
+            last_project_save: Instant::now(),
+            project_dialog: None,
+            live_host,
+            live_points_fp,
+            last_live_poll: Instant::now(),
         }
+    }
+
+    /// Fingerprint of live point values/stamps (drives preview + table refresh).
+    fn points_fingerprint(host: &HostSnapshot) -> u64 {
+        let mut h = DefaultHasher::new();
+        host.point_count.hash(&mut h);
+        for p in &host.points {
+            p.name.hash(&mut h);
+            p.value.hash(&mut h);
+            p.quality.hash(&mut h);
+            p.updated_ms.hash(&mut h);
+        }
+        // MQTT traffic / connection (not host ticks — those advance every poll).
+        for slot in &host.slots {
+            slot.connected.hash(&mut h);
+            slot.detail_json.hash(&mut h);
+            for topic in &slot.topics {
+                topic.hash(&mut h);
+            }
+        }
+        h.finish()
     }
 
     fn mark_dirty(&mut self) {
@@ -107,6 +227,181 @@ impl ProtocolBenchApp {
             Err(err) => self.status = format!("Could not save layout: {err}"),
         }
         self.last_save = Instant::now();
+    }
+
+    fn autosave_project(&mut self, _host: &pb_engine::HostSnapshot) {
+        let current = MqttProject::from_panel(&self.mqtt);
+        let mqtt_dirty = current != self.mqtt_saved;
+        let hubs_dirty = self.ui_state.hubs != self.hubs_saved;
+        let settings_dirty = self.project_settings != self.settings_saved;
+        let min_age = if mqtt_dirty || hubs_dirty || settings_dirty {
+            Duration::from_millis(500)
+        } else {
+            // Flush new short-id bindings from live traffic.
+            Duration::from_secs(2)
+        };
+        if self.last_project_save.elapsed() < min_age {
+            return;
+        }
+        match self.save_project_now() {
+            Ok(()) => {}
+            Err(err) => self.status = format!("Could not save project: {err}"),
+        }
+    }
+
+    fn save_project_now(&mut self) -> Result<(), String> {
+        let mqtt = MqttProject::from_panel(&self.mqtt);
+        let (points, next_point_seq) = self
+            .engine
+            .points()
+            .lock()
+            .map(|store| {
+                (
+                    project::bindings_from_store(&store),
+                    store.next_seq(),
+                )
+            })
+            .unwrap_or_else(|_| (Vec::new(), 1));
+        let file = ProjectFile {
+            version: project::PROJECT_VERSION,
+            points,
+            next_point_seq,
+            mqtt: mqtt.clone(),
+            opcua: project::OpcUaProject::from_panel(&self.opcua),
+            hubs: Some(self.ui_state.hubs.clone()),
+            settings: self.project_settings.clone(),
+        };
+        project::save(&self.project_path, &file)?;
+        self.mqtt_saved = mqtt;
+        self.hubs_saved = self.ui_state.hubs.clone();
+        self.settings_saved = self.project_settings.clone();
+        self.last_project_save = Instant::now();
+        Ok(())
+    }
+
+    fn load_project_from_path(&mut self, path: PathBuf) -> Result<(), String> {
+        let file = project::load(&path)?;
+        file.mqtt.apply_to_panel(&mut self.mqtt);
+        file.opcua.apply_to_panel(&mut self.opcua);
+        self.project_settings = file.settings.clone();
+        if let Some(hubs) = file.hubs {
+            self.ui_state.hubs = hubs;
+            self.ui_state.hubs.sanitize();
+        }
+        if let Ok(mut store) = self.engine.points().lock() {
+            project::import_bindings_to_store(&mut store, &file.points, file.next_point_seq);
+            project::migrate_panel_point_refs(&mut self.mqtt, &mut store);
+        }
+        project::migrate_client_binds_to_hubs(&mut self.mqtt, &mut self.ui_state.hubs);
+        self.mqtt_saved = MqttProject::from_panel(&self.mqtt);
+        self.hubs_saved = self.ui_state.hubs.clone();
+        self.settings_saved = self.project_settings.clone();
+        self.project_path = path;
+        opcua_panel::apply_opcua_session(&self.engine, &mut self.opcua, &self.ui_state.hubs);
+        opcua_panel::maybe_auto_start_embedded(
+            &self.engine,
+            &mut self.opcua,
+            self.project_settings.auto_run_embedded_broker,
+        );
+        mqtt_panel::apply_mqtt_session(&self.engine, &mut self.mqtt, &self.ui_state.hubs);
+        mqtt_panel::maybe_auto_start_embedded(
+            &self.engine,
+            &mut self.mqtt,
+            &self.ui_state.hubs,
+            self.project_settings.auto_run_embedded_broker,
+        );
+        self.status = format!("Opened {}", self.project_path.display());
+        Ok(())
+    }
+
+    fn project_dialog_window(&mut self, ctx: &egui::Context, p: &ThemePalette) {
+        let Some(dialog) = self.project_dialog.as_ref() else {
+            return;
+        };
+        let title = match dialog {
+            ProjectDialog::Open { .. } => "Open project",
+            ProjectDialog::SaveAs { .. } => "Save project as",
+        };
+        let is_open = matches!(dialog, ProjectDialog::Open { .. });
+        let mut path_buf = match dialog {
+            ProjectDialog::Open { path } | ProjectDialog::SaveAs { path } => path.clone(),
+        };
+        let mut open = true;
+        let mut commit = false;
+        let mut cancel = false;
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "JSON project (MQTT connections, hub Input/Output binds, points). Path entry avoids Hyprland file-dialog stalls.",
+                    )
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+                );
+                ui.add_space(8.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut path_buf)
+                        .desired_width(ui.available_width())
+                        .hint_text("/path/to/project.json"),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let primary = if is_open { "Open" } else { "Save" };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(primary)
+                                    .font(font_ui(12.5))
+                                    .color(Color32::from_rgb(0x12, 0x14, 0x18)),
+                            )
+                            .fill(p.accent),
+                        )
+                        .clicked()
+                    {
+                        commit = true;
+                    }
+                    ui.add_space(10.0);
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if let Some(dialog) = self.project_dialog.as_mut() {
+            match dialog {
+                ProjectDialog::Open { path } | ProjectDialog::SaveAs { path } => {
+                    *path = path_buf.clone();
+                }
+            }
+        }
+        if !open || cancel {
+            self.project_dialog = None;
+            return;
+        }
+        if commit {
+            self.project_dialog = None;
+            let path = PathBuf::from(path_buf.trim());
+            if path.as_os_str().is_empty() {
+                self.status = "Project path is empty".into();
+                return;
+            }
+            if is_open {
+                if let Err(err) = self.load_project_from_path(path) {
+                    self.status = format!("Open failed: {err}");
+                }
+            } else {
+                self.project_path = path;
+                match self.save_project_now() {
+                    Ok(()) => {
+                        self.status = format!("Saved {}", self.project_path.display());
+                    }
+                    Err(err) => self.status = format!("Save failed: {err}"),
+                }
+            }
+        }
     }
 
     fn reset_layout(&mut self) {
@@ -134,10 +429,14 @@ impl ProtocolBenchApp {
         match action {
             MenuAction::Close => {}
             MenuAction::OpenProject => {
-                self.status = "Open project — not wired yet".into();
+                self.project_dialog = Some(ProjectDialog::Open {
+                    path: self.project_path.display().to_string(),
+                });
             }
             MenuAction::SaveAsProject => {
-                self.status = "Save as project — not wired yet".into();
+                self.project_dialog = Some(ProjectDialog::SaveAs {
+                    path: self.project_path.display().to_string(),
+                });
             }
             MenuAction::ResetLayout => self.reset_layout(),
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -184,18 +483,37 @@ impl eframe::App for ProtocolBenchApp {
             theme::apply_theme(ctx, self.theme);
             self.theme_applied = Some(self.theme);
         }
-        let host = self.engine.snapshot();
+        // PB-64: poll engine on a data timer — mouse frames reuse live_host.
+        const LIVE_POLL: Duration = Duration::from_millis(150);
+        if self.last_live_poll.elapsed() >= LIVE_POLL {
+            self.last_live_poll = Instant::now();
+            self.engine
+                .set_calcs(crate::calc_panel::configs_from_hubs(&self.ui_state.hubs));
+            self.engine
+                .set_aggs(crate::agg_panel::configs_from_hubs(&self.ui_state.hubs));
+            let snap = self.engine.snapshot();
+            let fp = Self::points_fingerprint(&snap);
+            if fp != self.live_points_fp {
+                self.live_points_fp = fp;
+                self.live_host = snap;
+            } else {
+                // Keep point values frozen; still track pack liveness lightly.
+                self.live_host.alive = snap.alive;
+                self.live_host.ticks = snap.ticks;
+                self.live_host.uptime_ms = snap.uptime_ms;
+            }
+        }
         let p = self.theme.palette();
         theme::paint_root_bg(ctx, &p);
         self.pane_hits.clear();
+        let host_for_panes = self.live_host.clone();
 
         self.app_bar(ctx, &p);
         self.status_bar(ctx, &p);
         self.pane_rail(ctx, &p);
-        self.settings_drawer(ctx, &p, &host);
+        self.settings_drawer(ctx, &p, &host_for_panes);
         self.about_window(ctx, &p);
-
-        let host_for_panes = host;
+        self.project_dialog_window(ctx, &p);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -229,12 +547,15 @@ impl eframe::App for ProtocolBenchApp {
 
         self.handle_drop(ctx, &p);
         self.autosave();
-        ctx.request_repaint_after(Duration::from_secs(1));
+        self.autosave_project(&host_for_panes);
+        // Next data poll only — do not chase mouse FPS for live values (PB-64).
+        ctx.request_repaint_after(LIVE_POLL);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.ui_state.theme_id = self.theme.id().into();
         let _ = persist::save(&self.ui_state);
+        let _ = self.save_project_now();
         self.engine.shutdown();
     }
 }
@@ -1023,9 +1344,43 @@ impl ProtocolBenchApp {
                     .layout(Layout::top_down(egui::Align::Min)),
             );
             body_ui.set_clip_rect(body.expand(2.0).intersect(clip));
-            let hub_change = panels::paint(&mut body_ui, active, host, p, &mut self.ui_state.hubs);
+            let prev_auto = self.project_settings.auto_run_embedded_broker;
+            let hub_change = panels::paint(
+                &mut body_ui,
+                active,
+                host,
+                p,
+                &mut self.ui_state.hubs,
+                &self.engine,
+                &mut self.mqtt,
+                &mut self.opcua,
+                &mut self.points,
+                &mut self.project_settings,
+                &self.project_path,
+            );
             if hub_change.dirty {
                 self.mark_dirty();
+                // Hub Input/Output MQTT binds feed the pack session.
+                mqtt_panel::apply_mqtt_session(
+                    &self.engine,
+                    &mut self.mqtt,
+                    &self.ui_state.hubs,
+                );
+                opcua_panel::apply_opcua_session(
+                    &self.engine,
+                    &mut self.opcua,
+                    &self.ui_state.hubs,
+                );
+            }
+            // Honor auto-run when the Project checkbox is turned on.
+            if self.project_settings.auto_run_embedded_broker && !prev_auto {
+                mqtt_panel::maybe_auto_start_embedded(
+                    &self.engine,
+                    &mut self.mqtt,
+                    &self.ui_state.hubs,
+                    true,
+                );
+                opcua_panel::maybe_auto_start_embedded(&self.engine, &mut self.opcua, true);
             }
             if let Some(pane) = hub_change.open {
                 self.ui_state.reveal_pane(pane);

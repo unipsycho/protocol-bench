@@ -3,3 +3,8 @@
 
 # nested crate build output
 m17-rust-check/target/
+
+# built protocol packs (copy with scripts/mqtt-smoke.sh)
+modules/*.so
+modules/*.dll
+modules/*.dylib

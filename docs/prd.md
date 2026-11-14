@@ -4,7 +4,7 @@ Date: 2026-11-13. Status: living draft.
 
 Research: [competitive-landscape.md](competitive-landscape.md) (store). Free vs paid isolation: [free-vs-paid-isolation.md](free-vs-paid-isolation.md). Pack loading: [protocol-pack-loading.md](protocol-pack-loading.md). Protocol notes: [protocol-options.md](protocol-options.md).
 
-Checkout: `/home/mike/Documents/AAI-Projects/protocol bench` (workspace `pb-ui` + `pb-engine`, egui shell).
+Checkout: `/home/mike/Documents/AAI-Projects/protocol bench` (workspace: `pb-abi`, `pb-points`, `pb-engine`, `pb-mqtt`, `pb-service`, `pb-ui`).
 
 ## Product
 
@@ -45,22 +45,47 @@ Moving a value between a serial instrument, a Modbus device, a growing CSV, an M
 
 ## Engines
 
-Each protocol engine owns its work on a thread the UI does not block. `pb-engine` lives in the **service**; the UI takes a snapshot and submits commands (IPC details follow-on). The five slots that exist now (Streams, Modbus, MQTT, OPC UA, File follow) are idle — they do not open a serial port, a socket, or a file.
+Each protocol engine owns its work on a thread the UI does not block. `pb-engine` lives in the **service**; the UI takes a snapshot and submits commands (IPC details follow-on). Packs load via the C ABI (`pb-abi`) from a `modules/` directory. **MQTT client** is the first live pack (`pb-mqtt` / rumqttc): multi-client connect, wildcard subscribe, traffic topic tree, hub Input/Output point binds, publish. Other slots (Streams, Modbus, OPC UA, File follow) remain idle scaffolds until their packs land.
 
 ## Hubs
 
-A **hub** is the main protocol conversion / routing point. It is always **one protocol**, and only **server-capable** protocols can be hubs (Modbus server, MQTT broker / server-oriented, OPC UA server). Sources and outputs may use other protocols. Optional **aggregators** and **calculations** sit **on the edges** (the data path between nodes), not as free-floating peers of the hub. Flow: sources → optional transforms on edges → hub → optional transforms on edges → outputs (and multi-hub as before). A diagram shows what converts to what.
+A **hub** is the main protocol conversion / routing point. It is always **one protocol**, and only **server-capable** protocols can be hubs (Modbus server, MQTT broker / server-oriented, OPC UA server). **Input** (source) and **Output** nodes may use other protocols. Optional **aggregators** and **calculations** sit **on the edges** (the data path between nodes), not as free-floating peers of the hub. Flow: Inputs → optional transforms on edges → hub → optional transforms on edges → Outputs (and multi-hub as before). A diagram shows what converts to what.
 
 - More than one hub when there are multiple conversion points. Many projects use a single hub. There is no Split hub type.
 - Arrange the diagram: drag nodes, click a node or connection for details, open the matching protocol panel from a protocol node.
 - Add aggregator / Add calculation attaches to a **selected link/edge** (or a right-clicked connection), rendered on that line.
 - Sample hubs ship for framing (Plant Modbus + Edge MQTT, MQTT link between them) — configuration only, not a live bridge.
 
+### Calculations vs Aggregators
+
+| Kind | Role |
+| --- | --- |
+| **Calculation** | **Single-stream** edge transform: one source point → one output on that path (scale/offset, deadband, rolling average, rate of change, hysteresis, …). Never combines multiple points. |
+| **Aggregator** | **N≥2 member points** combined into one derived host point `agg_N`. Modes: sum, mean, min, max, count, median, first, last, any-good, majority. Optional window: none / last N samples / last T seconds. Member **quality is worst-wins**. |
+
+Calculations must not grow multi-input pickers — multi-point combine belongs only on Aggregator nodes. Aggregator config persists under each hub’s `aggregators[]` in `project.json`.
+
+### MQTT model (client pack)
+
+| Surface | Owns |
+| --- | --- |
+| **MQTT panel** | Connections only: broker host/port, client id (optional Unique), credentials, transport, Connect/Disconnect, optional **wide subscribe** (`+` / `#` wildcards OK) for traffic / bring-up |
+| **Hub Input node** | Point promotion: pick a shared connection + topic/field → auto sequential `mqtt_N` (no manual point-id picker). Click leaf in topic tree to bind |
+| **Hub Output node** | Publish: pick connection + topic + which points to publish |
+
+Rules:
+
+- Many **Input** nodes may **share one MQTT connection**; each owns its own topic/field → point binds. Overlap across nodes is OK (different graph uses).
+- Wide subscribe may be broad; **only hub Input–defined paths become points** (pack traffic still feeds the topic tree).
+- Shared **topic tree** (TopicBench-style): MQTT panel preview + Input inspector. Tree is fed from pack `traffic` snapshot, merged with live point sources so it stays aligned with the Points panel.
+- MQTT Input diagram nodes show bound **point count** on the right of the title. Input inspector has no Hide/Remove — delete via diagram later.
+- Persist in `project.json` v5: `mqtt.clients[]`, `mqtt.embedded` (hub broker listen; rumqttd Start/Stop in MQTT panel), `hubs` (binds), `points[]`, `next_point_seq`.
+
 ## What runs today, and what does not
 
-Today: the window, layout, themes, the hub diagram, and the engine thread boundary.
+Today: the window, layout, themes, the hub diagram (Input/Output MQTT binds), the engine thread boundary, host point store (`pb-points`), pack loader, headless `pb-service`, and the **MQTT client pack** (connection + hub-node binds → points / publish; TCP / TLS / WS / WSS).
 
-Not yet: opening a port, speaking a protocol, parsing a file, or writing a point. No file requester in this build. When one is added, it must not block the UI thread (blocking dialogs / vsync stalls on another Hyprland workspace trip “not responding”).
+Not yet: other protocol packs, Sparkplug, license signing enforcement, MSI, full UI↔service IPC / MCP. Embedded MQTT broker (rumqttd) Start/Stop is live in the MQTT panel. No file requester in this build. When one is added, it must not block the UI thread (blocking dialogs / vsync stalls on another Hyprland workspace trip “not responding”).
 
 ## Protocols
 
@@ -68,7 +93,7 @@ Already named in the shell:
 
 - Raw serial (Streams) — first build: **both** transparent byte pipe and delimited frames
 - Modbus — first build: **client and server**
-- MQTT — first build: **client** required; **embedded broker / in-process server** planned for hub scenarios (MQTT first; consider OPC UA for similar hub concepts)
+- MQTT — **client pack first** (live); **embedded broker / in-process server** deferred for hub scenarios (MQTT broker hub role not active yet; MQTT is source/output)
 - OPC UA — first build: **client and server**
 - File follow — first build parsers: **CSV and JSON lines**
 
@@ -149,7 +174,7 @@ Recorded 2026-11-13 from Mike’s answers (numbering matches the former Open dec
 12. **Language** — Protocol Bench service + UI remain Rust. Online license server can also be Rust; Cloudflare Workers + workers-rs is a viable host for a license API (see [Runtime](#runtime)).
 13. **Windows installer** — **MSI via WiX**, driven from the Rust repo with **`cargo-wix`** (not Inno Setup). Chosen for IT-friendly deploys (GPO / SCCM / silent install, standard Add/Remove Programs). Layout installs **service + UI + module dir**; upgrades must **preserve config, licenses, and packs**. Product **updates** stay on the Rust **license server** path (manifest + signed downloads) — the installer choice does not replace that. **Linux installer** is later / TBD and is not blocking.
 14. **MCP on the service** — the always-on **service** hosts an **MCP server** so an agent can manage setup (channels, points, mappings, hubs, and related product actions). Not in the UI process. High-level product intent only; no tool schema yet (see [MCP server on the service](#mcp-server-on-the-service)).
-15. **Hub graph model** — **Hub** = conversion / routing point (multiple hubs allowed for multiple conversion points). **Aggregator** and **Calculation** are edge transforms on the data path between nodes (sources → optional edge transforms → hub → optional edge transforms → outputs), not independent sibling hub-step nodes. UI adds them on a selected / right-clicked connection.
+15. **Hub graph model** — **Hub** = conversion / routing point (multiple hubs allowed for multiple conversion points). **Aggregator** and **Calculation** are edge transforms on the data path between nodes (sources → optional edge transforms → hub → optional edge transforms → outputs), not independent sibling hub-step nodes. UI adds them on a selected / right-clicked connection. **Calculation** = single-stream; **Aggregator** = N≥2 member combine → `agg_N` (see [Calculations vs Aggregators](#calculations-vs-aggregators)).
 16. **Hub protocol** — every hub is **one protocol**; **Split** hubs are removed. Only **server-capable** protocols may be hubs (Modbus server, MQTT broker/server-oriented, OPC UA server). Sources and outputs define other protocols on the diagram.
 
 ## Still open
