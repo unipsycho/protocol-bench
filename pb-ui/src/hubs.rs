@@ -980,6 +980,24 @@ impl HubModel {
         true
     }
 
+    /// Wire two nodes regardless of drag direction (PB-75).
+    /// Hub/Input ↔ Calc/Agg: creates feeder→sink, reversing if the drag was sink→feeder.
+    pub fn connect_wire_nodes(
+        &mut self,
+        a_hub: u64,
+        a_node: u64,
+        b_hub: u64,
+        b_node: u64,
+    ) -> bool {
+        if self.is_feeder(a_hub, a_node) && self.is_sink(b_hub, b_node) {
+            return self.connect_feed(a_hub, a_node, b_hub, b_node);
+        }
+        if self.is_feeder(b_hub, b_node) && self.is_sink(a_hub, a_node) {
+            return self.connect_feed(b_hub, b_node, a_hub, a_node);
+        }
+        false
+    }
+
     /// Reattach one end of an existing feed. Returns true when the feed changed.
     pub fn rewire_feed(
         &mut self,
@@ -1812,27 +1830,8 @@ pub fn paint(
         ui.add_space(8.0);
         legend(ui, p);
         ui.add_space(8.0);
-        // PB-71: tips live in a hover tooltip, not a permanent banner.
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new("Navigation")
-                    .font(font_ui(12.0))
-                    .color(p.muted),
-            )
-            .sense(Sense::hover()),
-        )
-        .on_hover_ui(|ui| {
-            ui.set_max_width(320.0);
-            for line in [
-                "Alt-drag or drag a port edge: wire Hub/Input/Calc/Agg → Output/Calc/Agg",
-                "Grab a wire end to reattach; click a wire then Delete to remove it",
-                "Drag empty canvas to box-select",
-                "Right-click a connection to add aggregator/calculation",
-                "Wheel zooms · Middle or Space-drag pans",
-            ] {
-                ui.label(egui::RichText::new(line).font(font_ui(12.0)).color(p.text));
-            }
-        });
+        // PB-77: chip control so hover help is obvious (not inert text).
+        navigation_help_chip(ui, p);
     });
     ui.add_space(8.0);
     let wide = ui.available_width() > 760.0;
@@ -2213,12 +2212,24 @@ fn diagram_view(
         let released = child.ctx().input(|i| i.pointer.any_released());
         if released {
             child.ctx().data_mut(|d| d.remove_temp::<RewireState>(rewire_id));
-            if let Some(pos) = pointer {
-                if let Some(target) = screen.iter().find(|n| n.rect.contains(pos)) {
-                    // Hub body: port_id None → use hub id as feeder id (PB-73).
+            if let Some(pos) = pointer.or_else(|| {
+                child
+                    .ctx()
+                    .pointer_hover_pos()
+                    .or_else(|| child.ctx().input(|i| i.pointer.latest_pos()))
+            }) {
+                if let Some(target) = hit_wire_target(&screen, pos) {
                     let node_id = target.port_id.unwrap_or(target.hub_id);
                     let from_end = matches!(state.end, FeedEnd::From);
-                    if model.rewire_feed(state.feed_idx, from_end, target.hub_id, node_id) {
+                    let ok = if from_end {
+                        model.is_feeder(target.hub_id, node_id)
+                            && model.rewire_feed(state.feed_idx, true, target.hub_id, node_id)
+                    } else if model.is_sink(target.hub_id, node_id) {
+                        model.rewire_feed(state.feed_idx, false, target.hub_id, node_id)
+                    } else {
+                        false
+                    };
+                    if ok {
                         let _ = model.sync_output_feed_binds(&host.points);
                         change.dirty = true;
                     }
@@ -2307,12 +2318,12 @@ fn diagram_view(
                 .ctx()
                 .data_mut(|d| d.remove_temp::<(u64, Option<u64>)>(wire_id));
             if let Some(pos) = drop_at {
-                if let Some(to) = hit_wire_sink(&screen, pos) {
-                    // Hub body: port_id None → feeder id is the hub id (PB-73/75).
+                if let Some(to) = hit_wire_target(&screen, pos) {
+                    // Hub/Input body: port_id None → node id is the hub id (PB-75).
                     let from_id = from.1.unwrap_or(from.0);
                     let to_id = to.port_id.unwrap_or(to.hub_id);
-                    if sink_role(to.role)
-                        && model.connect_feed(from.0, from_id, to.hub_id, to_id)
+                    if !(from.0 == to.hub_id && from_id == to_id)
+                        && model.connect_wire_nodes(from.0, from_id, to.hub_id, to_id)
                     {
                         let _ = model.sync_output_feed_binds(&host.points);
                         change.dirty = true;
@@ -2466,15 +2477,23 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     (a + ab * t).distance(p)
 }
 
+/// Resolve a placed node. Hub body is stored with `port_id: None` while feeds use hub id.
+fn find_placed<'a>(nodes: &'a [Placed], hub_id: u64, node_id: u64) -> Option<&'a Placed> {
+    nodes.iter().find(|n| {
+        if n.hub_id != hub_id {
+            return false;
+        }
+        match n.port_id {
+            Some(id) => id == node_id,
+            // Hub card: feeds store from_node/to_node = hub.id
+            None => n.role == Role::Hub && node_id == hub_id,
+        }
+    })
+}
+
 fn feed_ends(nodes: &[Placed], feed: &HubFeed) -> Option<(Pos2, Pos2, Rect, Rect)> {
-    let from = nodes
-        .iter()
-        .find(|n| n.hub_id == feed.from_hub && n.port_id == Some(feed.from_node))?;
-    let to = nodes.iter().find(|n| {
-        n.hub_id == feed.to_hub
-            && n.port_id == Some(feed.to_node)
-            && sink_role(n.role)
-    })?;
+    let from = find_placed(nodes, feed.from_hub, feed.from_node)?;
+    let to = find_placed(nodes, feed.to_hub, feed.to_node)?;
     let (a, b, _) = facing(from.rect, to.rect);
     Some((a, b, from.rect, to.rect))
 }
@@ -2504,28 +2523,28 @@ fn hit_feed_endpoint(
     best.map(|(_, idx, end)| (idx, end))
 }
 
-fn sink_role(role: Role) -> bool {
+fn wire_target_role(role: Role) -> bool {
     matches!(
         role,
-        Role::Output | Role::Calculation | Role::Aggregator
+        Role::Hub | Role::Source | Role::Output | Role::Calculation | Role::Aggregator
     )
 }
 
-/// Drop target for a new/rewired feed — contains or nearest sink within slop (PB-75).
-fn hit_wire_sink(nodes: &[Placed], pos: Pos2) -> Option<&Placed> {
+/// Drop target for a new wire — Hub/Input/Output/Calc/Agg (bidirectional connect) (PB-75).
+fn hit_wire_target(nodes: &[Placed], pos: Pos2) -> Option<&Placed> {
     if let Some(hit) = nodes
         .iter()
-        .find(|n| sink_role(n.role) && n.rect.expand(10.0).contains(pos))
+        .find(|n| wire_target_role(n.role) && n.rect.expand(12.0).contains(pos))
     {
         return Some(hit);
     }
     let mut best: Option<(f32, &Placed)> = None;
     for n in nodes {
-        if !sink_role(n.role) {
+        if !wire_target_role(n.role) {
             continue;
         }
         let d = n.rect.distance_to_pos(pos);
-        if d <= 28.0 && best.is_none_or(|(bd, _)| d < bd) {
+        if d <= 32.0 && best.is_none_or(|(bd, _)| d < bd) {
             best = Some((d, n));
         }
     }
@@ -2542,6 +2561,9 @@ fn feeder_label(model: &HubModel, hub_id: u64, node_id: u64) -> String {
     let Some(hub) = model.hub(hub_id) else {
         return format!("node {node_id}");
     };
+    if node_id == hub_id {
+        return format!("HUB · {}", hub.name);
+    }
     if let Some(p) = hub.sources.iter().find(|p| p.id == node_id) {
         return format!("IN · {}", p.label);
     }
@@ -4442,6 +4464,46 @@ fn text_button(ui: &mut Ui, label: &str, on: bool, p: &ThemePalette) -> egui::Re
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Toolbar chip: looks clickable/hoverable; tip lists canvas gestures (PB-77).
+fn navigation_help_chip(ui: &mut Ui, p: &ThemePalette) {
+    let label = "Navigation  (?)";
+    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(label.to_owned(), font_ui(12.0), p.text));
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + vec2(14.0, 8.0), Sense::hover());
+    let fill = if resp.hovered() {
+        tint(p.accent, 22)
+    } else {
+        p.control
+    };
+    ui.painter().rect_filled(rect, Rounding::same(5.0), fill);
+    ui.painter()
+        .rect_stroke(rect, Rounding::same(5.0), Stroke::new(1.0, p.line));
+    ui.painter().galley(
+        rect.center() - galley.size() * 0.5,
+        galley,
+        if resp.hovered() { p.accent } else { p.text },
+    );
+    resp.on_hover_cursor(egui::CursorIcon::Help)
+        .on_hover_ui(|ui| {
+            ui.set_max_width(340.0);
+            ui.label(
+                egui::RichText::new("Canvas navigation")
+                    .font(font_semi(13.0))
+                    .color(p.accent),
+            );
+            ui.add_space(4.0);
+            for line in [
+                "Wire: Alt-drag or drag a port edge — Hub/Input ↔ Calc/Agg/Output (either direction)",
+                "Rewire: grab a cyan wire end and drop on another node",
+                "Box-select: drag on empty canvas",
+                "Delete / Backspace: remove selected nodes or the selected wire",
+                "Right-click: node/wire menus to add, modify, or Delete",
+                "Wheel zooms · Middle-drag or Space-drag pans",
+            ] {
+                ui.label(egui::RichText::new(format!("• {line}")).font(font_ui(12.0)).color(p.text));
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4520,6 +4582,31 @@ mod tests {
         assert_eq!(model.feeds.len(), 1);
         assert_eq!(model.feeds[0].from_node, hub);
         assert_eq!(model.feeds[0].to_node, calc);
+        // Critical: Hub is laid out with port_id None — feed must still resolve (PB-75).
+        let nodes = layout_nodes(&model.hubs);
+        assert!(
+            find_placed(&nodes, hub, hub).is_some(),
+            "hub body must be findable for feed paint"
+        );
+        assert!(
+            feed_ends(&nodes, &model.feeds[0]).is_some(),
+            "Hub→Calc feed must paint (feed_ends)"
+        );
+    }
+
+    #[test]
+    fn hub_calc_wire_works_either_drag_direction() {
+        let mut model = HubModel::sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let calc = model.add_step(hub, false, src).expect("calc");
+        // Drag Calc → Hub must reverse to Hub → Calc.
+        assert!(model.connect_wire_nodes(hub, calc, hub, hub));
+        assert_eq!(model.feeds.len(), 1);
+        assert_eq!(model.feeds[0].from_node, hub);
+        assert_eq!(model.feeds[0].to_node, calc);
+        let nodes = layout_nodes(&model.hubs);
+        assert!(feed_ends(&nodes, &model.feeds[0]).is_some());
     }
 
     #[test]
@@ -4529,13 +4616,18 @@ mod tests {
         let src = model.hubs[1].sources[0].id;
         let calc_a = model.add_step(hub, false, src).expect("calc a");
         let calc_b = model.add_step(hub, false, src).expect("calc b");
-        assert!(model.connect_feed(hub, hub, hub, calc_a));
-        assert!(model.connect_feed(hub, hub, hub, calc_b));
+        assert!(model.connect_wire_nodes(hub, hub, hub, calc_a));
+        assert!(model.connect_wire_nodes(hub, hub, hub, calc_b));
         assert_eq!(model.feeds.len(), 2);
-        assert!(model.feeds.iter().any(|f| f.to_node == calc_a));
-        assert!(model.feeds.iter().any(|f| f.to_node == calc_b));
+        let nodes = layout_nodes(&model.hubs);
+        for feed in &model.feeds {
+            assert!(
+                feed_ends(&nodes, feed).is_some(),
+                "each Hub→Calc feed must be drawable"
+            );
+        }
         // Input → second Calc uses the same connect path.
-        assert!(model.connect_feed(hub, src, hub, calc_b));
+        assert!(model.connect_wire_nodes(hub, src, hub, calc_b));
         assert!(model
             .feeds
             .iter()
