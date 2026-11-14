@@ -264,52 +264,86 @@ pub fn paint_node_props(
     }
     if open {
         let mut pick = None;
+        let mut close_clicked = false;
         let mut still_open = open;
+        // Escape always dismisses — even when the title-bar X is off-screen.
+        if ui
+            .ctx()
+            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            still_open = false;
+        }
         // Mark open so the hub canvas does not steal wheel zoom behind the modal.
         ui.ctx()
             .data_mut(|d| d.insert_temp(Id::new("pb_calc_types_blocking"), true));
+
+        // Size to a 3-column catalog; hard-cap to the viewport so X stays reachable.
+        const COL: f32 = 220.0;
+        const GAP: f32 = 12.0;
+        const CARD_H: f32 = 128.0;
+        const ROWS: f32 = 4.0;
+        let screen = ui.ctx().screen_rect().size();
+        let max_w = (screen.x - 48.0).max(280.0);
+        let max_h = (screen.y - 48.0).max(200.0);
+        let ideal_w = (COL * 3.0 + GAP * 2.0 + 48.0).min(max_w);
+        let ideal_h = (72.0 + ROWS * CARD_H + (ROWS - 1.0) * GAP + 56.0).min(max_h);
+
         egui::Window::new("Calculation types")
             .id(Id::new(("pb_calc_types_win", step_id)))
             .open(&mut still_open)
             .collapsible(false)
             .resizable(true)
+            .constrain(true)
             .order(egui::Order::Foreground)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .default_size([960.0, 640.0])
-            .min_width(760.0)
-            .min_height(440.0)
+            .default_size([ideal_w, ideal_h])
+            .min_width(280.0_f32.min(max_w))
+            .min_height(200.0_f32.min(max_h))
+            .max_size([max_w, max_h])
             .show(ui.ctx(), |ui| {
-                ui.label(
-                    RichText::new(
-                        "Twelve operator-ready blocks. Click a type to apply it and pre-fill \
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(
+                            "Twelve operator-ready blocks. Click a type to apply it and pre-fill \
 configuration from the example. Types marked time use a window or time constant.",
-                    )
-                    .font(font_ui(13.0))
-                    .color(p.text),
-                );
-                ui.add_space(14.0);
-                let gap = 12.0;
-                let card_h = 128.0;
+                        )
+                        .font(font_ui(13.0))
+                        .color(p.text),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                        // Extra Close — title-bar X can be unreachable if the window was oversized.
+                        if ui
+                            .add(egui::Button::new(RichText::new("Close").font(font_ui(12.5))))
+                            .clicked()
+                        {
+                            close_clicked = true;
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+                // Bound the scroll body so the grid cannot inflate the window past max_size.
+                let body_h = (ui.available_height() - 8.0).max(80.0);
                 egui::ScrollArea::vertical()
                     .id_salt(("pb_calc_types_scroll", step_id))
-                    .auto_shrink([false, false])
+                    .max_height(body_h)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
                         // Equal 3-column grid — fixed card size, no staggered flow.
-                        let col_w = ((ui.available_width() - gap * 2.0) / 3.0).max(210.0);
+                        let col_w = ((ui.available_width() - GAP * 2.0) / 3.0).clamp(160.0, COL);
                         egui::Grid::new(("pb_calc_types_grid", step_id))
                             .num_columns(3)
-                            .spacing([gap, gap])
+                            .spacing([GAP, GAP])
                             .min_col_width(col_w)
                             .max_col_width(col_w)
                             .show(ui, |ui| {
                                 for (i, kind) in CALC_KINDS.iter().enumerate() {
                                     let active = step.calc_kind == kind.id;
                                     ui.allocate_ui_with_layout(
-                                        Vec2::new(col_w, card_h),
+                                        Vec2::new(col_w, CARD_H),
                                         Layout::top_down(Align::Min),
                                         |ui| {
-                                            ui.set_min_size(Vec2::new(col_w, card_h));
-                                            ui.set_max_size(Vec2::new(col_w, card_h));
+                                            ui.set_min_size(Vec2::new(col_w, CARD_H));
+                                            ui.set_max_size(Vec2::new(col_w, CARD_H));
                                             if catalog_card(ui, kind, active, p) {
                                                 pick = Some(kind.id);
                                             }
@@ -322,6 +356,9 @@ configuration from the example. Types marked time use a window or time constant.
                             });
                     });
             });
+        if close_clicked {
+            still_open = false;
+        }
         if let Some(id) = pick {
             if let Some(kind) = kind_by_id(id) {
                 apply_kind_example(step, kind);
