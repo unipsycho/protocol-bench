@@ -330,6 +330,31 @@ pub struct Across {
     pub proto: HubProto,
 }
 
+/// Depth for diagram undo (delete / move / arrange). Enough to recover a bad wipe.
+const HUB_UNDO_LIMIT: usize = 64;
+
+/// Structural snapshot for Ctrl+Z — positions + topology, not camera chrome.
+#[derive(Debug, Clone)]
+struct HubUndoFrame {
+    hubs: Vec<Hub>,
+    feeds: Vec<HubFeed>,
+    next_id: u64,
+    selected: Option<u64>,
+    selected_port: Option<u64>,
+    selected_link: Option<u64>,
+    selection: Vec<(u64, Option<u64>)>,
+}
+
+/// Ephemeral undo stack — ignored by `HubModel` equality / project dirty checks.
+#[derive(Debug, Clone, Default)]
+struct HubUndoStack(Vec<HubUndoFrame>);
+
+impl PartialEq for HubUndoStack {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HubModel {
     pub hubs: Vec<Hub>,
@@ -360,6 +385,9 @@ pub struct HubModel {
     pub feeds: Vec<HubFeed>,
     #[serde(default)]
     next_id: u64,
+    /// PB-66: undo for delete / rearrange / move. Not persisted.
+    #[serde(skip)]
+    undo: HubUndoStack,
 }
 
 impl Default for HubModel {
@@ -381,6 +409,7 @@ impl HubModel {
             inspector_width: INSPECT_DEFAULT,
             zoom: ZOOM_MAX,
             feeds: Vec::new(),
+            undo: HubUndoStack::default(),
             hubs: vec![
                 Hub {
                     id: 1,
@@ -625,6 +654,7 @@ impl HubModel {
 
     /// Put every node back on the automatic arrangement and re-center the camera.
     pub fn clear_arrangement(&mut self) {
+        self.checkpoint();
         self.view_pan = None;
         for hub in &mut self.hubs {
             hub.at = None;
@@ -639,6 +669,67 @@ impl HubModel {
                 step.at = None;
             }
         }
+    }
+
+    /// Snapshot diagram topology + positions before a destructive or rearrange edit (PB-66).
+    pub fn checkpoint(&mut self) {
+        let frame = HubUndoFrame {
+            hubs: self.hubs.clone(),
+            feeds: self.feeds.clone(),
+            next_id: self.next_id,
+            selected: self.selected,
+            selected_port: self.selected_port,
+            selected_link: self.selected_link,
+            selection: self.selection.clone(),
+        };
+        if self
+            .undo
+            .0
+            .last()
+            .is_some_and(|prev| prev.hubs == frame.hubs && prev.feeds == frame.feeds)
+        {
+            return;
+        }
+        self.undo.0.push(frame);
+        while self.undo.0.len() > HUB_UNDO_LIMIT {
+            self.undo.0.remove(0);
+        }
+    }
+
+    /// Restore the last checkpoint. Returns true when something was restored.
+    pub fn undo(&mut self) -> bool {
+        let Some(frame) = self.undo.0.pop() else {
+            return false;
+        };
+        self.hubs = frame.hubs;
+        self.feeds = frame.feeds;
+        self.next_id = frame.next_id;
+        self.selected = frame.selected;
+        self.selected_port = frame.selected_port;
+        self.selected_link = frame.selected_link;
+        self.selection = frame.selection;
+        self.keep_focus();
+        true
+    }
+
+    /// Delete every selected canvas node. Ports/steps first, then hubs.
+    pub fn delete_selection(&mut self) -> bool {
+        if self.selection.is_empty() {
+            return false;
+        }
+        self.checkpoint();
+        let keys = self.selection.clone();
+        let mut hub_ids = Vec::new();
+        for (hub_id, port_id) in keys {
+            match port_id {
+                Some(id) => self.erase_node(hub_id, id),
+                None => hub_ids.push(hub_id),
+            }
+        }
+        for id in hub_ids {
+            self.erase_hub(id);
+        }
+        true
     }
 
     fn port_mut(&mut self, hub_id: u64, port_id: u64) -> Option<&mut HubPort> {
@@ -690,7 +781,14 @@ impl HubModel {
     }
 
     pub fn remove_hub(&mut self, id: u64) {
+        self.checkpoint();
+        self.erase_hub(id);
+    }
+
+    fn erase_hub(&mut self, id: u64) {
         self.hubs.retain(|hub| hub.id != id);
+        self.feeds
+            .retain(|f| f.from_hub != id && f.to_hub != id);
         self.selection.retain(|(hub_id, _)| *hub_id != id);
         if self.selected == Some(id) {
             if let Some((hub_id, port_id)) = self.selection.first().copied() {
@@ -777,21 +875,33 @@ impl HubModel {
     }
 
     pub fn remove_port(&mut self, hub_id: u64, port_id: u64) {
+        self.checkpoint();
+        self.erase_node(hub_id, port_id);
+    }
+
+    /// Remove one Input / Output / Calc / Agg. Output delete keeps connected transforms (PB-65).
+    fn erase_node(&mut self, hub_id: u64, port_id: u64) {
         if let Some(hub) = self.hub_mut(hub_id) {
             hub.sources.retain(|port| port.id != port_id);
             hub.outputs.retain(|port| port.id != port_id);
-            // Drop the node itself, or any transform that lived on that edge.
-            hub.aggregators
-                .retain(|step| step.id != port_id && step.edge_port != port_id);
-            hub.calculations
-                .retain(|step| step.id != port_id && step.edge_port != port_id);
+            // Drop only the selected step — never cascade by edge_port (PB-65).
+            hub.aggregators.retain(|step| step.id != port_id);
+            hub.calculations.retain(|step| step.id != port_id);
         }
+        // Drop feeds that used this node as feeder or as Output sink.
+        self.feeds.retain(|f| {
+            !(f.to_hub == hub_id && f.to_output == port_id)
+                && !(f.from_hub == hub_id && f.from_node == port_id)
+        });
         if self.selected_port == Some(port_id) {
             self.selected_port = None;
         }
         if self.selected_link == Some(port_id) {
             self.selected_link = None;
         }
+        self.selection
+            .retain(|(h, p)| !(*h == hub_id && *p == Some(port_id)));
+        self.keep_focus();
     }
 
     /// Connect a Source / Calc / Agg into an Output (many → one). Returns true if new.
@@ -1727,6 +1837,28 @@ fn diagram_view(
         })
         .collect();
     let mut gesture = gesture_nodes(&mut child, model, &screen, panning);
+    // PB-66: one undo frame per rearrange drag (not every move tick).
+    if gesture.drag_started {
+        model.checkpoint();
+    }
+    // PB-66/67: Ctrl+Z undo; Delete/Backspace removes selection (no cascade).
+    let typing = child.ctx().wants_keyboard_input();
+    if !typing {
+        let (do_undo, do_delete) = child.ctx().input(|i| {
+            let undo = i.modifiers.command
+                && !i.modifiers.shift
+                && i.key_pressed(egui::Key::Z);
+            let delete = !i.modifiers.command
+                && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+            (undo, delete)
+        });
+        if do_undo && model.undo() {
+            change.dirty = true;
+        }
+        if do_delete && model.delete_selection() {
+            change.dirty = true;
+        }
+    }
     // Links only when no node took the pointer (nodes sit on top of edges).
     if gesture.hover.is_none()
         && gesture.pick.is_none()
@@ -1981,6 +2113,8 @@ enum MenuCmd {
     AddSource(u64),
     AddOutput(u64),
     NewHub,
+    /// PB-67: delete one canvas node (hub when `port_id` is None).
+    DeleteNode { hub_id: u64, port_id: Option<u64> },
 }
 
 fn apply_menu(model: &mut HubModel, cmd: MenuCmd, change: &mut HubChange) {
@@ -2013,6 +2147,21 @@ fn apply_menu(model: &mut HubModel, cmd: MenuCmd, change: &mut HubChange) {
             model.add_hub();
             change.dirty = true;
         }
+        MenuCmd::DeleteNode { hub_id, port_id } => {
+            match port_id {
+                Some(id) => model.remove_port(hub_id, id),
+                None => model.remove_hub(hub_id),
+            }
+            change.dirty = true;
+        }
+    }
+}
+
+/// Shared Delete entry for node context menus (PB-67).
+fn delete_node_menu(ui: &mut Ui, hub_id: u64, port_id: Option<u64>, cmd: &mut Option<MenuCmd>) {
+    if ui.button("Delete").clicked() {
+        *cmd = Some(MenuCmd::DeleteNode { hub_id, port_id });
+        ui.close_menu();
     }
 }
 
@@ -2069,6 +2218,8 @@ struct Gesture {
     hover: Option<(u64, Option<u64>)>,
     pick: Option<(u64, Option<u64>)>,
     drag: Option<(u64, Option<u64>, Vec2)>,
+    /// True once when a node move drag begins (for undo checkpoint).
+    drag_started: bool,
     open: Option<DockPane>,
     menu: Option<MenuCmd>,
     /// True when `pick` came from a connection, not a node.
@@ -2084,6 +2235,7 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
         hover: None,
         pick: None,
         drag: None,
+        drag_started: false,
         open: None,
         menu: None,
         link_pick: false,
@@ -2132,6 +2284,9 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
             };
             ui.ctx().set_cursor_icon(cursor);
         }
+        if !panning && resp.drag_started() && !(alt && can_feed) {
+            gesture.drag_started = true;
+        }
         if !panning && resp.dragged() {
             if alt && can_feed {
                 gesture.wire_from = Some(key);
@@ -2157,13 +2312,21 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
                         ui.separator();
                     }
                     hub_port_menu(ui, node.hub_id, &mut menu);
+                    ui.separator();
+                    delete_node_menu(ui, node.hub_id, node.port_id, &mut menu);
                 }
                 Role::Aggregator | Role::Calculation => {
                     if let Some(step) = find_step(model, node.hub_id, node.port_id) {
                         edge_transform_menu(ui, node.hub_id, step.edge_port, &mut menu);
+                        ui.separator();
                     }
+                    delete_node_menu(ui, node.hub_id, node.port_id, &mut menu);
                 }
-                Role::Hub => hub_port_menu(ui, node.hub_id, &mut menu),
+                Role::Hub => {
+                    hub_port_menu(ui, node.hub_id, &mut menu);
+                    ui.separator();
+                    delete_node_menu(ui, node.hub_id, None, &mut menu);
+                }
             }
         });
         if menu.is_some() {
@@ -3749,6 +3912,75 @@ fn text_button(ui: &mut Ui, label: &str, on: bool, p: &ThemePalette) -> egui::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_output_keeps_connected_calc_and_drops_feeds() {
+        let mut model = HubModel::sample();
+        let hub = model.hubs[1].id;
+        let out = model.hubs[1].outputs[0].id;
+        let src = model.hubs[1].sources[0].id;
+        let calc = model.add_step(hub, false, src).expect("calc");
+        assert!(model.connect_feed(hub, calc, hub, out));
+        assert_eq!(model.feeds.len(), 1);
+        model.remove_port(hub, out);
+        assert!(
+            model.hub(hub).unwrap().calculations.iter().any(|s| s.id == calc),
+            "calc must survive Output delete (PB-65)"
+        );
+        assert!(
+            model.hub(hub).unwrap().outputs.iter().all(|p| p.id != out),
+            "output gone"
+        );
+        assert!(model.feeds.is_empty(), "feeds into Output must clear");
+    }
+
+    #[test]
+    fn undo_restores_deleted_output_and_moves() {
+        let mut model = HubModel::sample();
+        let hub = model.hubs[1].id;
+        let out = model.hubs[1].outputs[0].id;
+        model.set_center(hub, Some(out), [120.0, 80.0]);
+        model.remove_port(hub, out);
+        assert!(model.hub(hub).unwrap().outputs.iter().all(|p| p.id != out));
+        assert!(model.undo());
+        let port = model
+            .hub(hub)
+            .unwrap()
+            .outputs
+            .iter()
+            .find(|p| p.id == out)
+            .expect("output restored");
+        assert_eq!(port.at, Some([120.0, 80.0]));
+        model.checkpoint();
+        model.set_center(hub, Some(out), [200.0, 90.0]);
+        assert!(model.undo());
+        assert_eq!(
+            model
+                .hub(hub)
+                .unwrap()
+                .outputs
+                .iter()
+                .find(|p| p.id == out)
+                .unwrap()
+                .at,
+            Some([120.0, 80.0])
+        );
+    }
+
+    #[test]
+    fn delete_selection_removes_focused_output_only() {
+        let mut model = HubModel::sample();
+        let hub = model.hubs[1].id;
+        let out = model.hubs[1].outputs[0].id;
+        let src = model.hubs[1].sources[0].id;
+        let calc = model.add_step(hub, false, src).expect("calc");
+        assert!(model.connect_feed(hub, calc, hub, out));
+        model.focus_port(hub, out);
+        assert!(model.delete_selection());
+        assert!(model.hub(hub).unwrap().outputs.iter().all(|p| p.id != out));
+        assert!(model.hub(hub).unwrap().calculations.iter().any(|s| s.id == calc));
+        assert!(model.hub(hub).unwrap().sources.iter().any(|p| p.id == src));
+    }
 
     #[test]
     fn output_accepts_many_inbound_feeds() {
