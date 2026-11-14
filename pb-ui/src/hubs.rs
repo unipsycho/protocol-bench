@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use crate::dock::DockPane;
 use crate::mqtt_panel::MqttPanelState;
 use crate::point_rows;
-use crate::theme::{blend_scope, divider_bar, font_semi, font_ui, tint, ThemePalette, SEP};
+use crate::theme::{blend_scope, divider_bar, font_semi, font_ui, mix, tint, ThemePalette, SEP};
 use crate::topic_tree::{self, TopicTree, TreeMode};
 
 const PORT_W: f32 = 156.0;
@@ -3147,7 +3147,7 @@ fn paint_hub_node(
     };
     let z = zoom.max(0.35);
     let ink = hub.protocol.ink(p.is_light);
-    // PB-70: soft filled ground so hubs stand out from Input/Output/Calc/Agg (pane).
+    // PB-83: soft protocol-tinted fill (MQTT cyan, Modbus yellow, …) so hubs read as typed.
     paint_hub_card(painter, node.rect, ink, on, hot, p);
     paint_grip(painter, node.rect, if hot || on { ink } else { p.muted });
     let clip = Rect::from_min_max(
@@ -3325,7 +3325,7 @@ fn paint_card(
     );
 }
 
-/// Hub card — idle fill uses `control` so hubs read as anchors (PB-70).
+/// Hub card — soft protocol wash so hubs read as typed anchors (PB-83).
 fn paint_hub_card(
     painter: &egui::Painter,
     rect: Rect,
@@ -3334,13 +3334,14 @@ fn paint_hub_card(
     hot: bool,
     p: &ThemePalette,
 ) {
+    // Mix protocol ink into pane: quiet, but clearly Modbus-yellow / MQTT-cyan / OPC-lilac.
+    let wash = if p.is_light { 0.14 } else { 0.20 };
     let fill = if on {
-        p.header_top
+        mix(p.header_top, ink, wash * 0.7)
     } else if hot {
-        tint(ink, if p.is_light { 28 } else { 36 })
+        mix(p.pane, ink, wash + 0.06)
     } else {
-        // Soft lift vs port/calc `pane` cards — same palette, not loud.
-        p.control
+        mix(p.pane, ink, wash)
     };
     paint_card_fill(painter, rect, ink, on, hot, p, fill);
 }
