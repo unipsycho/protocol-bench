@@ -17,13 +17,6 @@ const SIDE_BY_SIDE_MIN: f32 = 720.0;
 const TRANSPORTS: &[&str] = &["tcp", "tls", "ws", "wss"];
 const LABEL_W: f32 = 100.0;
 
-/// CONNECT auth user stub for the embedded hub broker (rumqttd later).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrokerUserStub {
-    pub username: String,
-    pub password: String,
-}
-
 fn default_broker_bind() -> String {
     "0.0.0.0".into()
 }
@@ -38,6 +31,17 @@ fn default_broker_id() -> String {
 
 fn default_broker_name() -> String {
     "Hub broker".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Legacy CONNECT user row (migrated into username/password on load).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerUserStub {
+    pub username: String,
+    pub password: String,
 }
 
 /// Single-project embedded MQTT broker (LAN listen).
@@ -57,8 +61,16 @@ pub struct EmbeddedBrokerConfig {
     pub bind: String,
     #[serde(default = "default_broker_listen_port")]
     pub port: u16,
-    /// Connect users; empty = anonymous OK.
+    /// When true, rumqttd accepts CONNECT without credentials (default).
+    #[serde(default = "default_true")]
+    pub anonymous: bool,
+    /// Required when `anonymous` is false.
     #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    /// Legacy multi-user list — folded into username/password on load; not written.
+    #[serde(default, skip_serializing)]
     pub users: Vec<BrokerUserStub>,
 }
 
@@ -70,6 +82,9 @@ impl Default for EmbeddedBrokerConfig {
             enabled: false,
             bind: default_broker_bind(),
             port: default_broker_listen_port(),
+            anonymous: true,
+            username: String::new(),
+            password: String::new(),
             users: Vec::new(),
         }
     }
@@ -102,6 +117,30 @@ impl EmbeddedBrokerConfig {
         } else {
             b.to_string()
         }
+    }
+
+    /// Fold legacy `users[]` into username/password + anonymous=false.
+    pub fn migrate_auth(&mut self) {
+        if let Some(u) = self.users.first() {
+            if self.username.trim().is_empty() && !u.username.trim().is_empty() {
+                self.username = u.username.clone();
+                self.password = u.password.clone();
+                self.anonymous = false;
+            }
+        }
+        self.users.clear();
+    }
+
+    /// Auth pairs for rumqttd — empty means anonymous.
+    pub fn auth_users(&self) -> Vec<(String, String)> {
+        if self.anonymous {
+            return Vec::new();
+        }
+        let u = self.username.trim();
+        if u.is_empty() {
+            return Vec::new();
+        }
+        vec![(u.to_string(), self.password.clone())]
     }
 }
 
@@ -172,9 +211,6 @@ pub struct MqttPanelState {
     pub trees: BTreeMap<String, TopicTree>,
     /// Project-wide embedded hub broker (single MQTT broker hub).
     pub embedded: EmbeddedBrokerConfig,
-    /// Draft row for adding a Connect user (Enter to add).
-    pub draft_broker_user: String,
-    pub draft_broker_pass: String,
     /// Live rumqttd listen state (session UI; not persisted).
     pub broker_running: bool,
     pub broker_status: String,
@@ -187,8 +223,6 @@ impl Default for MqttPanelState {
             selected: None,
             trees: BTreeMap::new(),
             embedded: EmbeddedBrokerConfig::default(),
-            draft_broker_user: String::new(),
-            draft_broker_pass: String::new(),
             broker_running: false,
             broker_status: String::new(),
         }
@@ -417,12 +451,14 @@ fn embedded_configure_json(state: &MqttPanelState, hubs: &HubModel) -> serde_jso
             })
         })
         .collect();
-    let (username, password) = state
-        .embedded
-        .users
-        .first()
-        .map(|u| (u.username.clone(), u.password.clone()))
-        .unwrap_or_default();
+    let (username, password) = if state.embedded.anonymous {
+        (String::new(), String::new())
+    } else {
+        (
+            state.embedded.username.clone(),
+            state.embedded.password.clone(),
+        )
+    };
     serde_json::json!({
         "id": id,
         "label": state.embedded.display_name(),
@@ -790,11 +826,9 @@ fn edit_embedded_broker(
     panel_heading(ui, "Embedded hub broker", p.accent, p);
     ui.add_space(4.0);
     ui.label(
-        egui::RichText::new(
-            "Single project rumqttd listener for LAN. Empty Connect users allow anonymous.",
-        )
-        .font(font_ui(12.0))
-        .color(p.muted),
+        egui::RichText::new("Single project rumqttd listener for LAN.")
+            .font(font_ui(12.0))
+            .color(p.muted),
     );
     ui.add_space(6.0);
     if ui
@@ -828,77 +862,16 @@ fn edit_embedded_broker(
         }
     }
     ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new("Connect users")
-            .font(font_ui(10.5))
-            .color(p.muted),
-    );
-    ui.add_space(4.0);
-    let mut remove = None;
-    for (i, user) in state.embedded.users.iter().enumerate() {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!("{}  ·  ••••", user.username))
-                    .font(font_ui(12.0))
-                    .color(p.text),
-            );
-            if text_btn(ui, "×", false, p).clicked() {
-                remove = Some(i);
-            }
-        });
+    if ui
+        .checkbox(&mut state.embedded.anonymous, "Anonymous login")
+        .changed()
+    {
+        // Wired into rumqttd auth on Start.
     }
-    if let Some(i) = remove {
-        state.embedded.users.remove(i);
-    }
-    // Draft fields — Enter in either field adds the user (no Add user button).
-    let mut add_user = false;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        ui.add_sized(
-            [LABEL_W, 20.0],
-            egui::Label::new(
-                egui::RichText::new("Username")
-                    .font(font_ui(12.0))
-                    .color(p.muted),
-            ),
-        );
-        let r = ui.add(
-            egui::TextEdit::singleline(&mut state.draft_broker_user).desired_width(f32::INFINITY),
-        );
-        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            add_user = true;
-        }
-    });
-    ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        ui.add_sized(
-            [LABEL_W, 20.0],
-            egui::Label::new(
-                egui::RichText::new("Password")
-                    .font(font_ui(12.0))
-                    .color(p.muted),
-            ),
-        );
-        let r = ui.add(
-            egui::TextEdit::singleline(&mut state.draft_broker_pass)
-                .password(true)
-                .desired_width(f32::INFINITY),
-        );
-        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            add_user = true;
-        }
-    });
-    if add_user {
-        let u = state.draft_broker_user.trim().to_string();
-        if !u.is_empty() && !state.embedded.users.iter().any(|x| x.username == u) {
-            state.embedded.users.push(BrokerUserStub {
-                username: u,
-                password: state.draft_broker_pass.clone(),
-            });
-            state.draft_broker_user.clear();
-            state.draft_broker_pass.clear();
-        }
+    if !state.embedded.anonymous {
+        ui.add_space(4.0);
+        field(ui, "Username", &mut state.embedded.username, p);
+        password(ui, "Password", &mut state.embedded.password, p);
     }
 
     ui.add_space(14.0);
@@ -933,16 +906,15 @@ fn edit_embedded_broker(
 }
 
 fn start_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState, hubs: &HubModel) {
+    if !state.embedded.anonymous && state.embedded.username.trim().is_empty() {
+        state.broker_status = "Username required when Anonymous login is off".into();
+        return;
+    }
     let users: Vec<serde_json::Value> = state
         .embedded
-        .users
-        .iter()
-        .map(|u| {
-            serde_json::json!({
-                "username": u.username,
-                "password": u.password,
-            })
-        })
+        .auth_users()
+        .into_iter()
+        .map(|(username, password)| serde_json::json!({ "username": username, "password": password }))
         .collect();
     let json = serde_json::json!({
         "op": "broker_start",

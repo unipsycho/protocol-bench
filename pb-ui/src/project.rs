@@ -292,6 +292,7 @@ impl MqttProject {
                 .position(|c| c.id == self.selected_id)
         };
         state.embedded = self.embedded.clone();
+        state.embedded.migrate_auth();
     }
 }
 
@@ -517,10 +518,9 @@ mod tests {
         panel.embedded.enabled = true;
         panel.embedded.bind = "0.0.0.0".into();
         panel.embedded.port = 1884;
-        panel.embedded.users.push(crate::mqtt_panel::BrokerUserStub {
-            username: "ops".into(),
-            password: "secret".into(),
-        });
+        panel.embedded.anonymous = false;
+        panel.embedded.username = "ops".into();
+        panel.embedded.password = "secret".into();
         let project = ProjectFile {
             version: PROJECT_VERSION,
             points: vec![PointBindingSerde {
@@ -539,7 +539,8 @@ mod tests {
         assert_eq!(back.mqtt.embedded.port, 1884);
         assert_eq!(back.mqtt.embedded.name, "Plant hub");
         assert_eq!(back.mqtt.embedded.id, "hub");
-        assert_eq!(back.mqtt.embedded.users[0].username, "ops");
+        assert!(!back.mqtt.embedded.anonymous);
+        assert_eq!(back.mqtt.embedded.username, "ops");
     }
 
     #[test]
@@ -551,7 +552,20 @@ mod tests {
         assert_eq!(back.mqtt.embedded.port, 1883);
         assert_eq!(back.mqtt.embedded.id, "hub");
         assert_eq!(back.mqtt.embedded.name, "Hub broker");
-        assert!(back.mqtt.embedded.users.is_empty());
+        assert!(back.mqtt.embedded.anonymous);
+        assert!(back.mqtt.embedded.username.is_empty());
+    }
+
+    #[test]
+    fn embedded_migrates_legacy_users() {
+        let raw = r#"{"version":5,"mqtt":{"clients":[],"selected_id":"","embedded":{"id":"hub","name":"Hub broker","enabled":true,"bind":"0.0.0.0","port":1883,"users":[{"username":"ops","password":"x"}]}}}"#;
+        let file: ProjectFile = serde_json::from_str(raw).unwrap();
+        let mut panel = MqttPanelState::default();
+        file.mqtt.apply_to_panel(&mut panel);
+        assert!(!panel.embedded.anonymous);
+        assert_eq!(panel.embedded.username, "ops");
+        assert_eq!(panel.embedded.password, "x");
+        assert!(panel.embedded.users.is_empty());
     }
 
     #[test]

@@ -146,4 +146,14 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         let _ = EmbeddedBroker::start("127.0.0.1", port, &[]).expect("restart");
     }
+
+    #[test]
+    fn start_with_auth_users() {
+        let port = 1893;
+        let users = vec![("ops".into(), "secret".into())];
+        let broker = EmbeddedBroker::start("127.0.0.1", port, &users).expect("start auth");
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).expect("tcp");
+        broker.stop();
+    }
 }
