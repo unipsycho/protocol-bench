@@ -13,8 +13,13 @@ pub use pack_engine::PackEngine;
 
 use pb_points::PointStore;
 
+pub mod agg;
 pub mod calc;
+pub use agg::{
+    agg_point_name, peek_one as peek_agg, AggConfig, AggOutput, AggRuntime, MemberReading,
+};
 pub use calc::{peek_for_point, CalcConfig, CalcRuntime};
+use pb_points::PointValue;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -274,6 +279,9 @@ pub struct EngineHandle {
     calcs: Arc<Mutex<Vec<CalcConfig>>>,
     /// Shared edge-runner state (deadband hold, rolling windows) for egress + UI peek.
     calc_rt: Arc<Mutex<CalcRuntime>>,
+    /// Hub aggregator configs → host `agg_N` points.
+    aggs: Arc<Mutex<Vec<AggConfig>>>,
+    agg_rt: Arc<Mutex<AggRuntime>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -293,12 +301,16 @@ impl EngineHandle {
             .unwrap_or_else(|| Arc::new(Mutex::new(PointStore::new())));
         let calcs = Arc::new(Mutex::new(Vec::<CalcConfig>::new()));
         let calc_rt = Arc::new(Mutex::new(CalcRuntime::default()));
+        let aggs = Arc::new(Mutex::new(Vec::<AggConfig>::new()));
+        let agg_rt = Arc::new(Mutex::new(AggRuntime::default()));
         let (tx, rx) = mpsc::channel();
         let snap = Arc::new(Mutex::new(initial_snapshot(&modules_dir)));
         let snap_thread = Arc::clone(&snap);
         let points_thread = Arc::clone(&points);
         let calcs_thread = Arc::clone(&calcs);
         let calc_rt_thread = Arc::clone(&calc_rt);
+        let aggs_thread = Arc::clone(&aggs);
+        let agg_rt_thread = Arc::clone(&agg_rt);
         let join = thread::Builder::new()
             .name("pb-engine".into())
             .spawn(move || {
@@ -308,6 +320,8 @@ impl EngineHandle {
                     points_thread,
                     calcs_thread,
                     calc_rt_thread,
+                    aggs_thread,
+                    agg_rt_thread,
                     modules_dir,
                 )
             })
@@ -318,6 +332,8 @@ impl EngineHandle {
             points,
             calcs,
             calc_rt,
+            aggs,
+            agg_rt,
             join: Some(join),
         }
     }
@@ -335,6 +351,18 @@ impl EngineHandle {
     /// Replace hub calculation configs used on Output egress.
     pub fn set_calcs(&self, next: Vec<CalcConfig>) {
         if let Ok(mut guard) = self.calcs.lock() {
+            *guard = next;
+        }
+    }
+
+    /// Shared aggregator runtime (UI peeks window history here).
+    pub fn agg_runtime(&self) -> Arc<Mutex<AggRuntime>> {
+        Arc::clone(&self.agg_rt)
+    }
+
+    /// Replace hub aggregator configs (N≥2 members → `agg_N` points).
+    pub fn set_aggs(&self, next: Vec<AggConfig>) {
+        if let Ok(mut guard) = self.aggs.lock() {
             *guard = next;
         }
     }
@@ -390,6 +418,8 @@ fn host_main(
     points: Arc<Mutex<PointStore>>,
     calcs: Arc<Mutex<Vec<CalcConfig>>>,
     calc_rt: Arc<Mutex<CalcRuntime>>,
+    aggs: Arc<Mutex<Vec<AggConfig>>>,
+    agg_rt: Arc<Mutex<AggRuntime>>,
     modules_dir: PathBuf,
 ) {
     let started = Instant::now();
@@ -458,6 +488,45 @@ fn host_main(
                 calc_stamp.insert(p.name.clone(), p.updated_ms);
                 last_out.insert(p.name.clone(), value.clone());
                 dirty_out.push((p.name.clone(), value));
+            }
+        }
+
+        // Aggregators: recompute every tick from member values → host `agg_N` points.
+        {
+            let agg_cfgs = aggs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if !agg_cfgs.is_empty() {
+                let mut art = agg_rt.lock().unwrap_or_else(|e| e.into_inner());
+                let lookup = |name: &str| {
+                    rows.iter().find(|p| p.name == name).map(|p| agg::MemberReading {
+                        name: p.name.clone(),
+                        value: p.value.clone(),
+                        quality: p.quality,
+                        updated_ms: p.updated_ms,
+                    })
+                };
+                let outs = agg::evaluate_all(&agg_cfgs, &mut art, &lookup);
+                drop(art);
+                if !outs.is_empty() {
+                    let mut store = points.lock().unwrap_or_else(|e| e.into_inner());
+                    for o in outs {
+                        let src = format!("agg/step/{}", o.name.trim_start_matches("agg_"));
+                        let same = store.get(&o.name).is_some_and(|p| {
+                            p.value.as_display() == o.value && p.quality == o.quality
+                        });
+                        if same {
+                            continue;
+                        }
+                        let pv = o
+                            .value
+                            .parse::<f64>()
+                            .map(PointValue::F64)
+                            .unwrap_or_else(|_| PointValue::String(o.value.clone()));
+                        store.upsert(o.name.clone(), pv, o.quality, src);
+                        // Feed egress when the derived point changes.
+                        last_out.insert(o.name.clone(), o.value.clone());
+                        dirty_out.push((o.name, o.value));
+                    }
+                }
             }
         }
 

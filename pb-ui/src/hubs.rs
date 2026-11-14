@@ -227,6 +227,23 @@ pub struct HubStep {
     /// Host point the calculation transforms in place on the path to Output.
     #[serde(default)]
     pub source_point: String,
+    /// Aggregator combine mode (`sum`, `mean`, `min`, …). Ignored for calculations.
+    #[serde(default = "default_agg_mode")]
+    pub agg_mode: String,
+    /// Aggregator window: `none` | `n:<count>` | `t:<secs>`.
+    #[serde(default = "default_agg_window")]
+    pub agg_window: String,
+    /// Aggregator member host points (N≥2). Ignored for calculations.
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
+fn default_agg_mode() -> String {
+    "mean".into()
+}
+
+fn default_agg_window() -> String {
+    "none".into()
 }
 
 fn default_calc_kind() -> String {
@@ -729,6 +746,9 @@ impl HubModel {
             param_b: "0.0".into(),
             window_secs: "10".into(),
             source_point: String::new(),
+            agg_mode: default_agg_mode(),
+            agg_window: default_agg_window(),
+            members: Vec::new(),
         };
         if aggregator {
             hub.aggregators.push(step);
@@ -2455,12 +2475,16 @@ fn edit_step(
             change.dirty = true;
         }
     } else {
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("Aggregator options are plan-only for now — name and edge only.")
-                .font(font_ui(11.5))
-                .color(p.muted),
-        );
+        ui.add_space(12.0);
+        if crate::agg_panel::paint_node_props(
+            ui,
+            step_field(model, hub_id, step_id),
+            p,
+            &host.points,
+            engine,
+        ) {
+            change.dirty = true;
+        }
     }
     ui.add_space(10.0);
     ui.horizontal(|ui| {

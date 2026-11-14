@@ -56,6 +56,15 @@ A **hub** is the main protocol conversion / routing point. It is always **one pr
 - Add aggregator / Add calculation attaches to a **selected link/edge** (or a right-clicked connection), rendered on that line.
 - Sample hubs ship for framing (Plant Modbus + Edge MQTT, MQTT link between them) — configuration only, not a live bridge.
 
+### Calculations vs Aggregators
+
+| Kind | Role |
+| --- | --- |
+| **Calculation** | **Single-stream** edge transform: one source point → one output on that path (scale/offset, deadband, rolling average, rate of change, hysteresis, …). Never combines multiple points. |
+| **Aggregator** | **N≥2 member points** combined into one derived host point `agg_N`. Modes: sum, mean, min, max, count, median, first, last, any-good, majority. Optional window: none / last N samples / last T seconds. Member **quality is worst-wins**. |
+
+Calculations must not grow multi-input pickers — multi-point combine belongs only on Aggregator nodes. Aggregator config persists under each hub’s `aggregators[]` in `project.json`.
+
 ### MQTT model (client pack)
 
 | Surface | Owns |
@@ -165,7 +174,7 @@ Recorded 2026-11-13 from Mike’s answers (numbering matches the former Open dec
 12. **Language** — Protocol Bench service + UI remain Rust. Online license server can also be Rust; Cloudflare Workers + workers-rs is a viable host for a license API (see [Runtime](#runtime)).
 13. **Windows installer** — **MSI via WiX**, driven from the Rust repo with **`cargo-wix`** (not Inno Setup). Chosen for IT-friendly deploys (GPO / SCCM / silent install, standard Add/Remove Programs). Layout installs **service + UI + module dir**; upgrades must **preserve config, licenses, and packs**. Product **updates** stay on the Rust **license server** path (manifest + signed downloads) — the installer choice does not replace that. **Linux installer** is later / TBD and is not blocking.
 14. **MCP on the service** — the always-on **service** hosts an **MCP server** so an agent can manage setup (channels, points, mappings, hubs, and related product actions). Not in the UI process. High-level product intent only; no tool schema yet (see [MCP server on the service](#mcp-server-on-the-service)).
-15. **Hub graph model** — **Hub** = conversion / routing point (multiple hubs allowed for multiple conversion points). **Aggregator** and **Calculation** are edge transforms on the data path between nodes (sources → optional edge transforms → hub → optional edge transforms → outputs), not independent sibling hub-step nodes. UI adds them on a selected / right-clicked connection.
+15. **Hub graph model** — **Hub** = conversion / routing point (multiple hubs allowed for multiple conversion points). **Aggregator** and **Calculation** are edge transforms on the data path between nodes (sources → optional edge transforms → hub → optional edge transforms → outputs), not independent sibling hub-step nodes. UI adds them on a selected / right-clicked connection. **Calculation** = single-stream; **Aggregator** = N≥2 member combine → `agg_N` (see [Calculations vs Aggregators](#calculations-vs-aggregators)).
 16. **Hub protocol** — every hub is **one protocol**; **Split** hubs are removed. Only **server-capable** protocols may be hubs (Modbus server, MQTT broker/server-oriented, OPC UA server). Sources and outputs define other protocols on the diagram.
 
 ## Still open

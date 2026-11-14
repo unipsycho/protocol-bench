@@ -2,6 +2,7 @@
 // Stroke widths are f32. Rust 1.99 warns when an untyped float hits that generic slot.
 #![allow(float_literal_f32_fallback)]
 
+mod agg_panel;
 mod app;
 mod art;
 mod brand_logo;

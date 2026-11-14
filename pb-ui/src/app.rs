@@ -433,9 +433,11 @@ impl eframe::App for ProtocolBenchApp {
             self.theme_applied = Some(self.theme);
         }
         let host = self.engine.snapshot();
-        // Keep edge-runner calc configs in lockstep with the hub diagram.
+        // Keep edge-runner calc/agg configs in lockstep with the hub diagram.
         self.engine
             .set_calcs(crate::calc_panel::configs_from_hubs(&self.ui_state.hubs));
+        self.engine
+            .set_aggs(crate::agg_panel::configs_from_hubs(&self.ui_state.hubs));
         let p = self.theme.palette();
         theme::paint_root_bg(ctx, &p);
         self.pane_hits.clear();

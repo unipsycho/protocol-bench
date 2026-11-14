@@ -113,15 +113,15 @@ pub const CALC_KINDS: &[CalcKind] = &[
     CalcKind {
         id: "boolean_compare",
         name: "Boolean compare",
-        blurb: "Compare to a setpoint or another point → true/false.",
-        example: "x > 50 · or · x ≥ ref_point",
+        blurb: "Compare this stream to a numeric setpoint → true/false. (Multi-point combine is Aggregator.)",
+        example: "x > 50",
         time_based: false,
     },
     CalcKind {
         id: "formula",
         name: "Expression / formula",
-        blurb: "Free expression over one or more points (operators + functions).",
-        example: "(A * 1.8) + 32 · or · clamp(A / B, 0, 1)",
+        blurb: "Free expression over this one stream (x / A) — operators + ( ). Multi-point combine is Aggregator.",
+        example: "(x * 1.8) + 32",
         time_based: false,
     },
     CalcKind {
