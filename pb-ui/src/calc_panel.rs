@@ -1,10 +1,9 @@
-//! Calculation node properties — operator-facing catalog for edge transforms
-//! that sit between Input/node path and Output.
+//! Calculation node properties — operator-facing edge transforms.
 //!
 //! Shown in the Hubs inspector when a calculation node is selected.
-//! Engine evaluation can be stubbed; UI + project fields are production-shaped.
+//! Catalog lives in a large modal help guide; picking a type pre-fills config.
 
-use egui::{Align, Color32, Layout, RichText, Sense, Vec2};
+use egui::{Align, Color32, Id, Layout, RichText, Sense, Vec2};
 
 use crate::hubs::HubStep;
 use crate::theme::{font_semi, font_ui, ThemePalette};
@@ -116,121 +115,187 @@ pub fn kind_label(id: &str) -> &str {
     kind_by_id(id).map(|k| k.name).unwrap_or("Calculation")
 }
 
+/// Apply catalog example values onto the step.
+fn apply_kind_example(step: &mut HubStep, kind: &CalcKind) {
+    let prev_name = kind_by_id(step.calc_kind.as_str()).map(|k| k.name);
+    step.calc_kind = kind.id.into();
+    if step.label.is_empty()
+        || step.label == "Calculation"
+        || prev_name.is_some_and(|n| step.label == n)
+    {
+        step.label = kind.name.into();
+    }
+    step.formula.clear();
+    step.param_a.clear();
+    step.param_b.clear();
+    step.window_secs.clear();
+    match kind.id {
+        "scale_offset" => {
+            step.param_a = "0.1".into();
+            step.param_b = "-40".into();
+        }
+        "unit_convert" => {
+            step.param_a = "°C".into();
+            step.param_b = "°F".into();
+        }
+        "clamp" => {
+            step.param_a = "0".into();
+            step.param_b = "100".into();
+        }
+        "deadband" => {
+            step.param_a = "0.5".into();
+        }
+        "rolling_avg" => {
+            step.window_secs = "10".into();
+            step.param_a = "auto".into();
+        }
+        "ema" => {
+            step.window_secs = "5".into();
+            step.param_a = "0.2".into();
+        }
+        "rate_of_change" => {
+            step.param_a = "/s".into();
+        }
+        "min_max_hold" => {
+            step.window_secs = "30".into();
+            step.param_a = "max".into();
+        }
+        "hysteresis" => {
+            step.param_a = "80".into();
+            step.param_b = "70".into();
+        }
+        "boolean_compare" => {
+            step.param_a = ">".into();
+            step.param_b = "50".into();
+        }
+        "formula" => {
+            step.formula = "(A * 1.8) + 32".into();
+        }
+        "time_window" => {
+            step.window_secs = "60".into();
+            step.param_a = "avg".into();
+        }
+        _ => {}
+    }
+}
+
+fn modal_open_id(step_id: u64) -> Id {
+    Id::new(("pb_calc_types_modal", step_id))
+}
+
 /// Paint calculation node properties (Hubs inspector). Returns true when mutated.
 pub fn paint_node_props(ui: &mut egui::Ui, step: &mut HubStep, p: &ThemePalette) -> bool {
     let mut dirty = false;
+    let step_id = step.id;
+    let modal_id = modal_open_id(step_id);
 
-    ui.label(
-        RichText::new(
-            "Calculations sit on the path between an Input (or hub) and an Output. \
-They reshape values on that edge — not as free-floating peers of the hub.",
-        )
-        .font(font_ui(12.5))
-        .color(p.text),
-    );
-    ui.add_space(10.0);
-    heading(ui, "Path framing", p.live, p);
-    ui.add_space(8.0);
-    path_diagram(ui, p);
-
-    ui.add_space(16.0);
-    heading(ui, "Calculation types", p.accent, p);
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new(
-            "Twelve operator-ready blocks. Types marked time use a window or time constant.",
-        )
-        .font(font_ui(11.5))
-        .color(p.muted),
-    );
-    ui.add_space(12.0);
-
-    let mut pick = None;
-    for kind in CALC_KINDS {
-        let active = step.calc_kind == kind.id;
-        if catalog_card(ui, kind, active, p) {
-            pick = Some(kind.id);
-        }
-        ui.add_space(8.0);
-    }
-    if let Some(id) = pick {
-        if step.calc_kind != id {
-            step.calc_kind = id.into();
-            if step.label == "Calculation" || step.label.is_empty() {
-                if let Some(k) = kind_by_id(id) {
-                    step.label = k.name.into();
-                }
-            }
-            if id == "formula" && step.formula.is_empty() {
-                step.formula = "(x * scale) + offset".into();
-            }
-            dirty = true;
-        }
-    }
-
-    ui.add_space(8.0);
-    if let Some(kind) = kind_by_id(step.calc_kind.as_str()) {
-        if detail_editor(ui, kind, step, p) {
-            dirty = true;
-        }
-    } else if let Some(kind) = kind_by_id("scale_offset") {
+    // Configuration first.
+    let kind = kind_by_id(step.calc_kind.as_str()).unwrap_or(&CALC_KINDS[0]);
+    if step.calc_kind != kind.id {
         step.calc_kind = kind.id.into();
         dirty = true;
-        if detail_editor(ui, kind, step, p) {
-            dirty = true;
-        }
     }
-    ui.add_space(8.0);
+    if detail_editor(ui, kind, step, p) {
+        dirty = true;
+    }
+
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add(egui::Button::new(
+                RichText::new("Calculation types").font(font_ui(13.0)),
+            ))
+            .clicked()
+        {
+            ui.ctx().data_mut(|d| d.insert_temp(modal_id, true));
+        }
+        ui.label(
+            RichText::new("Help guide — pick a type to pre-fill this config.")
+                .font(font_ui(11.5))
+                .color(p.muted),
+        );
+    });
+    ui.add_space(6.0);
     ui.label(
         RichText::new("Engine evaluation for these blocks ships next — configuration is live.")
             .font(font_ui(11.5))
             .color(p.muted),
     );
+
+    let mut open = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(modal_id))
+        .unwrap_or(false);
+    // One-shot: `PB_SHOT_CALC_TYPES=1` opens the guide for screenshots.
+    if !open && std::env::var_os("PB_SHOT_CALC_TYPES").is_some() {
+        open = true;
+        ui.ctx().data_mut(|d| d.insert_temp(modal_id, true));
+    }
+    if open {
+        let mut pick = None;
+        let mut still_open = open;
+        egui::Window::new("Calculation types")
+            .id(Id::new(("pb_calc_types_win", step_id)))
+            .open(&mut still_open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([920.0, 640.0])
+            .min_width(720.0)
+            .min_height(420.0)
+            .show(ui.ctx(), |ui| {
+                ui.label(
+                    RichText::new(
+                        "Twelve operator-ready blocks. Click a type to apply it and pre-fill \
+configuration from the example. Types marked time use a window or time constant.",
+                    )
+                    .font(font_ui(13.0))
+                    .color(p.text),
+                );
+                ui.add_space(14.0);
+                egui::ScrollArea::vertical()
+                    .id_salt(("pb_calc_types_scroll", step_id))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let gap = 12.0;
+                        let col_w = ((ui.available_width() - gap * 2.0) / 3.0).max(200.0);
+                        for row in CALC_KINDS.chunks(3) {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                for kind in row {
+                                    let active = step.calc_kind == kind.id;
+                                    ui.allocate_ui_with_layout(
+                                        Vec2::new(col_w, 0.0),
+                                        Layout::top_down(Align::Min),
+                                        |ui| {
+                                            ui.set_min_width(col_w);
+                                            ui.set_max_width(col_w);
+                                            if catalog_card(ui, kind, active, p) {
+                                                pick = Some(kind.id);
+                                            }
+                                        },
+                                    );
+                                }
+                            });
+                            ui.add_space(gap);
+                        }
+                    });
+            });
+        if let Some(id) = pick {
+            if let Some(kind) = kind_by_id(id) {
+                apply_kind_example(step, kind);
+                dirty = true;
+            }
+            still_open = false;
+        }
+        open = still_open;
+        ui.ctx().data_mut(|d| d.insert_temp(modal_id, open));
+    }
+
     dirty
 }
 
 fn heading(ui: &mut egui::Ui, title: &str, color: Color32, _p: &ThemePalette) {
     ui.label(RichText::new(title).font(font_semi(14.0)).color(color));
-}
-
-fn path_diagram(ui: &mut egui::Ui, p: &ThemePalette) {
-    let full = ui.available_width().max(200.0);
-    let h = 52.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(full, h), Sense::hover());
-    let painter = ui.painter();
-    let y = rect.center().y;
-    let pad = 8.0;
-    let box_w = ((full - pad * 4.0) / 3.0).clamp(56.0, 120.0);
-    let boxes = [
-        ("Input / node", rect.min.x + pad),
-        ("Calculation", rect.min.x + pad * 2.0 + box_w),
-        ("Output", rect.min.x + pad * 3.0 + box_w * 2.0),
-    ];
-    for (i, (label, x)) in boxes.iter().enumerate() {
-        let r = egui::Rect::from_min_size(egui::pos2(*x, y - 16.0), Vec2::new(box_w, 32.0));
-        let fill = if i == 1 {
-            Color32::from_rgba_unmultiplied(p.accent.r(), p.accent.g(), p.accent.b(), 40)
-        } else {
-            p.control
-        };
-        painter.rect_filled(r, 6.0, fill);
-        painter.rect_stroke(r, 6.0, egui::Stroke::new(1.0, p.line));
-        painter.text(
-            r.center(),
-            egui::Align2::CENTER_CENTER,
-            *label,
-            font_ui(11.0),
-            p.text,
-        );
-        if i < 2 {
-            let x0 = r.max.x + 3.0;
-            let x1 = boxes[i + 1].1 - 3.0;
-            painter.line_segment(
-                [egui::pos2(x0, y), egui::pos2(x1, y)],
-                egui::Stroke::new(1.5, p.muted),
-            );
-        }
-    }
 }
 
 fn catalog_card(ui: &mut egui::Ui, kind: &CalcKind, active: bool, p: &ThemePalette) -> bool {
@@ -248,13 +313,13 @@ fn catalog_card(ui: &mut egui::Ui, kind: &CalcKind, active: bool, p: &ThemePalet
         .fill(fill)
         .stroke(stroke)
         .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(kind.name)
-                        .font(font_semi(13.0))
+                        .font(font_semi(13.5))
                         .color(if active { p.accent } else { p.text }),
                 );
                 if kind.time_based {
@@ -267,12 +332,12 @@ fn catalog_card(ui: &mut egui::Ui, kind: &CalcKind, active: bool, p: &ThemePalet
                     }
                 });
             });
-            ui.add_space(3.0);
-            ui.label(RichText::new(kind.blurb).font(font_ui(11.5)).color(p.muted));
-            ui.add_space(3.0);
+            ui.add_space(4.0);
+            ui.label(RichText::new(kind.blurb).font(font_ui(12.0)).color(p.muted));
+            ui.add_space(4.0);
             ui.label(
                 RichText::new(format!("Example · {}", kind.example))
-                    .font(font_ui(11.0))
+                    .font(font_ui(11.5))
                     .color(p.text),
             );
         });
@@ -287,7 +352,6 @@ fn detail_editor(
     p: &ThemePalette,
 ) -> bool {
     let mut dirty = false;
-    ui.add_space(6.0);
     heading(ui, "Configure", p.accent, p);
     ui.add_space(6.0);
     ui.label(
