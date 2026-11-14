@@ -2836,14 +2836,17 @@ fn edit_mqtt_port_binds(
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let point_w = (ui.available_width() * 0.28).clamp(72.0, 140.0);
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut bind.point)
-                                .desired_width(point_w)
-                                .hint_text("point"),
-                        )
-                        .changed()
-                    {
+                    // Focus buffer: commit on blur only — per-keystroke dirty
+                    // reconfigures the pack and publishes partial topic roots
+                    // into MQTT Explorer (TopicBench sim panel fix).
+                    if let Some(next) = buffered_line_edit(
+                        ui,
+                        ("pb_out_point", hub_id, port_id, i),
+                        &bind.point,
+                        "point",
+                        point_w,
+                    ) {
+                        bind.point = next;
                         change.dirty = true;
                     }
                     ui.label(
@@ -2852,14 +2855,14 @@ fn edit_mqtt_port_binds(
                             .color(p.muted),
                     );
                     let topic_w = (ui.available_width() - 120.0).max(80.0);
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut bind.topic)
-                                .desired_width(topic_w)
-                                .hint_text("topic"),
-                        )
-                        .changed()
-                    {
+                    if let Some(next) = buffered_line_edit(
+                        ui,
+                        ("pb_out_topic", hub_id, port_id, i),
+                        &bind.topic,
+                        "topic",
+                        topic_w,
+                    ) {
+                        bind.topic = next;
                         change.dirty = true;
                     }
                     let mut qos = bind.qos;
@@ -2969,6 +2972,41 @@ fn inspect_field(ui: &mut Ui, label: &str, value: &mut String, p: &ThemePalette)
         ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
     });
     ui.add_space(2.0);
+}
+
+/// Single-line edit that keeps keystrokes in a focus buffer and returns the
+/// new value only on blur (Enter). Avoids dripping partial MQTT topics into
+/// Explorer while the operator types (ported from TopicBench Simulation).
+fn buffered_line_edit(
+    ui: &mut Ui,
+    salt: impl std::hash::Hash,
+    committed: &str,
+    hint: &str,
+    width: f32,
+) -> Option<String> {
+    let buf_id = Id::new(("pb_line_buf", &salt));
+    let edit_id = Id::new(("pb_line_edit", &salt));
+    let mut text = ui
+        .ctx()
+        .data(|d| d.get_temp::<String>(buf_id))
+        .unwrap_or_else(|| committed.to_string());
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut text)
+            .id(edit_id)
+            .desired_width(width)
+            .hint_text(hint),
+    );
+    if resp.has_focus() {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(buf_id, text.clone()));
+    }
+    if resp.lost_focus() {
+        ui.ctx().data_mut(|d| d.remove_temp::<String>(buf_id));
+        if text != committed {
+            return Some(text);
+        }
+    }
+    None
 }
 
 fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
