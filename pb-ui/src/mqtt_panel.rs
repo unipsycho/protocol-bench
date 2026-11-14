@@ -32,10 +32,24 @@ fn default_broker_listen_port() -> u16 {
     1883
 }
 
-/// Single-project embedded MQTT broker (LAN listen). No live egress yet.
+fn default_broker_id() -> String {
+    "hub".into()
+}
+
+fn default_broker_name() -> String {
+    "Hub broker".into()
+}
+
+/// Single-project embedded MQTT broker (LAN listen).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddedBrokerConfig {
-    /// When true, UI intends the broker to run (start/stop wired later).
+    /// Stable connection id for Output/Input pickers (`mqtt_connection`).
+    #[serde(default = "default_broker_id")]
+    pub id: String,
+    /// Display name in pickers and the MQTT panel.
+    #[serde(default = "default_broker_name")]
+    pub name: String,
+    /// When true, UI intends the broker to run (Start still required).
     #[serde(default)]
     pub enabled: bool,
     /// Listen address — LAN default `0.0.0.0`.
@@ -51,10 +65,42 @@ pub struct EmbeddedBrokerConfig {
 impl Default for EmbeddedBrokerConfig {
     fn default() -> Self {
         Self {
+            id: default_broker_id(),
+            name: default_broker_name(),
             enabled: false,
             bind: default_broker_bind(),
             port: default_broker_listen_port(),
             users: Vec::new(),
+        }
+    }
+}
+
+impl EmbeddedBrokerConfig {
+    pub fn connection_id(&self) -> &str {
+        let id = self.id.trim();
+        if id.is_empty() {
+            "hub"
+        } else {
+            id
+        }
+    }
+
+    pub fn display_name(&self) -> &str {
+        let name = self.name.trim();
+        if name.is_empty() {
+            "Hub broker"
+        } else {
+            name
+        }
+    }
+
+    /// Host clients use to reach this listener (loopback when bind is all-interfaces).
+    pub fn client_host(&self) -> String {
+        let b = self.bind.trim();
+        if b.is_empty() || b == "0.0.0.0" || b == "::" || b == "[::]" {
+            "127.0.0.1".into()
+        } else {
+            b.to_string()
         }
     }
 }
@@ -158,18 +204,23 @@ impl MqttPanelState {
         self.selected.and_then(|i| self.clients.get_mut(i))
     }
 
+    /// Embedded hub broker first, then external Clients (for Input/Output pickers).
     pub fn connection_choices(&self) -> Vec<(String, String)> {
-        self.clients
-            .iter()
-            .map(|c| {
-                let label = if c.label.is_empty() {
-                    c.id.clone()
-                } else {
-                    c.label.clone()
-                };
-                (c.id.clone(), label)
-            })
-            .collect()
+        let hub_id = self.embedded.connection_id().to_string();
+        let hub_label = format!("{} (embedded)", self.embedded.display_name());
+        let mut out = vec![(hub_id.clone(), hub_label)];
+        for c in &self.clients {
+            if c.id == hub_id {
+                continue;
+            }
+            let label = if c.label.is_empty() {
+                c.id.clone()
+            } else {
+                c.label.clone()
+            };
+            out.push((c.id.clone(), label));
+        }
+        out
     }
 
     /// Refresh topic trees from pack traffic, merged with live point sources.
@@ -219,9 +270,10 @@ impl MqttPanelState {
     }
 
     fn unique_id(&self, base: &str) -> String {
+        let hub = self.embedded.connection_id();
         let mut id = base.to_string();
         let mut n = 2;
-        while self.clients.iter().any(|c| c.id == id) {
+        while id == hub || self.clients.iter().any(|c| c.id == id) {
             id = format!("{base}-{n}");
             n += 1;
         }
@@ -262,77 +314,131 @@ pub fn fresh_mqtt_client_id(conn_id: &str) -> String {
 
 /// Push multi-client document to the MQTT pack.
 /// Hub Input/Output nodes supply parse/output binds; panel subscriptions are optional wide filters.
+/// Embedded hub broker appears as a synthetic client so Outputs can publish to it.
 pub fn apply_mqtt_session(engine: &EngineHandle, state: &mut MqttPanelState, hubs: &HubModel) {
     state.ensure_unique_mqtt_client_ids();
-    let clients: Vec<serde_json::Value> = state
+    let hub_id = state.embedded.connection_id().to_string();
+    let mut clients: Vec<serde_json::Value> = state
         .clients
         .iter()
-        .map(|c| {
-            let port: u16 = c.port.parse().unwrap_or(1883);
-            let (hub_inputs, hub_outs, extra_subs) = hubs.mqtt_binds_for_connection(&c.id);
-            let mut rules: Vec<MqttParseRule> = hub_inputs
-                .into_iter()
-                .map(|b| MqttParseRule {
-                    topic: b.topic,
-                    path: b.path,
-                    point: b.point,
-                })
-                .collect();
-            let mut outs: Vec<MqttOutput> = hub_outs
-                .into_iter()
-                .map(|b| MqttOutput {
-                    point: b.point,
-                    topic: b.topic,
-                    qos: b.qos,
-                    retain: b.retain,
-                })
-                .collect();
-            // Legacy client-level binds (pre hub-node reshape) still apply until migrated.
-            for r in &c.parse_rules {
-                if !rules.iter().any(|x| x == r) {
-                    rules.push(r.clone());
-                }
-            }
-            for o in &c.outputs {
-                if !outs.iter().any(|x| x == o) {
-                    outs.push(o.clone());
-                }
-            }
-            let mut subscriptions = c.subscriptions.clone();
-            for t in extra_subs {
-                if !t.is_empty() && !subscriptions.iter().any(|s| s == &t) {
-                    subscriptions.push(t);
-                }
-            }
+        .filter(|c| c.id != hub_id)
+        .map(|c| client_configure_json(c, hubs))
+        .collect();
+    // Synthetic client → localhost (or bind) so Output binds can target the hub broker.
+    clients.insert(0, embedded_configure_json(state, hubs));
+    let json = serde_json::json!({ "clients": clients }).to_string();
+    engine.submit(EngineId::Mqtt, EngineCommand::Configure { json });
+}
+
+fn client_configure_json(c: &MqttClient, hubs: &HubModel) -> serde_json::Value {
+    let port: u16 = c.port.parse().unwrap_or(1883);
+    let (hub_inputs, hub_outs, extra_subs) = hubs.mqtt_binds_for_connection(&c.id);
+    let mut rules: Vec<MqttParseRule> = hub_inputs
+        .into_iter()
+        .map(|b| MqttParseRule {
+            topic: b.topic,
+            path: b.path,
+            point: b.point,
+        })
+        .collect();
+    let mut outs: Vec<MqttOutput> = hub_outs
+        .into_iter()
+        .map(|b| MqttOutput {
+            point: b.point,
+            topic: b.topic,
+            qos: b.qos,
+            retain: b.retain,
+        })
+        .collect();
+    for r in &c.parse_rules {
+        if !rules.iter().any(|x| x == r) {
+            rules.push(r.clone());
+        }
+    }
+    for o in &c.outputs {
+        if !outs.iter().any(|x| x == o) {
+            outs.push(o.clone());
+        }
+    }
+    let mut subscriptions = c.subscriptions.clone();
+    for t in extra_subs {
+        if !t.is_empty() && !subscriptions.iter().any(|s| s == &t) {
+            subscriptions.push(t);
+        }
+    }
+    serde_json::json!({
+        "id": c.id,
+        "label": c.label,
+        "host": c.host,
+        "port": port,
+        "client_id": c.client_id,
+        "unique_client_id": c.unique_client_id,
+        "username": c.username,
+        "password": c.password,
+        "transport": c.transport,
+        "keep_alive_secs": 30,
+        "subscriptions": subscriptions,
+        "parse_rules": rules.iter().map(|r| serde_json::json!({
+            "topic": r.topic,
+            "path": r.path,
+            "point": r.point,
+        })).collect::<Vec<_>>(),
+        "outputs": outs.iter().map(|o| serde_json::json!({
+            "point": o.point,
+            "topic": o.topic,
+            "qos": o.qos,
+            "retain": o.retain,
+        })).collect::<Vec<_>>(),
+        "auto_connect": c.auto_connect,
+    })
+}
+
+fn embedded_configure_json(state: &MqttPanelState, hubs: &HubModel) -> serde_json::Value {
+    let id = state.embedded.connection_id();
+    let (hub_inputs, hub_outs, extra_subs) = hubs.mqtt_binds_for_connection(id);
+    let rules: Vec<_> = hub_inputs
+        .into_iter()
+        .map(|b| {
             serde_json::json!({
-                "id": c.id,
-                "label": c.label,
-                "host": c.host,
-                "port": port,
-                "client_id": c.client_id,
-                "unique_client_id": c.unique_client_id,
-                "username": c.username,
-                "password": c.password,
-                "transport": c.transport,
-                "keep_alive_secs": 30,
-                "subscriptions": subscriptions,
-                "parse_rules": rules.iter().map(|r| serde_json::json!({
-                    "topic": r.topic,
-                    "path": r.path,
-                    "point": r.point,
-                })).collect::<Vec<_>>(),
-                "outputs": outs.iter().map(|o| serde_json::json!({
-                    "point": o.point,
-                    "topic": o.topic,
-                    "qos": o.qos,
-                    "retain": o.retain,
-                })).collect::<Vec<_>>(),
-                "auto_connect": c.auto_connect,
+                "topic": b.topic,
+                "path": b.path,
+                "point": b.point,
             })
         })
         .collect();
-    let json = serde_json::json!({ "clients": clients }).to_string();
-    engine.submit(EngineId::Mqtt, EngineCommand::Configure { json });
+    let outs: Vec<_> = hub_outs
+        .into_iter()
+        .map(|b| {
+            serde_json::json!({
+                "point": b.point,
+                "topic": b.topic,
+                "qos": b.qos,
+                "retain": b.retain,
+            })
+        })
+        .collect();
+    let (username, password) = state
+        .embedded
+        .users
+        .first()
+        .map(|u| (u.username.clone(), u.password.clone()))
+        .unwrap_or_default();
+    serde_json::json!({
+        "id": id,
+        "label": state.embedded.display_name(),
+        "host": state.embedded.client_host(),
+        "port": state.embedded.port,
+        "client_id": format!("pb-embed-{id}"),
+        "unique_client_id": false,
+        "username": username,
+        "password": password,
+        "transport": "tcp",
+        "keep_alive_secs": 30,
+        "subscriptions": extra_subs,
+        "parse_rules": rules,
+        "outputs": outs,
+        "auto_connect": state.broker_running,
+    })
 }
 
 pub fn paint(
@@ -381,7 +487,7 @@ fn paint_body(
         ui.add_space(8.0);
     }
 
-    edit_embedded_broker(ui, state, engine, p);
+    edit_embedded_broker(ui, state, engine, hubs, p);
     ui.add_space(18.0);
     panel_heading(ui, "External brokers / connections", p.live, p);
     ui.add_space(4.0);
@@ -678,6 +784,7 @@ fn edit_embedded_broker(
     ui: &mut egui::Ui,
     state: &mut MqttPanelState,
     engine: &EngineHandle,
+    hubs: &HubModel,
     p: &ThemePalette,
 ) {
     panel_heading(ui, "Embedded hub broker", p.accent, p);
@@ -697,6 +804,13 @@ fn edit_embedded_broker(
         // Persist only — Start still required to listen.
     }
     ui.add_space(4.0);
+    {
+        let mut name = state.embedded.name.clone();
+        field(ui, "Name", &mut name, p);
+        if name != state.embedded.name {
+            state.embedded.name = name;
+        }
+    }
     {
         let mut bind = state.embedded.bind.clone();
         field(ui, "Bind", &mut bind, p);
@@ -811,14 +925,14 @@ fn edit_embedded_broker(
         .inner
     };
     if start {
-        start_embedded_broker(engine, state);
+        start_embedded_broker(engine, state, hubs);
     }
     if stop {
-        stop_embedded_broker(engine, state);
+        stop_embedded_broker(engine, state, hubs);
     }
 }
 
-fn start_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState) {
+fn start_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState, hubs: &HubModel) {
     let users: Vec<serde_json::Value> = state
         .embedded
         .users
@@ -858,17 +972,21 @@ fn start_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState) {
     if ok {
         state.broker_running = true;
         state.broker_status = format!("Listening on {addr}");
+        // Connect Output/Input binds that target the hub broker.
+        apply_mqtt_session(engine, state, hubs);
     } else {
         state.broker_running = false;
         state.broker_status = format!("Could not confirm listen on {addr}");
     }
 }
 
-fn stop_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState) {
+fn stop_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState, hubs: &HubModel) {
     let json = serde_json::json!({ "op": "broker_stop" }).to_string();
     engine.submit(EngineId::Mqtt, EngineCommand::Configure { json });
     state.broker_running = false;
     state.broker_status = "Stopped".into();
+    // Drop auto_connect on the synthetic hub client.
+    apply_mqtt_session(engine, state, hubs);
 }
 
 fn section(ui: &mut egui::Ui, label: &str, p: &ThemePalette) {

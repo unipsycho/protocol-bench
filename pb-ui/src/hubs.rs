@@ -2747,7 +2747,7 @@ fn edit_mqtt_port_binds(
         ui.add_space(2.0);
         ui.label(
             egui::RichText::new(
-                "Publish path uses the connection above (Clients). Live egress / throttle come later.",
+                "Publish via the connection above — hub broker (embedded) or an external Client.",
             )
             .font(font_ui(11.0))
             .color(p.muted),

@@ -512,6 +512,8 @@ mod tests {
     fn multi_client_roundtrip() {
         let mut panel = MqttPanelState::default();
         panel.clients[0].host = "broker.local".into();
+        panel.embedded.id = "hub".into();
+        panel.embedded.name = "Plant hub".into();
         panel.embedded.enabled = true;
         panel.embedded.bind = "0.0.0.0".into();
         panel.embedded.port = 1884;
@@ -535,6 +537,8 @@ mod tests {
         assert_eq!(back.points[0].id, "mqtt_1");
         assert!(back.mqtt.embedded.enabled);
         assert_eq!(back.mqtt.embedded.port, 1884);
+        assert_eq!(back.mqtt.embedded.name, "Plant hub");
+        assert_eq!(back.mqtt.embedded.id, "hub");
         assert_eq!(back.mqtt.embedded.users[0].username, "ops");
     }
 
@@ -545,7 +549,18 @@ mod tests {
         assert!(!back.mqtt.embedded.enabled);
         assert_eq!(back.mqtt.embedded.bind, "0.0.0.0");
         assert_eq!(back.mqtt.embedded.port, 1883);
+        assert_eq!(back.mqtt.embedded.id, "hub");
+        assert_eq!(back.mqtt.embedded.name, "Hub broker");
         assert!(back.mqtt.embedded.users.is_empty());
+    }
+
+    #[test]
+    fn connection_choices_list_embedded_first() {
+        let panel = MqttPanelState::default();
+        let choices = panel.connection_choices();
+        assert_eq!(choices[0].0, "hub");
+        assert!(choices[0].1.contains("Hub broker"));
+        assert!(choices.iter().any(|(id, _)| id == "local"));
     }
 
     #[test]

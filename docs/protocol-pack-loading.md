@@ -62,7 +62,7 @@ If Mosquitto is not installed, start any broker on `127.0.0.1:1883`, then use th
 Editable wire config (not dock layout). Default path: `…/ProtocolBench/project.json` (via `directories` — e.g. `~/.config/protocolbench/project.json`). File → Open / Save as project uses a path dialog (non-blocking). MQTT panel and hub Input/Output bind changes autosave here.
 
 - **`mqtt.clients[]`** — connections + wide subscribe only (no Inputs/Outputs editors on the panel).  
-- **`mqtt.embedded`** — single hub broker listen config (bind/port/Connect users). MQTT panel Start/Stop runs rumqttd. Absent on older files → defaults (`0.0.0.0:1883`, disabled).  
+- **`mqtt.embedded`** — single hub broker (`id`/`name`/bind/port/Connect users). Listed in Output/Input connection pickers; MQTT panel Start/Stop runs rumqttd. Absent on older files → defaults (`id=hub`, `name=Hub broker`, `0.0.0.0:1883`, disabled).  
 - **`hubs`** — diagram + per-port `mqtt_connection` / `mqtt_inputs` / `mqtt_outputs` (v4+). Older files without `hubs` keep the diagram from `ui.toml` until the next save.  
 - **`points` / `next_point_seq`** — short id bindings.
 
@@ -77,6 +77,8 @@ Editable wire config (not dock layout). Default path: `…/ProtocolBench/project
   "mqtt": {
     "selected_id": "local",
     "embedded": {
+      "id": "hub",
+      "name": "Hub broker",
       "enabled": false,
       "bind": "0.0.0.0",
       "port": 1883,
