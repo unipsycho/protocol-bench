@@ -13,7 +13,6 @@ use crate::brand_logo::AaLogoCache;
 use crate::dnd::{self, DropCommit, PaneHit};
 use crate::dock::DockPane;
 use crate::layout::{LayoutNode, SplitDir, TabGroup};
-use crate::calc_panel::CalcPanelState;
 use crate::mqtt_panel::{self, MqttPanelState};
 use crate::panels::PointsPanelState;
 use crate::panels;
@@ -46,7 +45,6 @@ pub struct ProtocolBenchApp {
     last_save: Instant,
     mqtt: MqttPanelState,
     points: PointsPanelState,
-    calc: CalcPanelState,
     /// Project-level options (Project panel / project.json).
     project_settings: ProjectSettings,
     /// Last settings snapshot written to the project file.
@@ -161,7 +159,6 @@ impl ProtocolBenchApp {
             last_save: Instant::now(),
             mqtt,
             points: PointsPanelState::default(),
-            calc: CalcPanelState::default(),
             project_settings,
             settings_saved,
             project_path,
@@ -1288,7 +1285,6 @@ impl ProtocolBenchApp {
                 &self.engine,
                 &mut self.mqtt,
                 &mut self.points,
-                &mut self.calc,
                 &mut self.project_settings,
                 &self.project_path,
             );

@@ -5,7 +5,6 @@ use egui::{Align2, Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
 use pb_engine::{EngineHandle, HostSnapshot};
 
 use crate::art;
-use crate::calc_panel::{self, CalcPanelState};
 use crate::dock::DockPane;
 use crate::hubs::HubModel;
 use crate::mqtt_panel::{self, MqttPanelState};
@@ -39,7 +38,6 @@ pub fn paint(
     engine: &EngineHandle,
     mqtt: &mut MqttPanelState,
     points: &mut PointsPanelState,
-    calc: &mut CalcPanelState,
     settings: &mut ProjectSettings,
     project_path: &std::path::Path,
 ) -> crate::hubs::HubChange {
@@ -60,12 +58,10 @@ pub fn paint(
             crate::hubs::HubChange::quiet()
         }
         DockPane::Calculations => {
-            let mut change = crate::hubs::HubChange::quiet();
-            if calc_panel::paint_panel(ui, hubs, calc, p) {
-                change.dirty = true;
-            }
-            change
-        } // hubs mut passed for Apply-to-selection
+            // Legacy leaf — sanitized out of the tree; keep match exhaustive.
+            scaffold_panel(ui, pane, host, p);
+            crate::hubs::HubChange::quiet()
+        }
         _ => {
             scaffold_panel(ui, pane, host, p);
             crate::hubs::HubChange::quiet()
@@ -201,9 +197,7 @@ fn blurb(pane: DockPane, host: &HostSnapshot) -> String {
     match pane {
         DockPane::Project => "Hubs, inputs, outputs, and edge transforms for this project.".into(),
         DockPane::Points => "Live values from every wired protocol input.".into(),
-        DockPane::Calculations => {
-            "Edge transforms between Input/node and Output — scale, filter, formula.".into()
-        }
+        DockPane::Calculations => "Moved into calculation node properties on the Hubs diagram.".into(),
         DockPane::Mappings => "A point that arrives on one link can leave on another.".into(),
         DockPane::Traffic => "Bytes and frames from every link, when capture exists.".into(),
         _ => String::new(),

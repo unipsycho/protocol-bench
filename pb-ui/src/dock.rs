@@ -11,6 +11,8 @@ pub enum DockPane {
     Project,
     Hubs,
     Points,
+    /// Removed from the rail; kept so older ui.toml layouts still deserialize.
+    #[serde(alias = "Calculations")]
     Calculations,
     Mappings,
     Traffic,
@@ -23,11 +25,10 @@ pub enum DockPane {
 
 impl DockPane {
     /// Rail order: bench views, then protocol links.
-    pub const ALL: [DockPane; 11] = [
+    pub const ALL: [DockPane; 10] = [
         DockPane::Project,
         DockPane::Hubs,
         DockPane::Points,
-        DockPane::Calculations,
         DockPane::Mappings,
         DockPane::Traffic,
         DockPane::Streams,

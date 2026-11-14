@@ -2366,6 +2366,11 @@ fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
         })
         .unwrap_or_else(|| "connection".into());
     let hub_name = hub.name.clone();
+    let calc_kind_name = hub
+        .calculations
+        .iter()
+        .find(|step| step.id == step_id)
+        .map(|step| crate::calc_panel::kind_label(step.calc_kind.as_str()).to_string());
     let mut change = HubChange::quiet();
     let kind = if aggregator {
         "AGGREGATOR"
@@ -2382,7 +2387,19 @@ fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
             .font(font_ui(12.0))
             .color(p.muted),
     );
+    if let Some(name) = &calc_kind_name {
+        ui.label(
+            egui::RichText::new(format!("Type · {name}"))
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+    }
     ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("NAME")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
     let label = &mut step_field(model, hub_id, step_id).label;
     if ui
         .add(egui::TextEdit::singleline(label).desired_width(f32::INFINITY))
@@ -2391,101 +2408,15 @@ fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
         change.dirty = true;
     }
     if !aggregator {
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("TYPE")
-                .font(font_ui(10.5))
-                .color(p.muted),
-        );
-        let step = step_field(model, hub_id, step_id);
-        let mut kind_id = step.calc_kind.clone();
-        egui::ComboBox::from_id_salt(("calc_kind", step_id))
-            .selected_text(crate::calc_panel::kind_label(&kind_id))
-            .width(ui.available_width().max(120.0))
-            .show_ui(ui, |ui| {
-                for k in crate::calc_panel::CALC_KINDS {
-                    if ui
-                        .selectable_label(kind_id == k.id, k.name)
-                        .clicked()
-                    {
-                        kind_id = k.id.into();
-                    }
-                }
-            });
-        let step = step_field(model, hub_id, step_id);
-        if step.calc_kind != kind_id {
-            step.calc_kind = kind_id;
+        // Full catalog + params live on the calculation node (not a dock pane).
+        ui.add_space(12.0);
+        if crate::calc_panel::paint_node_props(ui, step_field(model, hub_id, step_id), p) {
             change.dirty = true;
         }
-        ui.add_space(6.0);
-        let step = step_field(model, hub_id, step_id);
-        let is_formula = step.calc_kind == "formula";
-        let is_time = matches!(
-            step.calc_kind.as_str(),
-            "rolling_avg" | "ema" | "rate_of_change" | "min_max_hold" | "time_window"
-        );
-        if is_formula {
-            ui.label(
-                egui::RichText::new("FORMULA")
-                    .font(font_ui(10.5))
-                    .color(p.muted),
-            );
-            let formula = &mut step_field(model, hub_id, step_id).formula;
-            if ui
-                .add(
-                    egui::TextEdit::multiline(formula)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(2),
-                )
-                .changed()
-            {
-                change.dirty = true;
-            }
-        } else {
-            if is_time {
-                ui.label(
-                    egui::RichText::new("WINDOW (s)")
-                        .font(font_ui(10.5))
-                        .color(p.muted),
-                );
-                let window = &mut step_field(model, hub_id, step_id).window_secs;
-                if ui
-                    .add(egui::TextEdit::singleline(window).desired_width(f32::INFINITY))
-                    .changed()
-                {
-                    change.dirty = true;
-                }
-                ui.add_space(4.0);
-            }
-            ui.label(
-                egui::RichText::new("PARAM A")
-                    .font(font_ui(10.5))
-                    .color(p.muted),
-            );
-            let a = &mut step_field(model, hub_id, step_id).param_a;
-            if ui
-                .add(egui::TextEdit::singleline(a).desired_width(f32::INFINITY))
-                .changed()
-            {
-                change.dirty = true;
-            }
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("PARAM B")
-                    .font(font_ui(10.5))
-                    .color(p.muted),
-            );
-            let b = &mut step_field(model, hub_id, step_id).param_b;
-            if ui
-                .add(egui::TextEdit::singleline(b).desired_width(f32::INFINITY))
-                .changed()
-            {
-                change.dirty = true;
-            }
-        }
-        ui.add_space(6.0);
+    } else {
+        ui.add_space(8.0);
         ui.label(
-            egui::RichText::new("Open the Calculations panel for the full type catalog.")
+            egui::RichText::new("Aggregator options are plan-only for now — name and edge only.")
                 .font(font_ui(11.5))
                 .color(p.muted),
         );
