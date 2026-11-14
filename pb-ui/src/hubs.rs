@@ -643,23 +643,6 @@ impl HubModel {
         self.selected_link = Some(port_id);
     }
 
-    /// Hub + port edge currently targeted for Add aggregator / calculation.
-    pub fn transform_edge(&self) -> Option<(u64, u64)> {
-        let hub_id = self.selected?;
-        let hub = self.hub(hub_id)?;
-        if let Some(link) = self.selected_link {
-            if hub.has_port(link) {
-                return Some((hub_id, link));
-            }
-        }
-        let port_id = self.selected_port?;
-        if hub.has_port(port_id) {
-            Some((hub_id, port_id))
-        } else {
-            None
-        }
-    }
-
     /// Remember a dragged center. `port_id` none moves the hub.
     pub fn set_center(&mut self, hub_id: u64, port_id: Option<u64>, center: [f32; 2]) {
         if let Some(port_id) = port_id {
@@ -887,6 +870,27 @@ impl HubModel {
                 return None;
             }
         }
+        self.push_step(hub_id, aggregator, edge_port, None)
+    }
+
+    /// Free-floating calc/agg at a world point — wire from a Hub later (PB-84).
+    pub fn add_orphan_step(
+        &mut self,
+        hub_id: u64,
+        aggregator: bool,
+        at: Option<[f32; 2]>,
+    ) -> Option<u64> {
+        let _ = self.hub(hub_id)?;
+        self.push_step(hub_id, aggregator, 0, at)
+    }
+
+    fn push_step(
+        &mut self,
+        hub_id: u64,
+        aggregator: bool,
+        edge_port: u64,
+        at: Option<[f32; 2]>,
+    ) -> Option<u64> {
         let id = self.alloc();
         let Some(hub) = self.hub_mut(hub_id) else {
             return None;
@@ -899,7 +903,7 @@ impl HubModel {
                 "Calculation".into()
             },
             edge_port,
-            at: None,
+            at,
             calc_kind: default_calc_kind(),
             formula: String::new(),
             param_a: "1.0".into(),
@@ -2059,7 +2063,7 @@ fn diagram_view(
             font_ui(14.0),
             p.muted,
         );
-        if let Some(cmd) = canvas_menu(&canvas, None, None, None) {
+        if let Some(cmd) = canvas_menu(&canvas, None, None, None, None) {
             apply_menu(model, cmd, &mut change);
         }
         return change;
@@ -2387,15 +2391,33 @@ fn diagram_view(
     let target = model
         .selected
         .or_else(|| model.hubs.first().map(|hub| hub.id));
-    // Prefer the hovered connection; else the already-selected edge.
-    let edge = gesture.hot_link.or_else(|| model.transform_edge());
+    // Wire under pointer only — empty-canvas RMB places orphans at the click (PB-84).
+    let edge = gesture.hot_link;
     let feed_for_menu = feed_hit.or(model.selected_feed);
+    // Stash world click so Add calculation/aggregator lands under the pointer.
+    let menu_world_id = Id::new("pb_hub_menu_world");
+    if canvas.secondary_clicked() {
+        if let Some(pos) = canvas.interact_pointer_pos() {
+            let z = zoom.max(0.0001);
+            let world = (pos.to_vec2() - area.min.to_vec2() - cam) / z;
+            child.ctx().data_mut(|d| {
+                d.insert_temp(
+                    menu_world_id,
+                    [world.x.max(24.0), world.y.max(24.0)],
+                );
+            });
+        }
+    }
+    let orphan_at = child.ctx().data(|d| d.get_temp::<[f32; 2]>(menu_world_id));
     let menu =
         gesture
             .menu
-            .or_else(|| canvas_menu(&canvas, target, edge, feed_for_menu));
+            .or_else(|| canvas_menu(&canvas, target, edge, feed_for_menu, orphan_at));
     if let Some(cmd) = menu {
         apply_menu(model, cmd, &mut change);
+        child
+            .ctx()
+            .data_mut(|d| d.remove_temp::<[f32; 2]>(menu_world_id));
     }
     let nodes = scale_nodes(&layout_nodes(&model.hubs), zoom);
     let screen: Vec<Placed> = nodes
@@ -2654,6 +2676,9 @@ fn canvas_pan_delta(ui: &Ui, rect: Rect) -> Option<Vec2> {
 enum MenuCmd {
     AddAggregator { hub_id: u64, edge_port: u64 },
     AddCalculation { hub_id: u64, edge_port: u64 },
+    /// Free-floating transform at a world point (PB-84).
+    AddOrphanAggregator { hub_id: u64, at: Option<[f32; 2]> },
+    AddOrphanCalculation { hub_id: u64, at: Option<[f32; 2]> },
     AddSource(u64),
     AddOutput(u64),
     NewHub,
@@ -2673,6 +2698,18 @@ fn apply_menu(model: &mut HubModel, cmd: MenuCmd, change: &mut HubChange) {
         }
         MenuCmd::AddCalculation { hub_id, edge_port } => {
             if let Some(step_id) = model.add_step(hub_id, false, edge_port) {
+                model.focus_port(hub_id, step_id);
+                change.dirty = true;
+            }
+        }
+        MenuCmd::AddOrphanAggregator { hub_id, at } => {
+            if let Some(step_id) = model.add_orphan_step(hub_id, true, at) {
+                model.focus_port(hub_id, step_id);
+                change.dirty = true;
+            }
+        }
+        MenuCmd::AddOrphanCalculation { hub_id, at } => {
+            if let Some(step_id) = model.add_orphan_step(hub_id, false, at) {
                 model.focus_port(hub_id, step_id);
                 change.dirty = true;
             }
@@ -2727,6 +2764,23 @@ fn edge_transform_menu(ui: &mut Ui, hub_id: u64, edge_port: u64, cmd: &mut Optio
     }
 }
 
+/// Free-floating calc/agg — place at click or beside the hub (PB-84).
+fn orphan_transform_menu(
+    ui: &mut Ui,
+    hub_id: u64,
+    at: Option<[f32; 2]>,
+    cmd: &mut Option<MenuCmd>,
+) {
+    if ui.button("Add aggregator").clicked() {
+        *cmd = Some(MenuCmd::AddOrphanAggregator { hub_id, at });
+        ui.close_menu();
+    }
+    if ui.button("Add calculation").clicked() {
+        *cmd = Some(MenuCmd::AddOrphanCalculation { hub_id, at });
+        ui.close_menu();
+    }
+}
+
 /// Hub port adds (source / output).
 fn hub_port_menu(ui: &mut Ui, hub_id: u64, cmd: &mut Option<MenuCmd>) {
     if ui.button("Add source").clicked() {
@@ -2739,12 +2793,13 @@ fn hub_port_menu(ui: &mut Ui, hub_id: u64, cmd: &mut Option<MenuCmd>) {
     }
 }
 
-/// Right-click empty canvas. Transforms only when an edge is already selected.
+/// Right-click empty canvas. Orphan Calc/Agg at the click; edge attaches only on a wire.
 fn canvas_menu(
     resp: &egui::Response,
     hub_id: Option<u64>,
     edge: Option<(u64, u64)>,
     feed: Option<usize>,
+    orphan_at: Option<[f32; 2]>,
 ) -> Option<MenuCmd> {
     let mut cmd = None;
     resp.context_menu(|ui| {
@@ -2758,7 +2813,12 @@ fn canvas_menu(
             ui.separator();
         }
         if let Some((hub_id, edge_port)) = edge {
+            // RMB on a hub↔port wire: attach to that edge.
             edge_transform_menu(ui, hub_id, edge_port, &mut cmd);
+            ui.separator();
+        } else if let Some(hub_id) = hub_id {
+            // PB-84: empty canvas → free-floating at the click.
+            orphan_transform_menu(ui, hub_id, orphan_at, &mut cmd);
             ui.separator();
         }
         if let Some(hub_id) = hub_id {
@@ -2907,6 +2967,9 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
                     delete_node_menu(ui, node.hub_id, node.port_id, &mut menu);
                 }
                 Role::Hub => {
+                    // PB-84: orphan transforms owned by this hub (wire later).
+                    orphan_transform_menu(ui, node.hub_id, None, &mut menu);
+                    ui.separator();
                     hub_port_menu(ui, node.hub_id, &mut menu);
                     ui.separator();
                     delete_node_menu(ui, node.hub_id, None, &mut menu);
@@ -4671,6 +4734,7 @@ fn navigation_help_chip(ui: &mut Ui, p: &ThemePalette) {
                 "Rewire: grab a cyan wire end and drop on another node",
                 "Box-select: drag on empty canvas",
                 "Delete / Backspace: remove selected nodes or the selected wire",
+                "Right-click empty canvas: Add calculation / aggregator at the click",
                 "Right-click: node/wire menus to add, modify, or Delete",
                 "Wheel zooms · Middle-drag or Space-drag pans",
             ] {
@@ -5073,6 +5137,31 @@ mod tests {
         assert!(calc_node.rect.center().x > left && calc_node.rect.center().x < right);
         assert!(open_target(&model, agg_node).is_none());
         assert!(model.add_step(1, true, 999).is_none());
+    }
+
+    #[test]
+    fn orphan_calc_and_agg_place_at_world_click() {
+        // PB-84: free-floating transforms at an explicit world point.
+        let mut model = HubModel::sample();
+        let at = [320.0, 180.0];
+        let calc = model.add_orphan_step(1, false, Some(at)).unwrap();
+        let agg = model.add_orphan_step(1, true, Some([400.0, 220.0])).unwrap();
+        let hub = model.hub(1).unwrap();
+        assert_eq!(hub.calculations.iter().find(|s| s.id == calc).unwrap().edge_port, 0);
+        assert_eq!(hub.aggregators.iter().find(|s| s.id == agg).unwrap().edge_port, 0);
+        assert_eq!(
+            hub.calculations.iter().find(|s| s.id == calc).unwrap().at,
+            Some(at)
+        );
+        let nodes = layout_nodes(&model.hubs);
+        let calc_node = nodes.iter().find(|n| n.port_id == Some(calc)).unwrap();
+        let agg_node = nodes.iter().find(|n| n.port_id == Some(agg)).unwrap();
+        assert_eq!(calc_node.role, Role::Calculation);
+        assert_eq!(agg_node.role, Role::Aggregator);
+        assert!((calc_node.rect.center().x - at[0]).abs() < 0.5);
+        assert!((calc_node.rect.center().y - at[1]).abs() < 0.5);
+        assert!((agg_node.rect.center().x - 400.0).abs() < 0.5);
+        assert!((agg_node.rect.center().y - 220.0).abs() < 0.5);
     }
 
     #[test]
