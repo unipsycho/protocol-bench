@@ -107,7 +107,8 @@ pub trait ProtocolEngine: Send {
     fn id(&self) -> EngineId;
     /// One idle turn. Must not block on I/O.
     fn poll(&mut self);
-    fn handle(&mut self, command: EngineCommand);
+    /// Handle a command. Returns `false` when the pack reported failure (e.g. not connected).
+    fn handle(&mut self, command: EngineCommand) -> bool;
     fn snapshot(&self) -> SlotSnapshot;
 }
 
@@ -137,7 +138,7 @@ impl ProtocolEngine for IdleEngine {
         self.ticks = self.ticks.saturating_add(1);
     }
 
-    fn handle(&mut self, command: EngineCommand) {
+    fn handle(&mut self, command: EngineCommand) -> bool {
         match command {
             EngineCommand::Acknowledge
             | EngineCommand::Configure { .. }
@@ -149,6 +150,7 @@ impl ProtocolEngine for IdleEngine {
                 self.commands_handled = self.commands_handled.saturating_add(1);
             }
         }
+        true
     }
 
     fn snapshot(&self) -> SlotSnapshot {
@@ -359,6 +361,10 @@ fn host_main(
     let pack_ids: Vec<String> = loaded.iter().map(|p| p.id.clone()).collect();
     let mut engines = build_engines(loaded);
     let thread_name = thread::current().name().unwrap_or("pb-engine").to_string();
+    // Last published `updated_ms` per short id — drives Output MQTT egress.
+    let mut egress_stamp: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut mqtt_was_connected = false;
 
     loop {
         let queued = match rx.recv_timeout(Duration::from_millis(200)) {
@@ -382,11 +388,46 @@ fn host_main(
         };
         if let Some((id, command)) = queued {
             if let Some(engine) = engines.iter_mut().find(|engine| engine.id() == id) {
-                engine.handle(command);
+                let _ = engine.handle(command);
             }
         }
         for engine in engines.iter_mut() {
             engine.poll();
+        }
+        // Live Output publish: when MQTT pack is connected, push changed points
+        // through write_point so hub/external Output binds egress.
+        let mqtt_connected = engines
+            .iter()
+            .find(|e| e.id() == EngineId::Mqtt)
+            .map(|e| e.snapshot().connected)
+            .unwrap_or(false);
+        if mqtt_connected {
+            let force_all = !mqtt_was_connected;
+            mqtt_was_connected = true;
+            let rows = points
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot();
+            if let Some(engine) = engines.iter_mut().find(|e| e.id() == EngineId::Mqtt) {
+                for p in rows {
+                    let prev = egress_stamp.get(&p.name).copied();
+                    if !force_all && prev == Some(p.updated_ms) {
+                        continue;
+                    }
+                    let value = p.value.as_display();
+                    let ok = engine.handle(EngineCommand::WritePoint {
+                        name: p.name.clone(),
+                        value,
+                    });
+                    // Only stamp on success so we retry until the hub client is up.
+                    if ok {
+                        egress_stamp.insert(p.name, p.updated_ms);
+                    }
+                }
+            }
+        } else {
+            mqtt_was_connected = false;
+            egress_stamp.clear();
         }
         publish(
             &snap,

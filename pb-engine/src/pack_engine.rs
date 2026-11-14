@@ -109,8 +109,9 @@ impl ProtocolEngine for PackEngine {
         }
     }
 
-    fn handle(&mut self, command: EngineCommand) {
+    fn handle(&mut self, command: EngineCommand) -> bool {
         self.commands_handled = self.commands_handled.saturating_add(1);
+        let mut ok = true;
         match command {
             EngineCommand::Acknowledge => {}
             EngineCommand::Configure { json } => {
@@ -119,18 +120,21 @@ impl ProtocolEngine for PackEngine {
                         configure(self.handle, json.as_ptr() as *const c_char, json.len())
                     };
                     self.call_i("configure", rc);
+                    ok = rc == 0;
                 }
             }
             EngineCommand::Connect => {
                 if let Some(connect) = self.pack.api.connect {
                     let rc = unsafe { connect(self.handle) };
                     self.call_i("connect", rc);
+                    ok = rc == 0;
                 }
             }
             EngineCommand::Disconnect => {
                 if let Some(disconnect) = self.pack.api.disconnect {
                     let rc = unsafe { disconnect(self.handle) };
                     self.call_i("disconnect", rc);
+                    ok = rc == 0;
                 }
             }
             EngineCommand::Subscribe { topic, qos } => {
@@ -139,8 +143,12 @@ impl ProtocolEngine for PackEngine {
                         Ok(c) => {
                             let rc = unsafe { subscribe(self.handle, c.as_ptr(), qos) };
                             self.call_i("subscribe", rc);
+                            ok = rc == 0;
                         }
-                        Err(_) => self.set_err("subscribe: topic contains NUL"),
+                        Err(_) => {
+                            self.set_err("subscribe: topic contains NUL");
+                            ok = false;
+                        }
                     }
                 }
             }
@@ -164,8 +172,12 @@ impl ProtocolEngine for PackEngine {
                                 )
                             };
                             self.call_i("publish", rc);
+                            ok = rc == 0;
                         }
-                        Err(_) => self.set_err("publish: topic contains NUL"),
+                        Err(_) => {
+                            self.set_err("publish: topic contains NUL");
+                            ok = false;
+                        }
                     }
                 }
             }
@@ -184,12 +196,19 @@ impl ProtocolEngine for PackEngine {
                                 )
                             };
                             self.call_i("write_point", rc);
+                            ok = rc == 0;
                         }
-                        Err(_) => self.set_err("write_point: name contains NUL"),
+                        Err(_) => {
+                            self.set_err("write_point: name contains NUL");
+                            ok = false;
+                        }
                     }
+                } else {
+                    ok = false;
                 }
             }
         }
+        ok
     }
 
     fn snapshot(&self) -> SlotSnapshot {

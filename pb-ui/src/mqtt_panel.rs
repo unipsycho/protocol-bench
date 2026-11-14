@@ -473,6 +473,7 @@ fn embedded_configure_json(state: &MqttPanelState, hubs: &HubModel) -> serde_jso
         "subscriptions": extra_subs,
         "parse_rules": rules,
         "outputs": outs,
+        // Connect whenever the embedded listener is up so Output binds can egress.
         "auto_connect": state.broker_running,
     })
 }

@@ -292,3 +292,109 @@ fn deadline_points(
     }
     captured.lock().unwrap().points.clone()
 }
+
+/// Embedded rumqttd + Output bind + write_point must publish for MQTT Explorer / mosquitto_sub.
+#[test]
+fn embedded_hub_output_write_point_publishes() {
+    use std::process::{Command, Stdio};
+
+    if std::env::var_os("PB_SMOKE_SKIP").is_some() {
+        return;
+    }
+    let port = 1894u16;
+    let captured = Arc::new(Mutex::new(Captured { points: Vec::new() }));
+    let (handle, api) = open_pack(&captured);
+    let configure = api.configure.expect("configure");
+    let write_point = api.write_point.expect("write_point");
+    let destroy = api.destroy.expect("destroy");
+    let poll = api.poll.expect("poll");
+
+    let start = serde_json::json!({
+        "op": "broker_start",
+        "bind": "127.0.0.1",
+        "port": port,
+        "users": []
+    })
+    .to_string();
+    assert_eq!(
+        unsafe { configure(handle, start.as_ptr() as *const _, start.len()) },
+        0,
+        "broker_start"
+    );
+    thread::sleep(Duration::from_millis(80));
+
+    let cfg = serde_json::json!({
+        "clients": [{
+            "id": "hub",
+            "label": "Hub broker",
+            "host": "127.0.0.1",
+            "port": port,
+            "client_id": "pb-embed-hub",
+            "transport": "tcp",
+            "auto_connect": true,
+            "subscriptions": [],
+            "parse_rules": [],
+            "outputs": [
+                {"point": "mqtt_1", "topic": "plant/edge/gaussian", "qos": 0, "retain": true}
+            ]
+        }]
+    })
+    .to_string();
+    assert_eq!(
+        unsafe { configure(handle, cfg.as_ptr() as *const _, cfg.len()) },
+        0,
+        "configure hub client"
+    );
+    wait_connected(&api, handle, 5);
+
+    let sub = Command::new("mosquitto_sub")
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-t",
+            "plant/edge/gaussian",
+            "-C",
+            "1",
+            "-W",
+            "5",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("mosquitto_sub");
+    thread::sleep(Duration::from_millis(200));
+
+    let payload = b"21.070";
+    let name = std::ffi::CString::new("mqtt_1").unwrap();
+    assert_eq!(
+        unsafe {
+            write_point(
+                handle,
+                name.as_ptr(),
+                PB_VALUE_STRING,
+                payload.as_ptr() as *const _,
+                payload.len(),
+            )
+        },
+        0,
+        "write_point"
+    );
+    for _ in 0..20 {
+        unsafe { poll(handle) };
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let out = sub.wait_with_output().expect("wait sub");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("21.070"),
+        "expected payload on plant/edge/gaussian, got {text:?} status={}",
+        out.status
+    );
+
+    let stop = serde_json::json!({ "op": "broker_stop" }).to_string();
+    let _ = unsafe { configure(handle, stop.as_ptr() as *const _, stop.len()) };
+    unsafe { destroy(handle) };
+}

@@ -761,36 +761,32 @@ impl PackState {
         self.clients.keys().cloned().collect()
     }
 
-    /// Publish via output binding if `point` matches; else derive topic from point id.
+    /// Publish via output binding if `point` matches.
+    /// No matching bind → Ok (Input-only points). Bound but disconnected → Err (retry).
     fn publish_for_point(&mut self, point: &str, payload: &[u8]) -> Result<(), String> {
         let known = self.known_client_ids();
         let default = known.first().cloned().unwrap_or_else(|| "default".into());
         let point = migrate_point_id(point, &known, &default);
+        let mut last_err: Option<String> = None;
+        let mut matched = false;
         for rt in self.clients.values() {
-            if let Some(out) = rt.config.outputs.iter().find(|o| {
+            let Some(out) = rt.config.outputs.iter().find(|o| {
                 migrate_point_id(&o.point, &known, &default) == point
-            }) {
-                let session = rt
-                    .session
-                    .as_ref()
-                    .ok_or_else(|| format!("output: '{}' not connected", rt.config.id))?;
-                return session.publish(&out.topic, payload, out.qos, out.retain);
-            }
+            }) else {
+                continue;
+            };
+            matched = true;
+            let Some(session) = rt.session.as_ref() else {
+                last_err = Some(format!("output: '{}' not connected", rt.config.id));
+                continue;
+            };
+            return session.publish(&out.topic, payload, out.qos, out.retain);
         }
-        // Fallback: mqtt/<client>/<topic>[::path]
-        let (client, topic, _) = split_point_id(&point, &known);
-        let conn = client
-            .map(|s| s.to_string())
-            .ok_or_else(|| "write_point: no output binding and cannot derive client/topic".to_string())?;
-        let value = serde_json::json!({
-            "op": "publish",
-            "id": conn,
-            "topic": topic,
-            "payload": String::from_utf8_lossy(payload),
-            "qos": 0,
-            "retain": false,
-        });
-        self.configure_op("publish", &value)
+        if matched {
+            return Err(last_err.unwrap_or_else(|| "output: not connected".into()));
+        }
+        // No Output bind for this point — quiet success (host egress walks all points).
+        Ok(())
     }
 }
 
@@ -1047,7 +1043,10 @@ unsafe extern "C" fn write_point(
     match state.publish_for_point(name, &payload) {
         Ok(()) => 0,
         Err(e) => {
-            state.log(PB_LOG_ERROR, &e);
+            // Host egress retries until the Output client connects — avoid log spam.
+            if !e.contains("not connected") {
+                state.log(PB_LOG_ERROR, &e);
+            }
             -1
         }
     }
