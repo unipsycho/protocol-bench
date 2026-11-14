@@ -2643,6 +2643,38 @@ fn near_port_edge(rect: Rect, pos: Pos2) -> bool {
     pos.x <= rect.min.x + margin || pos.x >= rect.max.x - margin
 }
 
+/// Primary-press origin — where wire-vs-move must be decided (PB-87).
+fn press_origin(ui: &Ui) -> Option<Pos2> {
+    ui.input(|i| i.pointer.press_origin())
+}
+
+/// Latch sticky wire-arm or body-move from the press position (PB-87).
+fn latch_wire_or_move(
+    ui: &Ui,
+    arm_id: Id,
+    move_id: Id,
+    can_wire: bool,
+    alt: bool,
+    rect: Rect,
+    press: Pos2,
+) {
+    let wire = wire_mode_at_press(can_wire, alt, rect, press);
+    ui.ctx().data_mut(|d| {
+        if wire {
+            d.insert_temp(arm_id, true);
+            d.remove_temp::<bool>(move_id);
+        } else {
+            d.insert_temp(move_id, true);
+            d.remove_temp::<bool>(arm_id);
+        }
+    });
+}
+
+/// True when a press on `rect` should start a wire (port strip or Alt) (PB-87).
+fn wire_mode_at_press(can_wire: bool, alt: bool, rect: Rect, press: Pos2) -> bool {
+    can_wire && (alt || near_port_edge(rect, press))
+}
+
 fn feeder_label(model: &HubModel, hub_id: u64, node_id: u64) -> String {
     let Some(hub) = model.hub(hub_id) else {
         return format!("node {node_id}");
@@ -2901,19 +2933,30 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
             .interact(node.rect, id, Sense::click_and_drag())
             .on_hover_text(tip);
         let key = (node.hub_id, node.port_id);
-        // Wire vs move is latched at drag_started only (PB-82). Body drag never
-        // converts to wire when the pointer later crosses a port strip / leaves the rect.
-        // Sticky wire arm keeps wiring after leaving the edge (PB-75).
+        // PB-87: latch wire vs move on pointer-down using press origin (same region as
+        // the crosshair). By drag_started the tip has usually left the thin port strip,
+        // so live-pointer checks falsely chose move (PB-82 body-only still holds).
         let arm_id = Id::new(("pb_hub_wire_arm", node.hub_id, node.port_id.unwrap_or(0)));
         let move_id = Id::new(("pb_hub_move_only", node.hub_id, node.port_id.unwrap_or(0)));
         let on_port = pointer.is_some_and(|pos| near_port_edge(node.rect, pos));
-        let port_press = can_wire && on_port;
-        let wire_at_press = can_wire && (alt || port_press);
+        let pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+        if !panning && pressed {
+            if let Some(pos) = press_origin(ui).or(pointer) {
+                if node.rect.expand(2.0).contains(pos) {
+                    latch_wire_or_move(ui, arm_id, move_id, can_wire, alt, node.rect, pos);
+                }
+            }
+        }
         if !panning && resp.drag_started() {
-            if wire_at_press {
-                ui.ctx().data_mut(|d| d.insert_temp(arm_id, true));
-            } else {
-                ui.ctx().data_mut(|d| d.insert_temp(move_id, true));
+            let has_arm = ui.ctx().data(|d| d.get_temp::<bool>(arm_id)).unwrap_or(false);
+            let has_move = ui.ctx().data(|d| d.get_temp::<bool>(move_id)).unwrap_or(false);
+            // Fallback if press latch was missed (focus / interact quirks).
+            if !has_arm && !has_move {
+                if let Some(pos) = press_origin(ui).or(pointer).or(resp.interact_pointer_pos()) {
+                    latch_wire_or_move(ui, arm_id, move_id, can_wire, alt, node.rect, pos);
+                } else {
+                    ui.ctx().data_mut(|d| d.insert_temp(move_id, true));
+                }
             }
         }
         if resp.drag_stopped() || ui.input(|i| i.pointer.any_released()) {
@@ -5402,5 +5445,19 @@ mod tests {
         assert!(!near_port_edge(rect, pos2(50.0, 130.0))); // outside left
         assert!(!near_port_edge(rect, pos2(300.0, 130.0))); // outside right
         assert!(!near_port_edge(rect, pos2(105.0, 50.0))); // outside above strip
+    }
+
+    #[test]
+    fn wire_mode_uses_press_origin_not_live_tip() {
+        // PB-87: press on right port → wire even if tip later sits on the body.
+        let rect = Rect::from_min_size(pos2(100.0, 100.0), vec2(160.0, 44.0));
+        let press_on_right = pos2(258.0, 122.0);
+        let tip_after_drag = pos2(180.0, 122.0);
+        assert!(wire_mode_at_press(true, false, rect, press_on_right));
+        assert!(
+            !wire_mode_at_press(true, false, rect, tip_after_drag),
+            "live tip on body must not decide the latch"
+        );
+        assert!(wire_mode_at_press(true, true, rect, tip_after_drag)); // Alt still wires
     }
 }
