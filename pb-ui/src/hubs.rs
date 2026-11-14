@@ -15,7 +15,10 @@ use std::collections::BTreeMap;
 use crate::dock::DockPane;
 use crate::mqtt_panel::MqttPanelState;
 use crate::point_rows;
-use crate::theme::{blend_scope, divider_bar, font_semi, font_ui, mix, tint, ThemePalette, SEP};
+use crate::theme::{
+    after_field, apply_form_spacing, blend_scope, divider_bar, font_semi, font_ui, mix, space, tint,
+    ThemePalette, SEP,
+};
 use crate::topic_tree::{self, TopicTree, TreeMode};
 
 const PORT_W: f32 = 156.0;
@@ -3536,6 +3539,8 @@ fn inspector(
         .id_salt("pb_hub_edit")
         .auto_shrink([false, false])
         .show(&mut child, |ui| {
+            // Dock zeros spacing — restore form rhythm for inspector fields (PB-88).
+            apply_form_spacing(ui);
             // Overlay scrollbar sits on the right; keep Add / × / row edges clear of it.
             let width = (ui.available_width() - INSPECT_SCROLL_GUTTER).max(1.0);
             ui.set_width(width);
@@ -3743,10 +3748,10 @@ fn edit_port(
             .font(font_ui(10.5))
             .color(proto.ink(p.is_light)),
     );
-    ui.add_space(6.0);
+    ui.add_space(space::AFTER_FIELD);
     // Protocol dropdown first; Name label + field on the same row (theme control heights).
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
         ui.set_min_height(PORT_ROW_H);
         let current = port_field(model, hub_id, port_id).protocol;
         let mut next = current;
@@ -3785,14 +3790,14 @@ fn edit_port(
         }
     });
     if incoming {
-        ui.add_space(4.0);
+        ui.add_space(space::AFTER_FIELD);
         ui.label(
             egui::RichText::new("Many Inputs can share one connection.")
                 .font(font_ui(11.0))
                 .color(p.muted),
         );
     } else {
-        ui.add_space(4.0);
+        ui.add_space(space::AFTER_FIELD);
         ui.label(
             egui::RichText::new(
                 "One Output accepts many inbound edges — Alt-drag Input/Calc/Agg here.",
@@ -3804,7 +3809,7 @@ fn edit_port(
     // Re-read protocol after possible dropdown change.
     let proto = port_field(model, hub_id, port_id).protocol;
     if proto == HubProto::Mqtt {
-        ui.add_space(12.0);
+        ui.add_space(space::SECTION - 2.0);
         change = change.join(edit_mqtt_port_binds(
             ui,
             model,
@@ -3818,7 +3823,7 @@ fn edit_port(
         ));
     }
     if proto == HubProto::OpcUa && incoming {
-        ui.add_space(12.0);
+        ui.add_space(space::SECTION - 2.0);
         change = change.join(edit_opcua_input_binds(ui, model, hub_id, port_id, p));
     }
     // MQTT Input: no Hub details / Remove — delete via diagram select/Delete or right-click.
@@ -3848,36 +3853,40 @@ fn edit_opcua_input_binds(
     p: &ThemePalette,
 ) -> HubChange {
     let mut change = HubChange::quiet();
+    apply_form_spacing(ui);
     ui.label(
         egui::RichText::new("OPC UA CONNECTION")
             .font(font_ui(10.5))
             .color(p.muted),
     );
-    ui.add_space(4.0);
+    ui.add_space(space::AFTER_HEADING);
     {
         let port = port_field(model, hub_id, port_id);
         if ui
             .add(
                 egui::TextEdit::singleline(&mut port.opcua_connection)
                     .hint_text("client id (e.g. plant)")
-                    .desired_width(220.0),
+                    .desired_width(220.0)
+                    .margin(egui::Margin::symmetric(6.0, 4.0)),
             )
             .changed()
         {
             change.dirty = true;
         }
     }
-    ui.add_space(8.0);
+    after_field(ui);
+    ui.add_space(space::AFTER_BLURB);
     ui.label(
         egui::RichText::new("NODE BINDS — NodeId → point")
             .font(font_ui(10.5))
             .color(p.muted),
     );
-    ui.add_space(4.0);
+    ui.add_space(space::AFTER_HEADING);
     let binds = port_field(model, hub_id, port_id).opcua_inputs.clone();
     let mut remove = None;
     for (i, bind) in binds.iter().enumerate() {
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = space::BUTTON;
             ui.label(
                 egui::RichText::new(format!("{} → {}", bind.node_id, if bind.point.is_empty() { "(auto)" } else { &bind.point }))
                     .font(font_ui(12.0))
@@ -3887,28 +3896,32 @@ fn edit_opcua_input_binds(
                 remove = Some(i);
             }
         });
+        after_field(ui);
     }
     if let Some(i) = remove {
         port_field(model, hub_id, port_id).opcua_inputs.remove(i);
         change.dirty = true;
     }
-    ui.add_space(6.0);
+    ui.add_space(space::AFTER_FIELD);
     let draft_id = egui::Id::new(("pb_opcua_draft", port_id));
     let (mut draft_node, mut draft_point): (String, String) =
         ui.ctx().data_mut(|d| d.get_temp(draft_id).unwrap_or_default());
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::BUTTON;
         let node_changed = ui
             .add(
                 egui::TextEdit::singleline(&mut draft_node)
                     .hint_text("ns=2;s=Temperature")
-                    .desired_width(180.0),
+                    .desired_width(180.0)
+                    .margin(egui::Margin::symmetric(6.0, 4.0)),
             )
             .changed();
         let point_changed = ui
             .add(
                 egui::TextEdit::singleline(&mut draft_point)
                     .hint_text("point (optional)")
-                    .desired_width(100.0),
+                    .desired_width(100.0)
+                    .margin(egui::Margin::symmetric(6.0, 4.0)),
             )
             .changed();
         if node_changed || point_changed {
@@ -3930,6 +3943,7 @@ fn edit_opcua_input_binds(
             change.dirty = true;
         }
     });
+    after_field(ui);
     ui.label(
         egui::RichText::new(
             "Tip: browse variables in the OPC UA panel, then paste the NodeId here.",

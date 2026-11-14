@@ -314,13 +314,64 @@ fn frost() -> ThemePalette {
     )
 }
 
+/// Form / panel spacing tokens (CSS-like). Dock chrome zeros `item_spacing` between
+/// tiles — call [`apply_form_spacing`] at the top of every panel/inspector body so
+/// labeled rows, checkboxes, and buttons breathe. New panels: inset + apply + reuse
+/// [`space`] constants instead of hard-coded `add_space` magic numbers.
+pub mod space {
+    /// Horizontal inset from the pane edge (matches MQTT / Points).
+    pub const INSET_X: f32 = 8.0;
+    /// Top inset inside a pane body.
+    pub const INSET_Y: f32 = 6.0;
+    /// Default horizontal gap between widgets in a row.
+    pub const ITEM_X: f32 = 10.0;
+    /// Default vertical gap egui inserts between sequential widgets.
+    pub const ITEM_Y: f32 = 8.0;
+    /// Extra space after a labeled field row (on top of ITEM_Y when needed).
+    pub const AFTER_FIELD: f32 = 6.0;
+    /// Gap under a section heading bar.
+    pub const AFTER_HEADING: f32 = 6.0;
+    /// Gap under a muted blurb / tip line.
+    pub const AFTER_BLURB: f32 = 8.0;
+    /// Between major sections (embedded vs clients, etc.).
+    pub const SECTION: f32 = 16.0;
+    /// Between checkboxes in a wrap row.
+    pub const CHECK: f32 = 12.0;
+    /// Between action buttons (Connect / Disconnect / Browse).
+    pub const BUTTON: f32 = 8.0;
+    /// Between client chips (+ Add, Plant UA, …).
+    pub const CHIP: f32 = 8.0;
+}
+
+/// Pane content rect inset from the dock leaf edges.
+pub fn form_inset(full: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(full.min.x + space::INSET_X, full.min.y + space::INSET_Y),
+        egui::pos2(full.max.x - space::INSET_X, full.max.y),
+    )
+}
+
+/// Restore form rhythm on a Ui whose ancestors zeroed spacing (dock splitters).
+pub fn apply_form_spacing(ui: &mut egui::Ui) {
+    let s = ui.spacing_mut();
+    s.item_spacing = egui::vec2(space::ITEM_X, space::ITEM_Y);
+    s.button_padding = egui::vec2(10.0, 5.0);
+    s.icon_spacing = 6.0;
+}
+
+/// Explicit vertical gap after a labeled field (safe even when item_spacing.y is 0).
+pub fn after_field(ui: &mut egui::Ui) {
+    ui.add_space(space::AFTER_FIELD);
+}
+
 /// Spacing and text styles. Call once; theme switches only replace visuals.
 pub fn install_chrome_style(ctx: &egui::Context) {
     ctx.style_mut(|style| {
-        style.spacing.item_spacing = egui::vec2(10.0, 6.0);
+        style.spacing.item_spacing = egui::vec2(space::ITEM_X, space::ITEM_Y);
         style.spacing.window_margin = egui::Margin::same(SEP);
-        style.spacing.button_padding = egui::vec2(8.0, 4.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
         style.spacing.interact_size = egui::vec2(32.0, 28.0);
+        style.spacing.icon_spacing = 6.0;
         style.text_styles.insert(TextStyle::Body, font_ui(13.5));
         style.text_styles.insert(TextStyle::Button, font_ui(13.0));
         style

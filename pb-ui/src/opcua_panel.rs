@@ -1,7 +1,7 @@
 //! OPC UA panel: embedded UA server hub + external UA clients.
 //! Shared browse widget lives in `opcua_browse` (panel + Hub Input).
 
-use egui::{Color32, Layout, Pos2, Rect, Sense, UiBuilder, Vec2};
+use egui::{Color32, Layout, Sense, UiBuilder, Vec2};
 use pb_engine::{EngineCommand, EngineHandle, EngineId, HostSnapshot};
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 
 use crate::hubs::HubModel;
 use crate::opcua_browse::{self, BrowseMode, BrowseNode, BrowseTree};
-use crate::theme::{font_semi, font_ui, ThemePalette};
+use crate::theme::{
+    after_field, apply_form_spacing, font_semi, font_ui, form_inset, space, ThemePalette,
+};
 
 const LABEL_W: f32 = 120.0;
 
@@ -378,10 +380,7 @@ pub fn paint(
         sync_points_to_server(engine, host);
     }
     let full = ui.available_rect_before_wrap();
-    let inner = Rect::from_min_max(
-        Pos2::new(full.min.x + 8.0, full.min.y + 4.0),
-        Pos2::new(full.max.x - 8.0, full.max.y),
-    );
+    let inner = form_inset(full);
     ui.allocate_new_ui(
         UiBuilder::new()
             .max_rect(inner)
@@ -399,6 +398,8 @@ fn paint_body(
     state: &mut OpcUaPanelState,
     hubs: &HubModel,
 ) {
+    // Dock splitters zero spacing — restore form rhythm for this pane (PB-88).
+    apply_form_spacing(ui);
     let pack_loaded = host
         .slot(EngineId::OpcUa)
         .map(|s| s.pack_loaded)
@@ -409,13 +410,13 @@ fn paint_body(
                 .font(font_ui(12.5))
                 .color(p.muted),
         );
-        ui.add_space(8.0);
+        ui.add_space(space::AFTER_BLURB);
     }
 
     edit_embedded(ui, state, engine, p);
-    ui.add_space(16.0);
+    ui.add_space(space::SECTION);
     panel_heading(ui, "External UA clients", p.live, p);
-    ui.add_space(4.0);
+    ui.add_space(space::AFTER_HEADING);
     ui.label(
         egui::RichText::new(
             "Outbound sessions to plant UA servers. Hub Inputs bind NodeIds via the shared browse tree.",
@@ -423,9 +424,9 @@ fn paint_body(
         .font(font_ui(12.0))
         .color(p.muted),
     );
-    ui.add_space(8.0);
+    ui.add_space(space::AFTER_BLURB);
     clients_bar(ui, state, engine, hubs, p);
-    ui.add_space(10.0);
+    ui.add_space(space::AFTER_FIELD + 2.0);
 
     if state.selected().is_none() {
         ui.label(
@@ -440,13 +441,14 @@ fn paint_body(
         .id_salt("pb_opcua_body")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            apply_form_spacing(ui);
             selected_client_editor(ui, state, engine, hubs, p);
-            ui.add_space(12.0);
+            ui.add_space(space::SECTION - 2.0);
             browse_preview(ui, state, engine, p);
             if !state.last_error.is_empty() || !state.server_checklist.is_empty() {
-                ui.add_space(10.0);
+                ui.add_space(space::AFTER_FIELD + 2.0);
                 panel_heading(ui, "Connectivity checklist", Color32::from_rgb(220, 140, 60), p);
-                ui.add_space(4.0);
+                ui.add_space(space::AFTER_HEADING);
                 if !state.last_error.is_empty() {
                     ui.label(
                         egui::RichText::new(&state.last_error)
@@ -474,7 +476,7 @@ fn edit_embedded(
     p: &ThemePalette,
 ) {
     panel_heading(ui, "Embedded UA server hub", p.accent, p);
-    ui.add_space(4.0);
+    ui.add_space(space::AFTER_HEADING);
     ui.label(
         egui::RichText::new(
             "Protocol Bench listens as an OPC UA server and exposes all host points under Objects/Points.",
@@ -482,12 +484,13 @@ fn edit_embedded(
         .font(font_ui(12.0))
         .color(p.muted),
     );
-    ui.add_space(8.0);
+    ui.add_space(space::AFTER_BLURB);
 
     let mut dirty = false;
     dirty |= labeled_text(ui, "Name", &mut state.embedded.name, p);
     dirty |= labeled_text(ui, "Bind", &mut state.embedded.bind, p);
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
         ui.add_sized(
             [LABEL_W, 20.0],
             egui::Label::new(egui::RichText::new("Port").font(font_ui(12.5)).color(p.muted)),
@@ -503,8 +506,10 @@ fn edit_embedded(
             }
         }
     });
+    after_field(ui);
     dirty |= labeled_text(ui, "App URI", &mut state.embedded.application_uri, p);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(space::CHECK, space::ITEM_Y);
         if ui
             .checkbox(&mut state.embedded.allow_anonymous, "Anonymous")
             .changed()
@@ -533,6 +538,7 @@ fn edit_embedded(
             dirty = true;
         }
     });
+    after_field(ui);
     if state.embedded.allow_anonymous
         && (state.embedded.bind.trim() == "0.0.0.0" || state.embedded.bind.trim() == "::")
     {
@@ -541,8 +547,10 @@ fn edit_embedded(
                 .font(font_ui(11.5))
                 .color(Color32::from_rgb(220, 140, 60)),
         );
+        after_field(ui);
     }
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::BUTTON;
         let running = state.server_running;
         if secondary_btn(ui, if running { "Stop" } else { "Start" }, p).clicked() {
             if running {
@@ -605,7 +613,7 @@ fn clients_bar(
     p: &ThemePalette,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+        ui.spacing_mut().item_spacing = Vec2::new(space::CHIP, space::CHIP);
         let mut select = None;
         let mut remove = None;
         for (i, client) in state.clients.iter().enumerate() {
@@ -679,7 +687,9 @@ fn selected_client_editor(
             dirty |= labeled_password(ui, "Password", &mut c.password, p);
         }
         dirty |= labeled_text(ui, "Trust", &mut c.trust_server, p);
-        ui.horizontal(|ui| {
+        after_field(ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(space::BUTTON, space::ITEM_Y);
             if secondary_btn(ui, "Connect", p).clicked() {
                 c.auto_connect = true;
                 do_connect = true;
@@ -730,7 +740,7 @@ fn browse_preview(
     p: &ThemePalette,
 ) {
     panel_heading(ui, "Browse", p.live, p);
-    ui.add_space(4.0);
+    ui.add_space(space::AFTER_HEADING);
     let id = state.selected().map(|c| c.id.clone()).unwrap_or_default();
     let tree = state.trees.entry(id.clone()).or_default().clone();
     let pick = opcua_browse::paint(ui, &tree, "pb_opcua_browse", BrowseMode::PickNode, p);
@@ -767,28 +777,34 @@ fn panel_heading(ui: &mut egui::Ui, title: &str, accent: Color32, p: &ThemePalet
 fn labeled_text(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
         ui.add_sized(
             [LABEL_W, 20.0],
             egui::Label::new(egui::RichText::new(label).font(font_ui(12.5)).color(p.muted)),
         );
+        let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
         changed = ui
-            .add(egui::TextEdit::singleline(value).desired_width(280.0))
+            .add(egui::TextEdit::singleline(value).desired_width(w))
             .changed();
     });
+    after_field(ui);
     changed
 }
 
 fn labeled_password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
         ui.add_sized(
             [LABEL_W, 20.0],
             egui::Label::new(egui::RichText::new(label).font(font_ui(12.5)).color(p.muted)),
         );
+        let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
         changed = ui
-            .add(egui::TextEdit::singleline(value).password(true).desired_width(280.0))
+            .add(egui::TextEdit::singleline(value).password(true).desired_width(w))
             .changed();
     });
+    after_field(ui);
     changed
 }
 

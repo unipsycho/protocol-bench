@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::hubs::HubModel;
-use crate::theme::{font_semi, font_ui, ThemePalette};
+use crate::theme::{
+    after_field, apply_form_spacing, font_semi, font_ui, form_inset, space, ThemePalette,
+};
 use crate::topic_tree::{self, TopicTree, TreeMode};
 
 const SIDE_BY_SIDE_MIN: f32 = 720.0;
@@ -491,10 +493,7 @@ pub fn paint(
     // Claim the full pane body with an explicit rect — nested horizontal rows
     // collapse available_height and clip the config editor.
     let full = ui.available_rect_before_wrap();
-    let inner = Rect::from_min_max(
-        Pos2::new(full.min.x + 8.0, full.min.y + 4.0),
-        Pos2::new(full.max.x - 8.0, full.max.y),
-    );
+    let inner = form_inset(full);
     ui.allocate_new_ui(
         UiBuilder::new()
             .max_rect(inner)
@@ -513,6 +512,8 @@ fn paint_body(
     state: &mut MqttPanelState,
     hubs: &HubModel,
 ) {
+    // Dock splitters zero spacing — restore form rhythm (PB-88).
+    apply_form_spacing(ui);
     let slot = host.slot(EngineId::Mqtt);
     let pack_loaded = slot.map(|s| s.pack_loaded).unwrap_or(false);
     if !pack_loaded {
@@ -521,13 +522,13 @@ fn paint_body(
                 .font(font_ui(12.5))
                 .color(p.muted),
         );
-        ui.add_space(8.0);
+        ui.add_space(space::AFTER_BLURB);
     }
 
     edit_embedded_broker(ui, state, engine, hubs, p);
-    ui.add_space(18.0);
+    ui.add_space(space::SECTION + 2.0);
     panel_heading(ui, "External brokers / connections", p.live, p);
-    ui.add_space(4.0);
+    ui.add_space(space::AFTER_HEADING);
     ui.label(
         egui::RichText::new(
             "Outbound clients for subscribe / Input traffic and Output publish. Point binds live on hub nodes.",
@@ -535,10 +536,10 @@ fn paint_body(
         .font(font_ui(12.0))
         .color(p.muted),
     );
-    ui.add_space(8.0);
+    ui.add_space(space::AFTER_BLURB);
 
     clients_bar(ui, state, engine, hubs, p);
-    ui.add_space(10.0);
+    ui.add_space(space::AFTER_FIELD + 2.0);
 
     if state.selected().is_none() {
         ui.label(
@@ -616,7 +617,7 @@ fn clients_bar(
     p: &ThemePalette,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+        ui.spacing_mut().item_spacing = Vec2::new(space::CHIP, space::CHIP);
         let mut select = None;
         let mut remove = None;
         for (i, client) in state.clients.iter().enumerate() {
@@ -981,12 +982,12 @@ fn section(ui: &mut egui::Ui, label: &str, p: &ThemePalette) {
             .font(font_ui(10.5))
             .color(p.muted),
     );
-    ui.add_space(6.0);
+    ui.add_space(space::AFTER_HEADING);
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
         ui.add_sized(
             [LABEL_W, 20.0],
             egui::Label::new(
@@ -998,12 +999,12 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
         let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
         ui.add(egui::TextEdit::singleline(value).desired_width(w));
     });
-    ui.add_space(4.0);
+    after_field(ui);
 }
 
 fn client_id_field(ui: &mut egui::Ui, c: &mut MqttClient, p: &ThemePalette) {
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
         ui.add_sized(
             [LABEL_W, 20.0],
             egui::Label::new(
@@ -1029,12 +1030,12 @@ fn client_id_field(ui: &mut egui::Ui, c: &mut MqttClient, p: &ThemePalette) {
             "Fresh random MQTT client id on each Connect — avoids collisions across sessions.",
         );
     });
-    ui.add_space(4.0);
+    after_field(ui);
 }
 
 fn password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
         ui.add_sized(
             [LABEL_W, 20.0],
             egui::Label::new(
@@ -1050,7 +1051,7 @@ fn password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette
                 .desired_width(w),
         );
     });
-    ui.add_space(4.0);
+    after_field(ui);
 }
 
 fn transport(ui: &mut egui::Ui, value: &mut String, p: &ThemePalette) {
@@ -1058,7 +1059,7 @@ fn transport(ui: &mut egui::Ui, value: &mut String, p: &ThemePalette) {
         *value = "tcp".into();
     }
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
         ui.add_sized(
             [LABEL_W, 20.0],
             egui::Label::new(
@@ -1077,7 +1078,7 @@ fn transport(ui: &mut egui::Ui, value: &mut String, p: &ThemePalette) {
                 }
             });
     });
-    ui.add_space(4.0);
+    after_field(ui);
 }
 
 fn text_btn(ui: &mut egui::Ui, label: &str, accent: bool, p: &ThemePalette) -> egui::Response {
