@@ -324,8 +324,7 @@ fn catalog_card(ui: &mut egui::Ui, kind: &CalcKind, active: bool, p: &ThemePalet
     } else {
         egui::Stroke::new(1.0, p.line)
     };
-    let mut clicked = false;
-    egui::Frame::none()
+    let resp = egui::Frame::none()
         .fill(fill)
         .stroke(stroke)
         .rounding(egui::Rounding::same(8.0))
@@ -356,16 +355,10 @@ fn catalog_card(ui: &mut egui::Ui, kind: &CalcKind, active: bool, p: &ThemePalet
                     .font(font_ui(11.5))
                     .color(p.text),
             );
-            let r = ui.interact(
-                ui.max_rect(),
-                ui.id().with(("calc_card", kind.id)),
-                Sense::click(),
-            );
-            if r.clicked() {
-                clicked = true;
-            }
         });
-    clicked
+    // Whole card is the hit target.
+    ui.interact(resp.response.rect, ui.id().with(("calc_card", kind.id)), Sense::click())
+        .clicked()
 }
 
 fn detail_editor(ui: &mut egui::Ui, kind: &CalcKind, state: &mut CalcPanelState, p: &ThemePalette) {
