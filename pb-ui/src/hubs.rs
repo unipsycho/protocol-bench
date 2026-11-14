@@ -2414,12 +2414,11 @@ fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette, host: &HostSna
     if !aggregator {
         // Full catalog + params live on the calculation node (not a dock pane).
         ui.add_space(12.0);
-        let point_names: Vec<String> = host.points.iter().map(|pt| pt.name.clone()).collect();
         if crate::calc_panel::paint_node_props(
             ui,
             step_field(model, hub_id, step_id),
             p,
-            &point_names,
+            &host.points,
         ) {
             change.dirty = true;
         }

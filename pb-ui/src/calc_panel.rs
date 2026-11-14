@@ -4,6 +4,7 @@
 //! Catalog lives in a large modal help guide; picking a type pre-fills config.
 
 use egui::{Align, Color32, Id, Layout, RichText, Sense, Vec2};
+use pb_engine::PointSnapshot;
 
 use crate::hubs::HubStep;
 use crate::theme::{font_semi, font_ui, ThemePalette};
@@ -188,21 +189,25 @@ pub fn paint_node_props(
     ui: &mut egui::Ui,
     step: &mut HubStep,
     p: &ThemePalette,
-    point_names: &[String],
+    host_points: &[PointSnapshot],
 ) -> bool {
     let mut dirty = false;
     let step_id = step.id;
     let modal_id = modal_open_id(step_id);
+    let point_names: Vec<String> = host_points.iter().map(|pt| pt.name.clone()).collect();
 
-    // Configuration first: points the formula reads/writes, then type params.
+    // Configuration first: source point + type params, then live preview.
     let kind = kind_by_id(step.calc_kind.as_str()).unwrap_or(&CALC_KINDS[0]);
     if step.calc_kind != kind.id {
         step.calc_kind = kind.id.into();
         dirty = true;
     }
-    if detail_editor(ui, kind, step, p, point_names) {
+    if detail_editor(ui, kind, step, p, &point_names) {
         dirty = true;
     }
+
+    ui.add_space(14.0);
+    live_preview(ui, step, kind, host_points, p);
 
     ui.add_space(14.0);
     ui.horizontal(|ui| {
@@ -220,12 +225,6 @@ pub fn paint_node_props(
                 .color(p.muted),
         );
     });
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new("Engine evaluation for these blocks ships next — configuration is live.")
-            .font(font_ui(11.5))
-            .color(p.muted),
-    );
 
     let mut open = ui
         .ctx()
@@ -383,6 +382,290 @@ fn source_point_picker(
         dirty = true;
     }
     dirty
+}
+
+fn parse_f64(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // Accept bool-ish for compare preview.
+    match t.to_ascii_lowercase().as_str() {
+        "true" | "on" => return Some(1.0),
+        "false" | "off" => return Some(0.0),
+        _ => {}
+    }
+    t.parse::<f64>().ok()
+}
+
+fn fmt_num(v: f64) -> String {
+    if v.fract().abs() < 1e-9 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.6}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+}
+
+/// Best-effort UI preview (not the host edge runner).
+fn compute_preview(kind: &CalcKind, step: &HubStep, x: f64) -> Result<String, String> {
+    let a = parse_f64(&step.param_a);
+    let b = parse_f64(&step.param_b);
+    match kind.id {
+        "scale_offset" => {
+            let scale = a.unwrap_or(1.0);
+            let offset = b.unwrap_or(0.0);
+            Ok(fmt_num(x * scale + offset))
+        }
+        "unit_convert" => {
+            let from = step.param_a.trim();
+            let to = step.param_b.trim();
+            let y = match (from, to) {
+                ("°C" | "C" | "c", "°F" | "F" | "f") => x * 1.8 + 32.0,
+                ("°F" | "F" | "f", "°C" | "C" | "c") => (x - 32.0) / 1.8,
+                ("psi", "kPa") => x * 6.894757,
+                ("kPa", "psi") => x / 6.894757,
+                _ => {
+                    return Err(format!(
+                        "preview needs known units (got {from} → {to}); try °C/°F or psi/kPa"
+                    ));
+                }
+            };
+            Ok(fmt_num(y))
+        }
+        "clamp" => {
+            let lo = a.unwrap_or(0.0);
+            let hi = b.unwrap_or(100.0);
+            Ok(fmt_num(x.clamp(lo.min(hi), lo.max(hi))))
+        }
+        "deadband" => {
+            let band = a.unwrap_or(0.5).abs();
+            Ok(format!(
+                "{}  (band ±{}; hold uses last published)",
+                fmt_num(x),
+                fmt_num(band)
+            ))
+        }
+        "hysteresis" => {
+            let on = a.unwrap_or(80.0);
+            let off = b.unwrap_or(70.0);
+            let out = if x >= on {
+                "true (on)"
+            } else if x <= off {
+                "false (off)"
+            } else {
+                "hold (between thresholds)"
+            };
+            Ok(out.into())
+        }
+        "boolean_compare" => {
+            let op = step.param_a.trim();
+            let rhs = b.unwrap_or(0.0);
+            let ok = match op {
+                ">" => x > rhs,
+                ">=" => x >= rhs,
+                "<" => x < rhs,
+                "<=" => x <= rhs,
+                "==" | "=" => (x - rhs).abs() < 1e-9,
+                "!=" => (x - rhs).abs() >= 1e-9,
+                _ => {
+                    return Err("Param A should be a compare op (>, >=, <, <=, ==, !=)".into());
+                }
+            };
+            Ok(ok.to_string())
+        }
+        "formula" => {
+            let expr = step.formula.trim();
+            if expr.is_empty() {
+                return Err("enter a formula to preview".into());
+            }
+            // Tiny evaluator: replace x / A with the sample, then allow + - * / ( ) numbers.
+            let mut s = expr.replace('x', &format!("({x})"));
+            s = s.replace('A', &format!("({x})"));
+            s = s.replace('B', &format!("({})", b.unwrap_or(0.0)));
+            match eval_simple_arith(&s) {
+                Some(v) => Ok(fmt_num(v)),
+                None => Err("formula preview supports + − × ÷ ( ) and x/A/B only".into()),
+            }
+        }
+        "rolling_avg" | "ema" | "rate_of_change" | "min_max_hold" | "time_window" => Err(
+            "time-based preview needs the edge runner (sample shown as input only)".into(),
+        ),
+        _ => Err("no preview for this type yet".into()),
+    }
+}
+
+/// Recursive-descent arithmetic for formula preview (no functions).
+fn eval_simple_arith(expr: &str) -> Option<f64> {
+    let chars: Vec<char> = expr.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut i = 0usize;
+    fn parse_expr(chars: &[char], i: &mut usize) -> Option<f64> {
+        let mut v = parse_term(chars, i)?;
+        while *i < chars.len() {
+            match chars[*i] {
+                '+' => {
+                    *i += 1;
+                    v += parse_term(chars, i)?;
+                }
+                '-' => {
+                    *i += 1;
+                    v -= parse_term(chars, i)?;
+                }
+                _ => break,
+            }
+        }
+        Some(v)
+    }
+    fn parse_term(chars: &[char], i: &mut usize) -> Option<f64> {
+        let mut v = parse_factor(chars, i)?;
+        while *i < chars.len() {
+            match chars[*i] {
+                '*' => {
+                    *i += 1;
+                    v *= parse_factor(chars, i)?;
+                }
+                '/' => {
+                    *i += 1;
+                    let d = parse_factor(chars, i)?;
+                    if d == 0.0 {
+                        return None;
+                    }
+                    v /= d;
+                }
+                _ => break,
+            }
+        }
+        Some(v)
+    }
+    fn parse_factor(chars: &[char], i: &mut usize) -> Option<f64> {
+        if *i >= chars.len() {
+            return None;
+        }
+        match chars[*i] {
+            '+' => {
+                *i += 1;
+                parse_factor(chars, i)
+            }
+            '-' => {
+                *i += 1;
+                Some(-(parse_factor(chars, i)?))
+            }
+            '(' => {
+                *i += 1;
+                let v = parse_expr(chars, i)?;
+                if *i >= chars.len() || chars[*i] != ')' {
+                    return None;
+                }
+                *i += 1;
+                Some(v)
+            }
+            c if c.is_ascii_digit() || c == '.' => {
+                let start = *i;
+                while *i < chars.len() && (chars[*i].is_ascii_digit() || chars[*i] == '.') {
+                    *i += 1;
+                }
+                chars[start..*i].iter().collect::<String>().parse().ok()
+            }
+            _ => None,
+        }
+    }
+    let v = parse_expr(&chars, &mut i)?;
+    if i != chars.len() {
+        return None;
+    }
+    Some(v)
+}
+
+fn live_preview(
+    ui: &mut egui::Ui,
+    step: &HubStep,
+    kind: &CalcKind,
+    host_points: &[PointSnapshot],
+    p: &ThemePalette,
+) {
+    heading(ui, "Live preview", p.live, p);
+    ui.add_space(6.0);
+    if step.source_point.trim().is_empty() {
+        ui.label(
+            RichText::new("Pick a source point to preview input → output.")
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        return;
+    }
+    let Some(pt) = host_points.iter().find(|pt| pt.name == step.source_point) else {
+        ui.label(
+            RichText::new(format!(
+                "Source point “{}” is not in the live host yet.",
+                step.source_point
+            ))
+            .font(font_ui(12.0))
+            .color(p.muted),
+        );
+        return;
+    };
+    if pt.value.trim().is_empty() {
+        ui.label(
+            RichText::new(format!(
+                "{} · quality {} — no value yet.",
+                pt.name, pt.quality
+            ))
+            .font(font_ui(12.0))
+            .color(p.muted),
+        );
+        return;
+    }
+
+    let fill = Color32::from_rgba_unmultiplied(p.live.r(), p.live.g(), p.live.b(), 24);
+    egui::Frame::none()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, p.line))
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                RichText::new(format!("Point · {} · quality {}", pt.name, pt.quality))
+                    .font(font_ui(11.5))
+                    .color(p.muted),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Input").font(font_semi(12.5)).color(p.muted));
+                ui.add_space(8.0);
+                ui.label(RichText::new(&pt.value).font(font_semi(15.0)).color(p.text));
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Output").font(font_semi(12.5)).color(p.muted));
+                ui.add_space(8.0);
+                match parse_f64(&pt.value) {
+                    Some(x) => match compute_preview(kind, step, x) {
+                        Ok(out) => {
+                            ui.label(RichText::new(out).font(font_semi(15.0)).color(p.accent));
+                        }
+                        Err(msg) => {
+                            ui.label(RichText::new(msg).font(font_ui(12.0)).color(p.muted));
+                        }
+                    },
+                    None => {
+                        ui.label(
+                            RichText::new("non-numeric input — preview needs a number")
+                                .font(font_ui(12.0))
+                                .color(p.muted),
+                        );
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("In-place on the path to Output · preview only (edge runner follows).")
+                    .font(font_ui(11.0))
+                    .color(p.muted),
+            );
+        });
 }
 
 fn detail_editor(
