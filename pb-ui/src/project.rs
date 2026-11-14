@@ -495,6 +495,15 @@ pub fn save(path: &Path, project: &ProjectFile) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    // PB-78: keep last non-empty hubs file as project.json.bak before overwrite.
+    if path.is_file() {
+        if let Ok(prev) = load(path) {
+            if prev.hubs.as_ref().is_some_and(|h| !h.hubs.is_empty()) {
+                let bak = path.with_extension("json.bak");
+                let _ = std::fs::copy(path, &bak);
+            }
+        }
+    }
     let text = serde_json::to_string_pretty(project).map_err(|e| e.to_string())?;
     std::fs::write(path, text).map_err(|e| e.to_string())
 }

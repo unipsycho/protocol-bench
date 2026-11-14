@@ -508,7 +508,8 @@ impl HubModel {
     /// Drop a port, step, link, or multi-select entry that no longer exists.
     fn keep_focus(&mut self) {
         // `selection` is ephemeral (serde skip); restore from persisted selected/port on load.
-        if self.selection.is_empty() {
+        // PB-79: never revive node selection while a wire is the active selection.
+        if self.selection.is_empty() && self.selected_feed.is_none() {
             if let Some(hub_id) = self.selected {
                 self.selection = vec![(hub_id, self.selected_port)];
             }
@@ -713,12 +714,31 @@ impl HubModel {
     }
 
     /// Delete every selected canvas node. Ports/steps first, then hubs.
+    /// PB-79: empty selection is always a no-op — never clear the graph.
     pub fn delete_selection(&mut self) -> bool {
         if self.selection.is_empty() {
             return false;
         }
+        // Drop stale keys so a ghost selection cannot delete anything.
+        let keys: Vec<(u64, Option<u64>)> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|(hub_id, port_id)| {
+                let Some(hub) = self.hub(*hub_id) else {
+                    return false;
+                };
+                match port_id {
+                    None => true,
+                    Some(id) => hub.has_node(*id),
+                }
+            })
+            .collect();
+        if keys.is_empty() {
+            self.selection.clear();
+            return false;
+        }
         self.checkpoint();
-        let keys = self.selection.clone();
         let mut hub_ids = Vec::new();
         for (hub_id, port_id) in keys {
             match port_id {
@@ -1098,7 +1118,9 @@ impl HubModel {
     pub fn select_feed(&mut self, idx: Option<usize>) {
         self.selected_feed = idx.filter(|i| *i < self.feeds.len());
         if self.selected_feed.is_some() {
+            // PB-79: wire-only selection — clear node focus so Delete cannot hit a hub.
             self.selection.clear();
+            self.selected = None;
             self.selected_port = None;
             self.selected_link = None;
         }
@@ -2059,9 +2081,14 @@ fn diagram_view(
             change.dirty = true;
         }
         // Prefer deleting a selected wire over nodes (PB-73).
+        // PB-79: Delete/Backspace never clear the canvas when nothing is selected.
         if do_delete {
-            if model.delete_selected_feed() || model.delete_selection() {
-                change.dirty = true;
+            let has_wire = model.selected_feed.is_some();
+            let has_nodes = !model.selection.is_empty();
+            if has_wire || has_nodes {
+                if model.delete_selected_feed() || model.delete_selection() {
+                    change.dirty = true;
+                }
             }
         }
     }
@@ -4721,6 +4748,41 @@ mod tests {
         assert!(model.hub(hub).unwrap().outputs.iter().all(|p| p.id != out));
         assert!(model.hub(hub).unwrap().calculations.iter().any(|s| s.id == calc));
         assert!(model.hub(hub).unwrap().sources.iter().any(|p| p.id == src));
+    }
+
+    #[test]
+    fn empty_selection_delete_is_noop() {
+        // PB-79: Delete with nothing selected must not clear hubs/feeds.
+        let mut model = HubModel::sample();
+        let before = model.hubs.clone();
+        let feeds_before = model.feeds.clone();
+        model.set_selection(Vec::new());
+        model.selected_feed = None;
+        assert!(!model.delete_selection());
+        assert!(!model.delete_selected_feed());
+        assert_eq!(model.hubs, before);
+        assert_eq!(model.feeds, feeds_before);
+    }
+
+    #[test]
+    fn select_feed_clears_node_focus() {
+        // PB-79: wire select must not leave a hub focused under Delete.
+        let mut model = HubModel::sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let out = model.hubs[1].outputs[0].id;
+        let calc = model.add_step(hub, false, src).expect("calc");
+        assert!(model.connect_feed(hub, calc, hub, out));
+        model.focus_hub(hub);
+        model.select_feed(Some(0));
+        assert!(model.selection.is_empty());
+        assert!(model.selected.is_none());
+        assert_eq!(model.selected_feed, Some(0));
+        let n_hubs = model.hubs.len();
+        assert!(model.delete_selected_feed());
+        assert_eq!(model.hubs.len(), n_hubs);
+        assert!(!model.delete_selection());
+        assert_eq!(model.hubs.len(), n_hubs);
     }
 
     #[test]
