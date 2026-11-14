@@ -12,6 +12,9 @@ pub use loader::{default_modules_dir, load_packs, verify_pack_stub, LoadedPack, 
 pub use pack_engine::PackEngine;
 
 use pb_points::PointStore;
+
+pub mod calc;
+pub use calc::{peek_for_point, CalcConfig, CalcRuntime};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -267,6 +270,10 @@ pub struct EngineHandle {
     tx: Sender<HostCommand>,
     snap: Arc<Mutex<HostSnapshot>>,
     points: Arc<Mutex<PointStore>>,
+    /// Hub calculation steps — applied on Output egress (deadband hold, etc.).
+    calcs: Arc<Mutex<Vec<CalcConfig>>>,
+    /// Shared edge-runner state (deadband hold, rolling windows) for egress + UI peek.
+    calc_rt: Arc<Mutex<CalcRuntime>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -284,18 +291,33 @@ impl EngineHandle {
         let points = opts
             .points
             .unwrap_or_else(|| Arc::new(Mutex::new(PointStore::new())));
+        let calcs = Arc::new(Mutex::new(Vec::<CalcConfig>::new()));
+        let calc_rt = Arc::new(Mutex::new(CalcRuntime::default()));
         let (tx, rx) = mpsc::channel();
         let snap = Arc::new(Mutex::new(initial_snapshot(&modules_dir)));
         let snap_thread = Arc::clone(&snap);
         let points_thread = Arc::clone(&points);
+        let calcs_thread = Arc::clone(&calcs);
+        let calc_rt_thread = Arc::clone(&calc_rt);
         let join = thread::Builder::new()
             .name("pb-engine".into())
-            .spawn(move || host_main(rx, snap_thread, points_thread, modules_dir))
+            .spawn(move || {
+                host_main(
+                    rx,
+                    snap_thread,
+                    points_thread,
+                    calcs_thread,
+                    calc_rt_thread,
+                    modules_dir,
+                )
+            })
             .expect("spawn pb-engine thread");
         Self {
             tx,
             snap,
             points,
+            calcs,
+            calc_rt,
             join: Some(join),
         }
     }
@@ -303,6 +325,18 @@ impl EngineHandle {
     /// Shared host point store (packs upsert through ABI into this).
     pub fn points(&self) -> Arc<Mutex<PointStore>> {
         Arc::clone(&self.points)
+    }
+
+    /// Shared calculation runtime (UI peeks hold / rolling state here).
+    pub fn calc_runtime(&self) -> Arc<Mutex<CalcRuntime>> {
+        Arc::clone(&self.calc_rt)
+    }
+
+    /// Replace hub calculation configs used on Output egress.
+    pub fn set_calcs(&self, next: Vec<CalcConfig>) {
+        if let Ok(mut guard) = self.calcs.lock() {
+            *guard = next;
+        }
     }
 
     /// Latest copy. Never borrows the engine thread's state.
@@ -354,6 +388,8 @@ fn host_main(
     rx: Receiver<HostCommand>,
     snap: Arc<Mutex<HostSnapshot>>,
     points: Arc<Mutex<PointStore>>,
+    calcs: Arc<Mutex<Vec<CalcConfig>>>,
+    calc_rt: Arc<Mutex<CalcRuntime>>,
     modules_dir: PathBuf,
 ) {
     let started = Instant::now();
@@ -361,8 +397,14 @@ fn host_main(
     let pack_ids: Vec<String> = loaded.iter().map(|p| p.id.clone()).collect();
     let mut engines = build_engines(loaded);
     let thread_name = thread::current().name().unwrap_or("pb-engine").to_string();
-    // Last published `updated_ms` per short id — drives Output MQTT egress.
-    let mut egress_stamp: std::collections::BTreeMap<String, u64> =
+    // Last processed `updated_ms` per point — advances calc runtime once per change.
+    let mut calc_stamp: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    // Last calc output per point (preview + publish source of truth).
+    let mut last_out: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    // Last payload string published per point (deadband must not republish holds).
+    let mut egress_payload: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     let mut mqtt_was_connected = false;
 
@@ -394,8 +436,30 @@ fn host_main(
         for engine in engines.iter_mut() {
             engine.poll();
         }
-        // Live Output publish: when MQTT pack is connected, push changed points
-        // through write_point so hub/external Output binds egress.
+
+        // Always advance edge-runner state on point stamp changes (even if MQTT is down)
+        // so UI live preview shares real deadband / rolling windows with egress.
+        let rows = points
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot();
+        let calc_cfgs = calcs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut dirty_out: Vec<(String, String)> = Vec::new();
+        {
+            let mut rt = calc_rt.lock().unwrap_or_else(|e| e.into_inner());
+            for p in &rows {
+                if calc_stamp.get(&p.name).copied() == Some(p.updated_ms) {
+                    continue;
+                }
+                let raw = p.value.as_display();
+                let value = calc::apply_for_egress(&calc_cfgs, &mut rt, &p.name, &raw);
+                calc_stamp.insert(p.name.clone(), p.updated_ms);
+                last_out.insert(p.name.clone(), value.clone());
+                dirty_out.push((p.name.clone(), value));
+            }
+        }
+
+        // Live Output publish: when MQTT pack is connected, push transformed values.
         let mqtt_connected = engines
             .iter()
             .find(|e| e.id() == EngineId::Mqtt)
@@ -404,30 +468,33 @@ fn host_main(
         if mqtt_connected {
             let force_all = !mqtt_was_connected;
             mqtt_was_connected = true;
-            let rows = points
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .snapshot();
             if let Some(engine) = engines.iter_mut().find(|e| e.id() == EngineId::Mqtt) {
-                for p in rows {
-                    let prev = egress_stamp.get(&p.name).copied();
-                    if !force_all && prev == Some(p.updated_ms) {
+                let to_pub: Vec<(String, String)> = if force_all {
+                    last_out
+                        .iter()
+                        .map(|(n, v)| (n.clone(), v.clone()))
+                        .collect()
+                } else {
+                    dirty_out
+                };
+                for (name, value) in to_pub {
+                    // Deadband hold: same payload as last publish → skip (no Explorer jitter).
+                    if !force_all && egress_payload.get(&name) == Some(&value) {
                         continue;
                     }
-                    let value = p.value.as_display();
                     let ok = engine.handle(EngineCommand::WritePoint {
-                        name: p.name.clone(),
-                        value,
+                        name: name.clone(),
+                        value: value.clone(),
                     });
-                    // Only stamp on success so we retry until the hub client is up.
                     if ok {
-                        egress_stamp.insert(p.name, p.updated_ms);
+                        egress_payload.insert(name, value);
                     }
                 }
             }
         } else {
             mqtt_was_connected = false;
-            egress_stamp.clear();
+            // Keep calc_rt / last_out so preview stays coherent across disconnects.
+            egress_payload.clear();
         }
         publish(
             &snap,

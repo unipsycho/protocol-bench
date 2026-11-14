@@ -1280,6 +1280,7 @@ pub fn paint(
     mqtt_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     host: &HostSnapshot,
+    engine: &pb_engine::EngineHandle,
 ) -> HubChange {
     let mut change = HubChange::quiet();
     // The dock column zeros item spacing, and that style is inherited here.
@@ -1345,6 +1346,7 @@ pub fn paint(
                 mqtt_connections,
                 mqtt,
                 host,
+                engine,
             ));
         });
     } else {
@@ -1360,6 +1362,7 @@ pub fn paint(
             mqtt_connections,
             mqtt,
             host,
+            engine,
         ));
     }
     change
@@ -2282,6 +2285,7 @@ fn inspector(
     mqtt_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     host: &HostSnapshot,
+    engine: &pb_engine::EngineHandle,
 ) -> HubChange {
     let (rect, _) = ui.allocate_exact_size(vec2(width.max(1.0), height.max(1.0)), Sense::hover());
     ui.painter()
@@ -2304,7 +2308,15 @@ fn inspector(
             // Overlay scrollbar sits on the right; keep Add / × / row edges clear of it.
             let width = (ui.available_width() - INSPECT_SCROLL_GUTTER).max(1.0);
             ui.set_width(width);
-            change = change.join(edit_selected(ui, model, p, mqtt_connections, mqtt, host));
+            change = change.join(edit_selected(
+                ui,
+                model,
+                p,
+                mqtt_connections,
+                mqtt,
+                host,
+                engine,
+            ));
         });
     change
 }
@@ -2316,6 +2328,7 @@ fn edit_selected(
     mqtt_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     host: &HostSnapshot,
+    engine: &pb_engine::EngineHandle,
 ) -> HubChange {
     // Item-specific properties only when exactly one canvas node is selected.
     if model.multi_selected() {
@@ -2348,14 +2361,20 @@ fn edit_selected(
             .zip(port_id)
             .is_some_and(|(hub_id, port_id)| find_step(model, hub_id, Some(port_id)).is_some())
         {
-            return edit_step(ui, model, p, host);
+            return edit_step(ui, model, p, host, engine);
         }
         return edit_port(ui, model, p, mqtt_connections, mqtt, host);
     }
     edit_hub(ui, model, p)
 }
 
-fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette, host: &HostSnapshot) -> HubChange {
+fn edit_step(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    p: &ThemePalette,
+    host: &HostSnapshot,
+    engine: &pb_engine::EngineHandle,
+) -> HubChange {
     let Some(hub_id) = model.selected else {
         return HubChange::quiet();
     };
@@ -2431,6 +2450,7 @@ fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette, host: &HostSna
             step_field(model, hub_id, step_id),
             p,
             &host.points,
+            engine,
         ) {
             change.dirty = true;
         }

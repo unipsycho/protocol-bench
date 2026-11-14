@@ -4,10 +4,36 @@
 //! Catalog lives in a large modal help guide; picking a type pre-fills config.
 
 use egui::{Align, Align2, Color32, Id, Layout, RichText, Sense, Vec2};
-use pb_engine::PointSnapshot;
+use pb_engine::{peek_for_point, CalcConfig, EngineHandle, PointSnapshot};
 
-use crate::hubs::HubStep;
+use crate::hubs::{HubModel, HubStep};
 use crate::theme::{font_semi, font_ui, ThemePalette};
+
+/// Build engine calc configs from every hub calculation with a source point.
+pub fn configs_from_hubs(hubs: &HubModel) -> Vec<CalcConfig> {
+    let mut out = Vec::new();
+    for hub in &hubs.hubs {
+        for step in &hub.calculations {
+            if step.source_point.trim().is_empty() {
+                continue;
+            }
+            out.push(config_from_step(step));
+        }
+    }
+    out
+}
+
+fn config_from_step(step: &HubStep) -> CalcConfig {
+    CalcConfig {
+        id: step.id,
+        kind: step.calc_kind.clone(),
+        source_point: step.source_point.clone(),
+        param_a: step.param_a.clone(),
+        param_b: step.param_b.clone(),
+        window_secs: step.window_secs.clone(),
+        formula: step.formula.clone(),
+    }
+}
 
 /// One catalog entry operators can place on a hub edge.
 #[derive(Debug, Clone, Copy)]
@@ -190,6 +216,7 @@ pub fn paint_node_props(
     step: &mut HubStep,
     p: &ThemePalette,
     host_points: &[PointSnapshot],
+    engine: &EngineHandle,
 ) -> bool {
     let mut dirty = false;
     let step_id = step.id;
@@ -207,7 +234,7 @@ pub fn paint_node_props(
     }
 
     ui.add_space(14.0);
-    live_preview(ui, step, kind, host_points, p);
+    live_preview(ui, step, kind, host_points, engine, p);
 
     ui.add_space(14.0);
     ui.horizontal(|ui| {
@@ -461,12 +488,9 @@ fn compute_preview(kind: &CalcKind, step: &HubStep, x: f64) -> Result<String, St
             Ok(fmt_num(x.clamp(lo.min(hi), lo.max(hi))))
         }
         "deadband" => {
+            // Stateless fallback only — live_preview prefers engine hold state.
             let band = a.unwrap_or(0.5).abs();
-            Ok(format!(
-                "{}  (band ±{}; hold uses last published)",
-                fmt_num(x),
-                fmt_num(band)
-            ))
+            Ok(format!("{}  (band ±{})", fmt_num(x), fmt_num(band)))
         }
         "hysteresis" => {
             let on = a.unwrap_or(80.0);
@@ -604,6 +628,7 @@ fn live_preview(
     step: &HubStep,
     kind: &CalcKind,
     host_points: &[PointSnapshot],
+    engine: &EngineHandle,
     p: &ThemePalette,
 ) {
     ui.label(RichText::new("LIVE PREVIEW").font(font_ui(10.5)).color(p.muted));
@@ -636,9 +661,22 @@ fn live_preview(
         return;
     }
 
-    let out = match parse_f64(&pt.value) {
-        Some(x) => compute_preview(kind, step, x).unwrap_or_else(|m| m),
-        None => "non-numeric".into(),
+    // Deadband / rolling avg peek the shared edge-runner state; other kinds stay local.
+    let out = match kind.id {
+        "deadband" | "rolling_avg" | "scale_offset" | "clamp" => {
+            let cfg = config_from_step(step);
+            if let Ok(rt) = engine.calc_runtime().lock() {
+                peek_for_point(&[cfg], &rt, &step.source_point, &pt.value)
+            } else {
+                parse_f64(&pt.value)
+                    .and_then(|x| compute_preview(kind, step, x).ok())
+                    .unwrap_or_else(|| pt.value.clone())
+            }
+        }
+        _ => match parse_f64(&pt.value) {
+            Some(x) => compute_preview(kind, step, x).unwrap_or_else(|m| m),
+            None => "non-numeric".into(),
+        },
     };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
