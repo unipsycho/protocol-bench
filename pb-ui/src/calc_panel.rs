@@ -184,18 +184,23 @@ fn modal_open_id(step_id: u64) -> Id {
 }
 
 /// Paint calculation node properties (Hubs inspector). Returns true when mutated.
-pub fn paint_node_props(ui: &mut egui::Ui, step: &mut HubStep, p: &ThemePalette) -> bool {
+pub fn paint_node_props(
+    ui: &mut egui::Ui,
+    step: &mut HubStep,
+    p: &ThemePalette,
+    point_names: &[String],
+) -> bool {
     let mut dirty = false;
     let step_id = step.id;
     let modal_id = modal_open_id(step_id);
 
-    // Configuration first.
+    // Configuration first: points the formula reads/writes, then type params.
     let kind = kind_by_id(step.calc_kind.as_str()).unwrap_or(&CALC_KINDS[0]);
     if step.calc_kind != kind.id {
         step.calc_kind = kind.id.into();
         dirty = true;
     }
-    if detail_editor(ui, kind, step, p) {
+    if detail_editor(ui, kind, step, p, point_names) {
         dirty = true;
     }
 
@@ -345,13 +350,56 @@ fn catalog_card(ui: &mut egui::Ui, kind: &CalcKind, active: bool, p: &ThemePalet
         .clicked()
 }
 
+fn point_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    point_names: &[String],
+    salt: (&str, u64),
+    p: &ThemePalette,
+) -> bool {
+    let mut dirty = false;
+    ui.label(RichText::new(label).font(font_ui(10.5)).color(p.muted));
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        let mut pick = value.clone();
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text(if pick.is_empty() {
+                "(type or pick)".to_string()
+            } else {
+                pick.clone()
+            })
+            .width(ui.available_width().min(220.0).max(120.0))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut pick, String::new(), "(none)");
+                for name in point_names {
+                    ui.selectable_value(&mut pick, name.clone(), name);
+                }
+            });
+        if pick != *value {
+            *value = pick;
+            dirty = true;
+        }
+    });
+    ui.add_space(2.0);
+    if ui
+        .add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY))
+        .changed()
+    {
+        dirty = true;
+    }
+    dirty
+}
+
 fn detail_editor(
     ui: &mut egui::Ui,
     kind: &CalcKind,
     step: &mut HubStep,
     p: &ThemePalette,
+    point_names: &[String],
 ) -> bool {
     let mut dirty = false;
+    let step_id = step.id;
     heading(ui, "Configure", p.accent, p);
     ui.add_space(6.0);
     ui.label(
@@ -359,7 +407,44 @@ fn detail_editor(
             .font(font_ui(12.0))
             .color(p.text),
     );
+    ui.add_space(10.0);
+    if point_picker(
+        ui,
+        "SOURCE POINT",
+        &mut step.source_point,
+        point_names,
+        ("pb_calc_src_point", step_id),
+        p,
+    ) {
+        dirty = true;
+    }
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Point the formula / transform reads (edge input value).")
+            .font(font_ui(11.0))
+            .color(p.muted),
+    );
     ui.add_space(8.0);
+    if point_picker(
+        ui,
+        "OUTPUT POINT",
+        &mut step.output_point,
+        point_names,
+        ("pb_calc_out_point", step_id),
+        p,
+    ) {
+        dirty = true;
+    }
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Where the result is written. Pick an existing point or type a new short id \
+(e.g. calc_1) — required when the result must not overwrite the source.",
+        )
+        .font(font_ui(11.0))
+        .color(p.muted),
+    );
+    ui.add_space(10.0);
 
     match kind.id {
         "formula" => {

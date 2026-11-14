@@ -224,6 +224,12 @@ pub struct HubStep {
     /// Window / tau in seconds for time-based kinds.
     #[serde(default)]
     pub window_secs: String,
+    /// Host point the calculation reads (`mqtt_1`, …).
+    #[serde(default)]
+    pub source_point: String,
+    /// Host point the calculation writes. Empty → create/bind when the engine runs.
+    #[serde(default)]
+    pub output_point: String,
 }
 
 fn default_calc_kind() -> String {
@@ -725,6 +731,8 @@ impl HubModel {
             param_a: "1.0".into(),
             param_b: "0.0".into(),
             window_secs: "10".into(),
+            source_point: String::new(),
+            output_point: String::new(),
         };
         if aggregator {
             hub.aggregators.push(step);
@@ -2332,14 +2340,14 @@ fn edit_selected(
             .zip(port_id)
             .is_some_and(|(hub_id, port_id)| find_step(model, hub_id, Some(port_id)).is_some())
         {
-            return edit_step(ui, model, p);
+            return edit_step(ui, model, p, host);
         }
         return edit_port(ui, model, p, mqtt_connections, mqtt, host);
     }
     edit_hub(ui, model, p)
 }
 
-fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
+fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette, host: &HostSnapshot) -> HubChange {
     let Some(hub_id) = model.selected else {
         return HubChange::quiet();
     };
@@ -2410,7 +2418,13 @@ fn edit_step(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
     if !aggregator {
         // Full catalog + params live on the calculation node (not a dock pane).
         ui.add_space(12.0);
-        if crate::calc_panel::paint_node_props(ui, step_field(model, hub_id, step_id), p) {
+        let point_names: Vec<String> = host.points.iter().map(|pt| pt.name.clone()).collect();
+        if crate::calc_panel::paint_node_props(
+            ui,
+            step_field(model, hub_id, step_id),
+            p,
+            &point_names,
+        ) {
             change.dirty = true;
         }
     } else {
