@@ -974,6 +974,7 @@ impl HubModel {
         if self.feeds.iter().any(|f| f == &feed) {
             return false;
         }
+        self.checkpoint();
         self.feeds.push(feed);
         self.apply_feed_binding(from_hub, from_node, to_hub, to_node);
         true
@@ -2272,8 +2273,9 @@ fn diagram_view(
         change.open = Some(pane);
     }
 
-    // PB-63/69: Alt-drag wire feeder → Output/Calc/Agg (persist across frames).
+    // PB-63/75: wire feeder → Output/Calc/Agg (sticky across frames; tip survives release).
     let wire_id = Id::new("pb_hub_fan_wire");
+    let wire_tip_id = Id::new("pb_hub_fan_wire_tip");
     if gesture.wire_from.is_some()
         && child.ctx().data(|d| d.get_temp::<RewireState>(rewire_id)).is_none()
     {
@@ -2283,25 +2285,37 @@ fn diagram_view(
     }
     let mut wire_preview: Option<((u64, Option<u64>), Pos2)> = None;
     if let Some(from) = child.ctx().data(|d| d.get_temp::<(u64, Option<u64>)>(wire_id)) {
-        if let Some(pos) = child.ctx().pointer_interact_pos() {
+        // Suppress node move while a wire drag is active.
+        gesture.drag = None;
+        gesture.drag_started = false;
+        let tip = child
+            .ctx()
+            .pointer_interact_pos()
+            .or_else(|| child.ctx().pointer_hover_pos())
+            .or_else(|| child.ctx().input(|i| i.pointer.latest_pos()));
+        if let Some(pos) = tip {
+            child.ctx().data_mut(|d| d.insert_temp(wire_tip_id, pos));
             wire_preview = Some((from, pos));
         }
-        let released = canvas.drag_stopped()
-            || child.ctx().input(|i| i.pointer.any_released());
+        let released = child.ctx().input(|i| i.pointer.any_released());
         if released {
-            child.ctx().data_mut(|d| d.remove_temp::<(u64, Option<u64>)>(wire_id));
-            if let Some(pos) = child.ctx().pointer_interact_pos() {
-                if let Some(to) = screen
-                    .iter()
-                    .find(|n| sink_role(n.role) && n.rect.contains(pos))
-                {
-                    // Hub body uses port_id None → feeder id is the hub id (PB-73).
-                    if let Some(to_id) = to.port_id {
-                        let from_id = from.1.unwrap_or(from.0);
-                        if model.connect_feed(from.0, from_id, to.hub_id, to_id) {
-                            let _ = model.sync_output_feed_binds(&host.points);
-                            change.dirty = true;
-                        }
+            let drop_at = child
+                .ctx()
+                .data_mut(|d| d.remove_temp::<Pos2>(wire_tip_id))
+                .or(tip);
+            child
+                .ctx()
+                .data_mut(|d| d.remove_temp::<(u64, Option<u64>)>(wire_id));
+            if let Some(pos) = drop_at {
+                if let Some(to) = hit_wire_sink(&screen, pos) {
+                    // Hub body: port_id None → feeder id is the hub id (PB-73/75).
+                    let from_id = from.1.unwrap_or(from.0);
+                    let to_id = to.port_id.unwrap_or(to.hub_id);
+                    if sink_role(to.role)
+                        && model.connect_feed(from.0, from_id, to.hub_id, to_id)
+                    {
+                        let _ = model.sync_output_feed_binds(&host.points);
+                        change.dirty = true;
                     }
                 }
             }
@@ -2345,11 +2359,12 @@ fn diagram_view(
             .iter()
             .find(|n| n.hub_id == from.0 && n.port_id == from.1)
         {
+            // PB-75: preview matches live hub wire color (cyan), not accent.
             link_curve(
                 child.painter(),
                 src.rect,
                 Rect::from_center_size(tip, vec2(1.0, 1.0)),
-                p.accent,
+                p.live,
                 false,
                 true,
             );
@@ -2360,7 +2375,7 @@ fn diagram_view(
             child.painter(),
             Rect::from_center_size(fixed, vec2(1.0, 1.0)),
             Rect::from_center_size(tip, vec2(1.0, 1.0)),
-            p.accent,
+            p.live,
             true,
             true,
         );
@@ -2496,9 +2511,30 @@ fn sink_role(role: Role) -> bool {
     )
 }
 
+/// Drop target for a new/rewired feed — contains or nearest sink within slop (PB-75).
+fn hit_wire_sink(nodes: &[Placed], pos: Pos2) -> Option<&Placed> {
+    if let Some(hit) = nodes
+        .iter()
+        .find(|n| sink_role(n.role) && n.rect.expand(10.0).contains(pos))
+    {
+        return Some(hit);
+    }
+    let mut best: Option<(f32, &Placed)> = None;
+    for n in nodes {
+        if !sink_role(n.role) {
+            continue;
+        }
+        let d = n.rect.distance_to_pos(pos);
+        if d <= 28.0 && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, n));
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
 /// Left/right strip of a node — drag here to start a wire without Alt (PB-73).
 fn near_port_edge(rect: Rect, pos: Pos2) -> bool {
-    let margin = 14.0;
+    let margin = 18.0;
     pos.x <= rect.min.x + margin || pos.x >= rect.max.x - margin
 }
 
@@ -2715,10 +2751,19 @@ fn gesture_nodes(ui: &mut Ui, model: &HubModel, nodes: &[Placed], panning: bool)
             .interact(node.rect, id, Sense::click_and_drag())
             .on_hover_text(tip);
         let key = (node.hub_id, node.port_id);
-        // Port-edge drag starts a wire without Alt (PB-73).
+        // Sticky wire arm: once started on port-edge/Alt, keep wiring for this drag (PB-75).
+        let arm_id = Id::new(("pb_hub_wire_arm", node.hub_id, node.port_id.unwrap_or(0)));
         let port_drag = can_feed
             && pointer.is_some_and(|pos| near_port_edge(node.rect, pos));
-        let start_wire = can_feed && (alt || port_drag);
+        let arm_now = can_feed && (alt || port_drag);
+        if !panning && resp.drag_started() && arm_now {
+            ui.ctx().data_mut(|d| d.insert_temp(arm_id, true));
+        }
+        if resp.drag_stopped() || ui.input(|i| i.pointer.any_released()) {
+            ui.ctx().data_mut(|d| d.remove_temp::<bool>(arm_id));
+        }
+        let armed = ui.ctx().data(|d| d.get_temp::<bool>(arm_id)).unwrap_or(false);
+        let start_wire = can_feed && (arm_now || armed);
         if !panning && (resp.hovered() || resp.dragged()) {
             gesture.hover = Some(key);
             let cursor = if resp.dragged() {
@@ -4475,6 +4520,26 @@ mod tests {
         assert_eq!(model.feeds.len(), 1);
         assert_eq!(model.feeds[0].from_node, hub);
         assert_eq!(model.feeds[0].to_node, calc);
+    }
+
+    #[test]
+    fn hub_can_feed_two_calcs() {
+        let mut model = HubModel::sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let calc_a = model.add_step(hub, false, src).expect("calc a");
+        let calc_b = model.add_step(hub, false, src).expect("calc b");
+        assert!(model.connect_feed(hub, hub, hub, calc_a));
+        assert!(model.connect_feed(hub, hub, hub, calc_b));
+        assert_eq!(model.feeds.len(), 2);
+        assert!(model.feeds.iter().any(|f| f.to_node == calc_a));
+        assert!(model.feeds.iter().any(|f| f.to_node == calc_b));
+        // Input → second Calc uses the same connect path.
+        assert!(model.connect_feed(hub, src, hub, calc_b));
+        assert!(model
+            .feeds
+            .iter()
+            .any(|f| f.from_node == src && f.to_node == calc_b));
     }
 
     #[test]
