@@ -11,8 +11,6 @@ members = [
 ]
 default-members = ["pb-ui"]
 
-# m17-rust-check/ is a separate crate and is not a workspace member.
-
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
