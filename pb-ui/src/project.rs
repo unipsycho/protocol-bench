@@ -17,11 +17,17 @@ use pb_points::{is_address_path, is_short_point_id, PointBinding, PointStore};
 /// v7: additive `opcua` clients + embedded UA server hub.
 pub const PROJECT_VERSION: u32 = 7;
 
-/// Project-level options (Project panel).
+/// Project identity + options (Project panel / project.json).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ProjectSettings {
-    /// When true, start the embedded hub broker on load if `mqtt.embedded.enabled`.
+    /// Display name (falls back to file stem when empty).
     #[serde(default)]
+    pub name: String,
+    /// Free-form project notes.
+    #[serde(default)]
+    pub description: String,
+    /// Legacy PB-57 field — migrated into `ui.toml` `auto_run_embedded_hubs` (PB-58).
+    #[serde(default, skip_serializing)]
     pub auto_run_embedded_broker: bool,
 }
 
@@ -710,7 +716,9 @@ mod tests {
             opcua: OpcUaProject::default(),
             hubs: None,
             settings: ProjectSettings {
-                auto_run_embedded_broker: true,
+                name: "Plant".into(),
+                description: "Roundtrip fixture".into(),
+                auto_run_embedded_broker: false,
             },
         };
         let text = serde_json::to_string_pretty(&project).unwrap();

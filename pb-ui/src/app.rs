@@ -22,8 +22,8 @@ use crate::panels;
 use crate::persist::{self, UiState};
 use crate::project::{self, MqttProject, ProjectFile, ProjectSettings};
 use crate::theme::{
-    self, divider_bar, font_semi, font_ui, tint, AppTheme, ThemePalette, BAR_H, HEADER_H, MIN_PANE,
-    RADIUS, RAIL_W, SEP, STATUS_H,
+    self, apply_form_spacing, divider_bar, font_semi, font_ui, space, tint, AppTheme, ThemePalette,
+    BAR_H, HEADER_H, MIN_PANE, RADIUS, RAIL_W, SEP, STATUS_H,
 };
 
 /// Product slogan from earlier shell About copy (stashed WIP).
@@ -121,6 +121,10 @@ impl ProtocolBenchApp {
                     file.mqtt.apply_to_panel(&mut mqtt);
                     file.opcua.apply_to_panel(&mut opcua);
                     project_settings = file.settings.clone();
+                    // PB-58: legacy project auto-run → app setting (ui.toml).
+                    if file.settings.auto_run_embedded_broker && !ui_state.auto_run_embedded_hubs {
+                        ui_state.auto_run_embedded_hubs = true;
+                    }
                     if let Some(hubs) = file.hubs {
                         ui_state.hubs = hubs;
                         // Rebuild ephemeral canvas selection from persisted selected/port.
@@ -141,13 +145,13 @@ impl ProtocolBenchApp {
                         &engine,
                         &mut mqtt,
                         &ui_state.hubs,
-                        project_settings.auto_run_embedded_broker,
+                        ui_state.auto_run_embedded_hubs,
                     );
                     opcua_panel::apply_opcua_session(&engine, &mut opcua, &ui_state.hubs);
                     opcua_panel::maybe_auto_start_embedded(
                         &engine,
                         &mut opcua,
-                        project_settings.auto_run_embedded_broker,
+                        ui_state.auto_run_embedded_hubs,
                     );
                     status = format!("Loaded project {}", project_path.display());
                 }
@@ -284,6 +288,10 @@ impl ProtocolBenchApp {
         file.mqtt.apply_to_panel(&mut self.mqtt);
         file.opcua.apply_to_panel(&mut self.opcua);
         self.project_settings = file.settings.clone();
+        if file.settings.auto_run_embedded_broker && !self.ui_state.auto_run_embedded_hubs {
+            self.ui_state.auto_run_embedded_hubs = true;
+            self.mark_dirty();
+        }
         if let Some(hubs) = file.hubs {
             self.ui_state.hubs = hubs;
             self.ui_state.hubs.sanitize();
@@ -301,14 +309,14 @@ impl ProtocolBenchApp {
         opcua_panel::maybe_auto_start_embedded(
             &self.engine,
             &mut self.opcua,
-            self.project_settings.auto_run_embedded_broker,
+            self.ui_state.auto_run_embedded_hubs,
         );
         mqtt_panel::apply_mqtt_session(&self.engine, &mut self.mqtt, &self.ui_state.hubs);
         mqtt_panel::maybe_auto_start_embedded(
             &self.engine,
             &mut self.mqtt,
             &self.ui_state.hubs,
-            self.project_settings.auto_run_embedded_broker,
+            self.ui_state.auto_run_embedded_hubs,
         );
         self.status = format!("Opened {}", self.project_path.display());
         Ok(())
@@ -921,6 +929,7 @@ impl ProtocolBenchApp {
                     .inner_margin(egui::Margin::same(16.0)),
             )
             .show(ctx, |ui| {
+                apply_form_spacing(ui);
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Settings")
@@ -948,7 +957,47 @@ impl ProtocolBenchApp {
                         .font(font_ui(12.0))
                         .color(p.muted),
                 );
-                ui.add_space(12.0);
+                ui.add_space(space::SECTION - 2.0);
+                ui.label(
+                    egui::RichText::new("HUBS")
+                        .font(font_ui(10.5))
+                        .color(p.muted),
+                );
+                ui.add_space(space::AFTER_HEADING);
+                let prev_auto = self.ui_state.auto_run_embedded_hubs;
+                if ui
+                    .checkbox(
+                        &mut self.ui_state.auto_run_embedded_hubs,
+                        "Auto-run embedded hubs",
+                    )
+                    .changed()
+                {
+                    self.mark_dirty();
+                    // Turning on at runtime starts MQTT + OPC UA hubs when configured.
+                    if self.ui_state.auto_run_embedded_hubs && !prev_auto {
+                        mqtt_panel::maybe_auto_start_embedded(
+                            &self.engine,
+                            &mut self.mqtt,
+                            &self.ui_state.hubs,
+                            true,
+                        );
+                        opcua_panel::maybe_auto_start_embedded(
+                            &self.engine,
+                            &mut self.opcua,
+                            true,
+                        );
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "When enabled, start the MQTT broker and OPC UA server hubs on load \
+(and when this is turned on) if they are configured in their panels.",
+                    )
+                    .font(font_ui(11.5))
+                    .color(p.muted),
+                );
+                ui.add_space(16.0);
                 if text_button(ui, "Reset layout", p).clicked() {
                     self.reset_layout();
                 }
@@ -1344,7 +1393,6 @@ impl ProtocolBenchApp {
                     .layout(Layout::top_down(egui::Align::Min)),
             );
             body_ui.set_clip_rect(body.expand(2.0).intersect(clip));
-            let prev_auto = self.project_settings.auto_run_embedded_broker;
             let hub_change = panels::paint(
                 &mut body_ui,
                 active,
@@ -1371,16 +1419,6 @@ impl ProtocolBenchApp {
                     &mut self.opcua,
                     &self.ui_state.hubs,
                 );
-            }
-            // Honor auto-run when the Project checkbox is turned on.
-            if self.project_settings.auto_run_embedded_broker && !prev_auto {
-                mqtt_panel::maybe_auto_start_embedded(
-                    &self.engine,
-                    &mut self.mqtt,
-                    &self.ui_state.hubs,
-                    true,
-                );
-                opcua_panel::maybe_auto_start_embedded(&self.engine, &mut self.opcua, true);
             }
             if let Some(pane) = hub_change.open {
                 self.ui_state.reveal_pane(pane);

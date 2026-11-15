@@ -22,6 +22,9 @@ pub struct UiState {
     /// Conversion hubs drawn in the Hubs panel. Missing files get the sample diagram.
     #[serde(default)]
     pub hubs: HubModel,
+    /// App-level: start MQTT + OPC UA embedded hubs on load when configured (PB-58).
+    #[serde(default)]
+    pub auto_run_embedded_hubs: bool,
 }
 
 fn default_theme() -> String {
@@ -36,6 +39,7 @@ impl Default for UiState {
             maximized: None,
             hidden_panes: Vec::new(),
             hubs: HubModel::sample(),
+            auto_run_embedded_hubs: false,
         }
     }
 }
