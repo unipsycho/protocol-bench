@@ -172,7 +172,7 @@ impl ProtocolBenchApp {
             pane_hits: Vec::new(),
             pending: None,
             about_open: false,
-            settings_open: false,
+            settings_open: std::env::var_os("PB_OPEN_SETTINGS").is_some(),
             menu: None,
             status,
             service_connected: true,
