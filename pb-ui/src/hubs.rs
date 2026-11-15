@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 
 use crate::dock::DockPane;
 use crate::mqtt_panel::MqttPanelState;
+use crate::opcua_browse::{self, BrowseAction, BrowseMode};
+use crate::opcua_panel::OpcUaPanelState;
 use crate::point_rows;
 use crate::theme::{
     after_field, apply_form_spacing, blend_scope, divider_bar, font_semi, font_ui, mix, space, tint,
@@ -1859,6 +1861,7 @@ pub fn paint(
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
+    opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
     engine: &pb_engine::EngineHandle,
 ) -> HubChange {
@@ -1921,6 +1924,7 @@ pub fn paint(
                 p,
                 mqtt_connections,
                 mqtt,
+                opcua,
                 host,
                 engine,
             ));
@@ -1937,6 +1941,7 @@ pub fn paint(
             p,
             mqtt_connections,
             mqtt,
+            opcua,
             host,
             engine,
         ));
@@ -3518,6 +3523,7 @@ fn inspector(
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
+    opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
     engine: &pb_engine::EngineHandle,
 ) -> HubChange {
@@ -3550,6 +3556,7 @@ fn inspector(
                 p,
                 mqtt_connections,
                 mqtt,
+                opcua,
                 host,
                 engine,
             ));
@@ -3563,6 +3570,7 @@ fn edit_selected(
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
+    opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
     engine: &pb_engine::EngineHandle,
 ) -> HubChange {
@@ -3599,7 +3607,7 @@ fn edit_selected(
         {
             return edit_step(ui, model, p, host, engine);
         }
-        return edit_port(ui, model, p, mqtt_connections, mqtt, host);
+        return edit_port(ui, model, p, mqtt_connections, mqtt, opcua, host, engine);
     }
     edit_hub(ui, model, p)
 }
@@ -3722,7 +3730,9 @@ fn edit_port(
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
+    opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
+    engine: &pb_engine::EngineHandle,
 ) -> HubChange {
     let Some(hub_id) = model.selected else {
         return HubChange::quiet();
@@ -3824,7 +3834,9 @@ fn edit_port(
     }
     if proto == HubProto::OpcUa && incoming {
         ui.add_space(space::SECTION - 2.0);
-        change = change.join(edit_opcua_input_binds(ui, model, hub_id, port_id, p));
+        change = change.join(edit_opcua_input_binds(
+            ui, model, hub_id, port_id, opcua, engine, p,
+        ));
     }
     // MQTT Input: no Hub details / Remove — delete via diagram select/Delete or right-click.
     if !(proto == HubProto::Mqtt && incoming) {
@@ -3844,12 +3856,14 @@ fn edit_port(
     change
 }
 
-/// OPC UA Input: client id + NodeId binds (browse in OPC UA panel; Manual here).
+/// OPC UA Input: client id + browse tree pick / manual NodeId binds (PB-89).
 fn edit_opcua_input_binds(
     ui: &mut Ui,
     model: &mut HubModel,
     hub_id: u64,
     port_id: u64,
+    opcua: &mut OpcUaPanelState,
+    engine: &pb_engine::EngineHandle,
     p: &ThemePalette,
 ) -> HubChange {
     let mut change = HubChange::quiet();
@@ -3875,6 +3889,42 @@ fn edit_opcua_input_binds(
         }
     }
     after_field(ui);
+    let conn_id = port_field(model, hub_id, port_id).opcua_connection.clone();
+    // Shared browse tree for this client (same widget as OPC UA panel).
+    if !conn_id.trim().is_empty() {
+        ui.add_space(space::AFTER_BLURB);
+        ui.label(
+            egui::RichText::new("BROWSE — click a Variable to bind")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        let tree = opcua.trees.entry(conn_id.clone()).or_default().clone();
+        let salt = format!("pb_opcua_input_br_{port_id}");
+        match opcua_browse::paint(ui, &tree, &salt, BrowseMode::PickNode, p) {
+            Some(BrowseAction::Pick(pick)) => {
+                port_field(model, hub_id, port_id)
+                    .opcua_inputs
+                    .push(OpcUaInputBind {
+                        node_id: pick.node_id,
+                        point: String::new(),
+                        mode: "subscribe".into(),
+                    });
+                change.dirty = true;
+            }
+            Some(BrowseAction::Expand(node_id)) => {
+                let json = serde_json::json!({
+                    "op": "browse",
+                    "id": conn_id,
+                    "node_id": node_id,
+                })
+                .to_string();
+                engine.submit(pb_engine::EngineId::OpcUa, pb_engine::EngineCommand::Configure { json });
+            }
+            None => {}
+        }
+        after_field(ui);
+    }
     ui.add_space(space::AFTER_BLURB);
     ui.label(
         egui::RichText::new("NODE BINDS — NodeId → point")
@@ -3946,7 +3996,7 @@ fn edit_opcua_input_binds(
     after_field(ui);
     ui.label(
         egui::RichText::new(
-            "Tip: browse variables in the OPC UA panel, then paste the NodeId here.",
+            "Tip: expand folders in the tree above, or paste a NodeId manually.",
         )
         .font(font_ui(11.0))
         .color(p.muted),

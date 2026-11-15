@@ -112,7 +112,8 @@ struct ClientRuntime {
     connected: bool,
     state: String,
     last_error: String,
-    browse: Vec<BrowseNode>,
+    /// Parent NodeId → children (PB-89 hierarchical browse).
+    browse_by_parent: BTreeMap<String, Vec<BrowseNode>>,
     checklist: String,
 }
 
@@ -124,7 +125,7 @@ impl ClientRuntime {
             connected: false,
             state: "disconnected".into(),
             last_error: String::new(),
-            browse: Vec::new(),
+            browse_by_parent: BTreeMap::new(),
             checklist: String::new(),
         }
     }
@@ -191,6 +192,7 @@ impl PackState {
         }
         rt.connected = false;
         rt.state = "disconnected".into();
+        rt.browse_by_parent.clear();
     }
 
     fn start_client(rt: &mut ClientRuntime) -> Result<(), String> {
@@ -269,8 +271,8 @@ impl PackState {
                 }
                 self.log(PB_LOG_INFO, &format!("[{id}] {detail}"));
             }
-            SessionEvent::Browse { nodes } => {
-                rt.browse = nodes;
+            SessionEvent::Browse { parent_id, nodes } => {
+                rt.browse_by_parent.insert(parent_id, nodes);
             }
             SessionEvent::Data { node_id, value } => {
                 let conn = rt.config.id.clone();
@@ -631,19 +633,29 @@ impl PackState {
             .clients
             .values()
             .map(|rt| {
-                let browse: Vec<Value> = rt
-                    .browse
-                    .iter()
-                    .take(400)
-                    .map(|n| {
-                        serde_json::json!({
-                            "node_id": n.node_id,
-                            "browse_name": n.browse_name,
-                            "display_name": n.display_name,
-                            "is_variable": n.is_variable,
+                // Parent → children map for hierarchical UI merge (PB-89).
+                let mut browse = serde_json::Map::new();
+                let mut remaining = 800usize;
+                for (parent, kids) in &rt.browse_by_parent {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = kids.len().min(remaining);
+                    remaining -= take;
+                    let rows: Vec<Value> = kids
+                        .iter()
+                        .take(take)
+                        .map(|n| {
+                            serde_json::json!({
+                                "node_id": n.node_id,
+                                "browse_name": n.browse_name,
+                                "display_name": n.display_name,
+                                "is_variable": n.is_variable,
+                            })
                         })
-                    })
-                    .collect();
+                        .collect();
+                    browse.insert(parent.clone(), Value::Array(rows));
+                }
                 serde_json::json!({
                     "id": rt.config.id,
                     "label": rt.config.label,

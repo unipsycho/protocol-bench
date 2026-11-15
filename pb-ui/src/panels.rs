@@ -48,8 +48,9 @@ pub fn paint(
         DockPane::Hubs => {
             // Sync trees so Input inspector can pick topics from live traffic.
             mqtt.sync_trees_from_host(host);
+            opcua.sync_from_host(host);
             let conns = mqtt.connection_choices();
-            crate::hubs::paint(ui, hubs, p, &conns, mqtt, host, engine)
+            crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, host, engine)
         }
         DockPane::Mqtt => {
             mqtt_panel::paint(ui, host, p, engine, mqtt, hubs);

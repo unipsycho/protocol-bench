@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::hubs::HubModel;
-use crate::opcua_browse::{self, BrowseMode, BrowseNode, BrowseTree};
+use crate::opcua_browse::{self, BrowseAction, BrowseMode, BrowseTree, FlatBrowseRow};
 use crate::theme::{
     after_field, apply_form_spacing, font_semi, font_ui, form_inset, space, ThemePalette,
 };
@@ -238,35 +238,14 @@ impl OpcUaPanelState {
                 if id.is_empty() {
                     continue;
                 }
-                let rows: Vec<BrowseNode> = c
-                    .get("browse")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|n| {
-                                Some(BrowseNode {
-                                    node_id: n.get("node_id")?.as_str()?.to_string(),
-                                    browse_name: n
-                                        .get("browse_name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string(),
-                                    display_name: n
-                                        .get("display_name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string(),
-                                    is_variable: n
-                                        .get("is_variable")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false),
-                                    children: BTreeMap::new(),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                self.trees.entry(id.to_string()).or_default().sync_from_rows(&rows);
+                // PB-89: browse is a parent→children map (legacy array = Objects kids).
+                let by_parent = parse_browse_map(c.get("browse"));
+                if !by_parent.is_empty() {
+                    self.trees
+                        .entry(id.to_string())
+                        .or_default()
+                        .sync_from_parent_map(&by_parent);
+                }
                 if let Some(err) = c.get("last_error").and_then(|v| v.as_str()) {
                     if !err.is_empty() {
                         self.last_error = format!("{id}: {err}");
@@ -741,6 +720,50 @@ fn selected_client_editor(
     }
 }
 
+fn parse_browse_map(value: Option<&serde_json::Value>) -> BTreeMap<String, Vec<FlatBrowseRow>> {
+    let Some(value) = value else {
+        return BTreeMap::new();
+    };
+    let parse_row = |n: &serde_json::Value| -> Option<FlatBrowseRow> {
+        Some(FlatBrowseRow {
+            node_id: n.get("node_id")?.as_str()?.to_string(),
+            browse_name: n
+                .get("browse_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            display_name: n
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            is_variable: n
+                .get("is_variable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        })
+    };
+    let mut out = BTreeMap::new();
+    if let Some(obj) = value.as_object() {
+        for (parent, kids) in obj {
+            let rows = kids
+                .as_array()
+                .map(|arr| arr.iter().filter_map(parse_row).collect())
+                .unwrap_or_default();
+            out.insert(parent.clone(), rows);
+        }
+        return out;
+    }
+    // Legacy flat array → Objects children.
+    if let Some(arr) = value.as_array() {
+        let rows: Vec<FlatBrowseRow> = arr.iter().filter_map(parse_row).collect();
+        if !rows.is_empty() {
+            out.insert("Objects".into(), rows);
+        }
+    }
+    out
+}
+
 fn browse_preview(
     ui: &mut egui::Ui,
     state: &mut OpcUaPanelState,
@@ -749,23 +772,57 @@ fn browse_preview(
 ) {
     panel_heading(ui, "Browse", p.live, p);
     ui.add_space(space::AFTER_HEADING);
+    ui.label(
+        egui::RichText::new(
+            "Objects → folders → variables. Expand folders to load children; click a Variable to select its NodeId.",
+        )
+        .font(font_ui(12.0))
+        .color(p.muted),
+    );
+    ui.add_space(space::AFTER_BLURB);
+    apply_form_spacing(ui);
     let id = state.selected().map(|c| c.id.clone()).unwrap_or_default();
     let tree = state.trees.entry(id.clone()).or_default().clone();
-    let pick = opcua_browse::paint(ui, &tree, "pb_opcua_browse", BrowseMode::PickNode, p);
-    if let Some(pick) = pick {
-        if let Some(c) = state.selected_mut() {
-            c.draft_node_id = pick.node_id.clone();
+    let action = opcua_browse::paint(ui, &tree, "pb_opcua_browse", BrowseMode::PickNode, p);
+    match action {
+        Some(BrowseAction::Pick(pick)) => {
+            if let Some(c) = state.selected_mut() {
+                c.draft_node_id = pick.node_id.clone();
+            }
+            if let Some(c) = state.selected() {
+                let json = serde_json::json!({
+                    "op": "monitor",
+                    "id": c.id,
+                    "node_id": pick.node_id,
+                    "point": "",
+                    "mode": "subscribe",
+                })
+                .to_string();
+                engine.submit(EngineId::OpcUa, EngineCommand::Configure { json });
+            }
         }
-        if let Some(c) = state.selected() {
-            let json = serde_json::json!({
-                "op": "monitor",
-                "id": c.id,
-                "node_id": pick.node_id,
-                "point": "",
-                "mode": "subscribe",
-            })
-            .to_string();
-            engine.submit(EngineId::OpcUa, EngineCommand::Configure { json });
+        Some(BrowseAction::Expand(node_id)) => {
+            if !id.is_empty() {
+                let json = serde_json::json!({
+                    "op": "browse",
+                    "id": id,
+                    "node_id": node_id,
+                })
+                .to_string();
+                engine.submit(EngineId::OpcUa, EngineCommand::Configure { json });
+            }
+        }
+        None => {}
+    }
+    // Show last selected NodeId for bind copy/paste into Hub Input.
+    if let Some(c) = state.selected() {
+        if !c.draft_node_id.is_empty() {
+            ui.add_space(space::AFTER_FIELD);
+            ui.label(
+                egui::RichText::new(format!("Selected NodeId: {}", c.draft_node_id))
+                    .font(font_ui(12.0))
+                    .color(p.live),
+            );
         }
     }
 }

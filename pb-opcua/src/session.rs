@@ -17,7 +17,9 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     State { connected: bool, detail: String },
+    /// Children of `parent_id` (canonical `"Objects"` for the Objects folder).
     Browse {
+        parent_id: String,
         nodes: Vec<BrowseNode>,
     },
     Data {
@@ -229,9 +231,12 @@ async fn run_session(
         detail: "connected".into(),
     });
 
-    // Initial Objects folder browse so the panel has a tree seed.
+    // Initial Objects folder browse so the panel has a tree seed (PB-89).
     if let Ok(nodes) = browse_children(&session, &NodeId::objects_folder_id()).await {
-        let _ = ev_tx.send(SessionEvent::Browse { nodes });
+        let _ = ev_tx.send(SessionEvent::Browse {
+            parent_id: "Objects".into(),
+            nodes,
+        });
     }
 
     let mut poll_nodes: Vec<String> = Vec::new();
@@ -250,9 +255,10 @@ async fn run_session(
                 }
                 Cmd::Browse { node_id } => {
                     let nid = parse_node_id(&node_id).unwrap_or_else(NodeId::objects_folder_id);
+                    let parent_id = browse_parent_key(&node_id, &nid);
                     match browse_children(&session, &nid).await {
                         Ok(nodes) => {
-                            let _ = ev_tx.send(SessionEvent::Browse { nodes });
+                            let _ = ev_tx.send(SessionEvent::Browse { parent_id, nodes });
                         }
                         Err(e) => {
                             let _ = ev_tx.send(SessionEvent::Error {
@@ -432,6 +438,23 @@ fn parse_mode(raw: &str) -> MessageSecurityMode {
         "signandencrypt" | "sign&encrypt" => MessageSecurityMode::SignAndEncrypt,
         "sign" => MessageSecurityMode::Sign,
         _ => MessageSecurityMode::None,
+    }
+}
+
+/// Canonical parent key for browse merge — Objects folder always `"Objects"`.
+fn browse_parent_key(requested: &str, resolved: &NodeId) -> String {
+    let t = requested.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("objects") || t == "i=85" {
+        return "Objects".into();
+    }
+    if *resolved == NodeId::objects_folder_id() {
+        return "Objects".into();
+    }
+    // Prefer the caller's id so UI expand requests round-trip cleanly.
+    if !t.is_empty() {
+        t.to_string()
+    } else {
+        resolved.to_string()
     }
 }
 
