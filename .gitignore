@@ -1,9 +1,11 @@
 /target
 **/*.rs.bk
 
-# nested crate build output
 
 # built protocol packs (copy with scripts/mqtt-smoke.sh)
 modules/*.so
 modules/*.dll
 modules/*.dylib
+
+# local OPC UA PKI scratch (never commit)
+pki/
