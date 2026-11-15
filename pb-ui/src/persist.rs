@@ -77,6 +77,13 @@ impl UiState {
         if !self.tree.contains_pane(DockPane::Hubs) {
             self.tree.band_north(DockPane::Hubs, 0.34);
         }
+        // Calculations moved into hub node properties — drop any leftover dock leaf.
+        let _ = self.tree.remove_leaf(DockPane::Calculations);
+        self.hidden_panes
+            .retain(|pane| *pane != DockPane::Calculations);
+        if self.maximized == Some(DockPane::Calculations) {
+            self.maximized = None;
+        }
         for pane in DockPane::ALL {
             self.tree
                 .ensure_pane(pane, DockPane::Project, TileEdge::East);
