@@ -2,7 +2,8 @@
 //! Shared browse widget lives in `opcua_browse` (panel + Hub Input).
 
 use egui::{Color32, Layout, Pos2, Rect, Sense, UiBuilder, Vec2};
-use pb_engine::{EngineCommand, EngineHandle, EngineId, HostSnapshot};
+use crate::engine_api::EngineHandle;
+use pb_engine::{EngineCommand, EngineId, HostSnapshot};
 use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;

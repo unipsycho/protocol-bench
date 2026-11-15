@@ -1863,7 +1863,7 @@ pub fn paint(
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
-    engine: &pb_engine::EngineHandle,
+    engine: &crate::engine_api::EngineHandle,
 ) -> HubChange {
     let mut change = HubChange::quiet();
     // Keep Output auto-binds aligned with inbound feed wires (PB-63).
@@ -3525,7 +3525,7 @@ fn inspector(
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
-    engine: &pb_engine::EngineHandle,
+    engine: &crate::engine_api::EngineHandle,
 ) -> HubChange {
     let (rect, _) = ui.allocate_exact_size(vec2(width.max(1.0), height.max(1.0)), Sense::hover());
     ui.painter()
@@ -3572,7 +3572,7 @@ fn edit_selected(
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
-    engine: &pb_engine::EngineHandle,
+    engine: &crate::engine_api::EngineHandle,
 ) -> HubChange {
     // Item-specific properties only when exactly one canvas node is selected.
     if model.multi_selected() {
@@ -3617,7 +3617,7 @@ fn edit_step(
     model: &mut HubModel,
     p: &ThemePalette,
     host: &HostSnapshot,
-    engine: &pb_engine::EngineHandle,
+    engine: &crate::engine_api::EngineHandle,
 ) -> HubChange {
     let Some(hub_id) = model.selected else {
         return HubChange::quiet();
@@ -3732,7 +3732,7 @@ fn edit_port(
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
-    engine: &pb_engine::EngineHandle,
+    engine: &crate::engine_api::EngineHandle,
 ) -> HubChange {
     let Some(hub_id) = model.selected else {
         return HubChange::quiet();
@@ -3863,7 +3863,7 @@ fn edit_opcua_input_binds(
     hub_id: u64,
     port_id: u64,
     opcua: &mut OpcUaPanelState,
-    engine: &pb_engine::EngineHandle,
+    engine: &crate::engine_api::EngineHandle,
     p: &ThemePalette,
 ) -> HubChange {
     let mut change = HubChange::quiet();

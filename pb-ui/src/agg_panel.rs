@@ -1,7 +1,8 @@
 //! Aggregator node properties — N≥2 member combine → host `agg_N`.
 
 use egui::{Align, Layout, RichText, Vec2};
-use pb_engine::{agg_point_name, peek_agg, AggConfig, EngineHandle, PointSnapshot};
+use crate::engine_api::EngineHandle;
+use pb_engine::{agg_point_name, peek_agg, AggConfig, PointSnapshot};
 use pb_points::{PointValue, Quality};
 
 use crate::hubs::HubStep;

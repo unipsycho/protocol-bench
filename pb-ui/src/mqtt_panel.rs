@@ -4,7 +4,8 @@
 //! one connection; each node owns its own topic/field → point binds.
 
 use egui::{Color32, Layout, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2};
-use pb_engine::{EngineCommand, EngineHandle, EngineId, HostSnapshot};
+use crate::engine_api::EngineHandle;
+use pb_engine::{EngineCommand, EngineId, HostSnapshot};
 use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;

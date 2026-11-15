@@ -3594,6 +3594,19 @@ dependencies = [
  "libloading",
  "pb-abi",
  "pb-points",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pb-ipc"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "pb-engine",
+ "pb-points",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3631,8 +3644,12 @@ name = "pb-service"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
+ "directories",
  "pb-engine",
+ "pb-ipc",
  "pb-points",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3645,6 +3662,7 @@ dependencies = [
  "egui",
  "image",
  "pb-engine",
+ "pb-ipc",
  "pb-points",
  "serde",
  "serde_json",

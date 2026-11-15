@@ -4,7 +4,8 @@
 //! Catalog lives in a large modal help guide; picking a type pre-fills config.
 
 use egui::{Align, Align2, Color32, Id, Layout, RichText, Sense, Vec2};
-use pb_engine::{peek_for_point, CalcConfig, EngineHandle, PointSnapshot};
+use crate::engine_api::EngineHandle;
+use pb_engine::{peek_for_point, CalcConfig, PointSnapshot};
 
 use crate::hubs::{HubModel, HubStep};
 use crate::theme::{font_semi, font_ui, ThemePalette};

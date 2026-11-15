@@ -12,6 +12,7 @@ pub use loader::{default_modules_dir, load_packs, verify_pack_stub, LoadedPack, 
 pub use pack_engine::PackEngine;
 
 use pb_points::PointStore;
+use serde::{Deserialize, Serialize};
 
 pub mod agg;
 pub mod calc;
@@ -27,7 +28,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Which protocol engine a command or snapshot row belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EngineId {
     Streams,
     Modbus,
@@ -88,7 +90,8 @@ impl EngineId {
 }
 
 /// Command from the UI / service. Handled only on `pb-engine`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
 pub enum EngineCommand {
     /// Cross-thread scaffold signal. Does not open a socket, port, or file.
     Acknowledge,
@@ -99,6 +102,7 @@ pub enum EngineCommand {
     Subscribe { topic: String, qos: u8 },
     Publish {
         topic: String,
+        #[serde(with = "serde_bytes_vec")]
         payload: Vec<u8>,
         qos: u8,
         retain: bool,
@@ -109,6 +113,23 @@ pub enum EngineCommand {
         /// UTF-8 string payload for the first cut.
         value: String,
     },
+}
+
+mod serde_bytes_vec {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        // JSON-friendly base64-ish: array of numbers is fine for small payloads.
+        s.collect_seq(bytes.iter().copied())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let vals: Vec<u64> = Vec::deserialize(d)?;
+        vals.into_iter()
+            .map(|v| u8::try_from(v).map_err(D::Error::custom))
+            .collect()
+    }
 }
 
 /// One protocol implementation. Only the host thread calls these methods.
@@ -165,7 +186,7 @@ impl ProtocolEngine for IdleEngine {
     fn snapshot(&self) -> SlotSnapshot {
         SlotSnapshot {
             id: self.id,
-            title: self.id.title(),
+            title: self.id.title().into(),
             state: "idle".into(),
             note: self.id.note().into(),
             ticks: self.ticks,
@@ -180,10 +201,10 @@ impl ProtocolEngine for IdleEngine {
 }
 
 /// One engine slot, copied out for the UI thread.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlotSnapshot {
     pub id: EngineId,
-    pub title: &'static str,
+    pub title: String,
     pub state: String,
     pub note: String,
     pub ticks: u64,
@@ -200,7 +221,7 @@ impl SlotSnapshot {
     fn scaffold(id: EngineId) -> Self {
         Self {
             id,
-            title: id.title(),
+            title: id.title().into(),
             state: "idle".into(),
             note: id.note().into(),
             ticks: 0,
@@ -215,7 +236,7 @@ impl SlotSnapshot {
 }
 
 /// One host point, copied for the UI (packs upsert into the live store).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PointSnapshot {
     pub name: String,
     pub value: String,
@@ -225,7 +246,7 @@ pub struct PointSnapshot {
 }
 
 /// What the UI is allowed to know about the host.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostSnapshot {
     pub thread_name: String,
     pub alive: bool,
