@@ -3901,7 +3901,7 @@ fn edit_opcua_input_binds(
         ui.add_space(space::AFTER_HEADING);
         let tree = opcua.trees.entry(conn_id.clone()).or_default().clone();
         let salt = format!("pb_opcua_input_br_{port_id}");
-        match opcua_browse::paint(ui, &tree, &salt, BrowseMode::PickNode, p) {
+        match opcua_browse::paint(ui, &tree, &salt, BrowseMode::PickNode, p, 240.0) {
             Some(BrowseAction::Pick(pick)) => {
                 port_field(model, hub_id, port_id)
                     .opcua_inputs

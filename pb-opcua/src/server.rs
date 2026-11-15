@@ -65,7 +65,10 @@ impl EmbeddedServer {
         let cancel_c = cancel.clone();
         let live: Arc<Mutex<Option<LiveServer>>> = Arc::new(Mutex::new(None));
         let live_c = Arc::clone(&live);
+        let boot_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let boot_err_c = Arc::clone(&boot_err);
         let cfg_c = cfg.clone();
+        let advertise_c = advertise.clone();
 
         let join = thread::Builder::new()
             .name("pb-opcua-server".into())
@@ -76,18 +79,66 @@ impl EmbeddedServer {
                     .build()
                 {
                     Ok(rt) => rt,
-                    Err(_) => return,
-                };
-                rt.block_on(async move {
-                    if let Err(e) = run_server(cfg_c, host, pki, cancel_c, live_c).await {
-                        log::error!("embedded OPC UA server: {e}");
+                    Err(e) => {
+                        if let Ok(mut g) = boot_err_c.lock() {
+                            *g = Some(format!("tokio runtime: {e}"));
+                        }
+                        return;
                     }
-                });
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rt.block_on(async move {
+                        run_server(cfg_c, host, advertise_c, pki, cancel_c, live_c).await
+                    })
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        log::error!("embedded OPC UA server: {e}");
+                        if let Ok(mut g) = boot_err_c.lock() {
+                            *g = Some(e);
+                        }
+                    }
+                    Err(panic) => {
+                        let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                            format!("panic: {s}")
+                        } else if let Some(s) = panic.downcast_ref::<String>() {
+                            format!("panic: {s}")
+                        } else {
+                            "panic: embedded OPC UA server thread".into()
+                        };
+                        log::error!("embedded OPC UA server: {msg}");
+                        if let Ok(mut g) = boot_err_c.lock() {
+                            *g = Some(msg);
+                        }
+                    }
+                }
             })
             .map_err(|e| format!("spawn server: {e}"))?;
 
-        // Brief settle so Start status can probe.
-        std::thread::sleep(std::time::Duration::from_millis(80));
+        // Wait until address space is live (build succeeded) or boot failed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if live.lock().map(|g| g.is_some()).unwrap_or(false) {
+                break;
+            }
+            let failed = boot_err.lock().ok().and_then(|g| g.clone());
+            if let Some(e) = failed {
+                let _ = join.join();
+                return Err(e);
+            }
+            if std::time::Instant::now() >= deadline {
+                let detail = boot_err
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .unwrap_or_else(|| "embedded OPC UA server did not become ready".into());
+                cancel.cancel();
+                let _ = join.join();
+                return Err(detail);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         Ok(Self {
             listen,
             cancel,
@@ -176,6 +227,7 @@ pub struct EmbeddedServerConfig {
 async fn run_server(
     cfg: EmbeddedServerConfig,
     host: String,
+    advertise: String,
     pki: PathBuf,
     cancel: CancellationToken,
     live: Arc<Mutex<Option<LiveServer>>>,
@@ -186,12 +238,16 @@ async fn run_server(
         vec![ANONYMOUS_USER_TOKEN_ID] // v1 still offers anonymous; users[] later
     };
 
+    // async-opcua requires at least one discovery URL (build fails otherwise).
+    let discovery = format!("opc.tcp://{advertise}:{}/", cfg.port);
+
     let mut builder = ServerBuilder::new()
         .application_name(cfg.application_name.clone())
         .application_uri(cfg.application_uri.clone())
         .product_uri("urn:protocol-bench")
         .host(host)
         .port(cfg.port)
+        .discovery_urls(vec![discovery])
         .pki_dir(pki)
         .create_sample_keypair(cfg.auto_generate_cert)
         .trust_client_certs(cfg.auto_trust_clients)
@@ -248,7 +304,11 @@ async fn run_server(
         space.add_folder(&folder, "Points", "Points", &NodeId::objects_folder_id());
     }
 
-    if let Ok(mut g) = live.lock() {
+    // Mark ready before run() so start() can unblock while accept loop starts.
+    {
+        let mut g = live
+            .lock()
+            .map_err(|_| "embedded OPC UA live lock poisoned".to_string())?;
         *g = Some(LiveServer {
             handle: handle.clone(),
             manager,
@@ -279,4 +339,50 @@ fn resolve_pki_dir(override_path: &str) -> Result<PathBuf, String> {
     let p = dirs.data_dir().join("opcua-pki");
     std::fs::create_dir_all(&p).map_err(|e| format!("pki dir: {e}"))?;
     Ok(p)
+}
+
+#[cfg(test)]
+mod listen_probe {
+    use super::*;
+
+    fn cfg(port: u16, bind: &str, pki: &str) -> EmbeddedServerConfig {
+        EmbeddedServerConfig {
+            bind: bind.into(),
+            port,
+            application_uri: "urn:protocol-bench:probe".into(),
+            application_name: "probe".into(),
+            allow_anonymous: true,
+            enable_sign_and_encrypt: false,
+            auto_generate_cert: true,
+            auto_trust_clients: true,
+            pki_dir: pki.into(),
+        }
+    }
+
+    #[test]
+    fn start_binds_tcp() {
+        let dir = std::env::temp_dir().join(format!("pb-opcua-probe-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let server = EmbeddedServer::start(cfg(4847, "127.0.0.1", &dir.to_string_lossy())).expect("start");
+        assert!(server.live.lock().map(|g| g.is_some()).unwrap_or(false));
+        assert!(std::net::TcpStream::connect_timeout(
+            &"127.0.0.1:4847".parse().unwrap(),
+            std::time::Duration::from_millis(500),
+        )
+        .is_ok());
+        server.stop();
+    }
+
+    #[test]
+    fn start_binds_tcp_zerohost_app_pki() {
+        let dir = "/home/mike/.local/share/protocolbench/opcua-pki";
+        let _ = std::fs::create_dir_all(dir);
+        let server = EmbeddedServer::start(cfg(4848, "0.0.0.0", dir)).expect("start");
+        assert!(std::net::TcpStream::connect_timeout(
+            &"127.0.0.1:4848".parse().unwrap(),
+            std::time::Duration::from_millis(500),
+        )
+        .is_ok());
+        server.stop();
+    }
 }

@@ -326,21 +326,22 @@ pub mod space {
     /// Default horizontal gap between widgets in a row.
     pub const ITEM_X: f32 = 10.0;
     /// Default vertical gap egui inserts between sequential widgets.
-    pub const ITEM_Y: f32 = 10.0;
+    /// Middle ground vs PB-88 breathe (was 10) — compact without jamming (PB-91).
+    pub const ITEM_Y: f32 = 6.0;
     /// Extra space after a labeled field row (on top of ITEM_Y when needed).
-    pub const AFTER_FIELD: f32 = 10.0;
+    pub const AFTER_FIELD: f32 = 4.0;
     /// Gap under a section heading bar.
-    pub const AFTER_HEADING: f32 = 8.0;
+    pub const AFTER_HEADING: f32 = 5.0;
     /// Gap under a muted blurb / tip line.
-    pub const AFTER_BLURB: f32 = 10.0;
+    pub const AFTER_BLURB: f32 = 6.0;
     /// Between major sections (embedded vs clients, etc.).
-    pub const SECTION: f32 = 20.0;
-    /// Between checkboxes in a wrap row.
-    pub const CHECK: f32 = 14.0;
+    pub const SECTION: f32 = 14.0;
+    /// Between checkboxes in a wrap row — keep readable.
+    pub const CHECK: f32 = 12.0;
     /// Between action buttons (Connect / Disconnect / Browse).
-    pub const BUTTON: f32 = 10.0;
-    /// Between client chips (+ Add, Plant UA, …).
-    pub const CHIP: f32 = 12.0;
+    pub const BUTTON: f32 = 8.0;
+    /// Between client chips (+ Add, Plant UA, …) — not flush, not sparse.
+    pub const CHIP: f32 = 10.0;
 }
 
 /// Pane content rect inset from the dock leaf edges.

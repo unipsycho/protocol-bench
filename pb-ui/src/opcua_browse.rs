@@ -217,12 +217,15 @@ pub enum BrowseAction {
 }
 
 /// Draw the hierarchical browse tree. Returns pick and/or expand requests.
+///
+/// `max_height` caps the tree viewport (PB-90: fill remaining dock height in panel).
 pub fn paint(
     ui: &mut egui::Ui,
     tree: &BrowseTree,
     id_salt: &str,
     mode: BrowseMode,
     p: &ThemePalette,
+    max_height: f32,
 ) -> Option<BrowseAction> {
     if tree.is_empty() {
         ui.label(
@@ -241,8 +244,12 @@ pub fn paint(
     ui.spacing_mut().item_spacing.y = 2.0;
     ui.spacing_mut().interact_size.y = 18.0;
 
+    // Prefer a tall viewport so folders/variables stay readable without nested scroll hell.
+    let h = max_height.max(160.0);
     egui::ScrollArea::vertical()
         .id_salt(id_salt)
+        .max_height(h)
+        .min_scrolled_height(h.min(320.0).max(160.0))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             paint_folder(ui, &tree.objects, id_salt, mode, p, true, &mut action);

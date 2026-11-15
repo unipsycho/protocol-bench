@@ -1,7 +1,7 @@
 //! OPC UA panel: embedded UA server hub + external UA clients.
 //! Shared browse widget lives in `opcua_browse` (panel + Hub Input).
 
-use egui::{Color32, Layout, Sense, UiBuilder, Vec2};
+use egui::{Color32, Layout, Pos2, Rect, Sense, UiBuilder, Vec2};
 use pb_engine::{EngineCommand, EngineHandle, EngineId, HostSnapshot};
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +14,10 @@ use crate::theme::{
 };
 
 const LABEL_W: f32 = 120.0;
+/// Match MQTT: when the pane is wide enough, config + browse sit side-by-side.
+const SIDE_BY_SIDE_MIN: f32 = 720.0;
+/// Floor for the client detail / browse flex region (PB-90).
+const CLIENT_AREA_MIN_H: f32 = 360.0;
 
 fn default_true() -> bool {
     true
@@ -392,7 +396,33 @@ fn paint_body(
         ui.add_space(space::AFTER_BLURB);
     }
 
-    edit_embedded(ui, state, engine, p);
+    // When a client is selected, collapse the embedded hub so browse/config
+    // can use the remaining dock height (PB-90).
+    let client_selected = state.selected().is_some();
+    if client_selected {
+        let status = embedded_status_label(state);
+        egui::CollapsingHeader::new(
+            egui::RichText::new(format!("Embedded UA server hub · {status}"))
+                .font(font_semi(15.0))
+                .color(p.accent),
+        )
+        .id_salt("pb_opcua_hub_collapse")
+        .default_open(false)
+        .show(ui, |ui| {
+            apply_form_spacing(ui);
+            ui.label(
+                egui::RichText::new(
+                    "Protocol Bench listens as an OPC UA server and exposes all host points under Objects/Points.",
+                )
+                .font(font_ui(12.0))
+                .color(p.muted),
+            );
+            ui.add_space(space::AFTER_BLURB);
+            edit_embedded_fields(ui, state, engine, p);
+        });
+    } else {
+        edit_embedded(ui, state, engine, p);
+    }
     ui.add_space(space::SECTION);
     panel_heading(ui, "External UA clients", p.live, p);
     ui.add_space(space::AFTER_HEADING);
@@ -416,36 +446,107 @@ fn paint_body(
         return;
     }
 
-    egui::ScrollArea::vertical()
-        .id_salt("pb_opcua_body")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            apply_form_spacing(ui);
-            selected_client_editor(ui, state, engine, hubs, p);
-            ui.add_space(space::SECTION - 2.0);
-            browse_preview(ui, state, engine, p);
-            if !state.last_error.is_empty() || !state.server_checklist.is_empty() {
-                ui.add_space(space::AFTER_FIELD + 2.0);
-                panel_heading(ui, "Connectivity checklist", Color32::from_rgb(220, 140, 60), p);
-                ui.add_space(space::AFTER_HEADING);
-                if !state.last_error.is_empty() {
-                    ui.label(
-                        egui::RichText::new(&state.last_error)
-                            .font(font_ui(12.0))
-                            .color(Color32::from_rgb(220, 100, 80)),
-                    );
-                }
-                if !state.server_checklist.is_empty() {
-                    for line in state.server_checklist.lines() {
-                        ui.label(
-                            egui::RichText::new(line)
-                                .font(font_ui(12.0))
-                                .color(p.muted),
-                        );
-                    }
-                }
-            }
-        });
+    // Claim remaining dock height so client config + browse aren't a tiny scroll strip (PB-90).
+    let rem = ui.available_rect_before_wrap();
+    let rem_size = rem.size();
+    let col_h = rem_size.y.max(CLIENT_AREA_MIN_H);
+    let side_by_side = rem_size.x >= SIDE_BY_SIDE_MIN;
+
+    if side_by_side {
+        let gap = 16.0;
+        let left_w = (rem_size.x * 0.48).clamp(300.0, rem_size.x - 280.0);
+        let right_w = (rem_size.x - left_w - gap).max(240.0);
+        let left = Rect::from_min_size(rem.min, Vec2::new(left_w, col_h));
+        let right = Rect::from_min_size(
+            Pos2::new(rem.min.x + left_w + gap, rem.min.y),
+            Vec2::new(right_w, col_h),
+        );
+
+        ui.allocate_new_ui(
+            UiBuilder::new()
+                .max_rect(left)
+                .layout(Layout::top_down(egui::Align::Min)),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("pb_opcua_cfg")
+                    .max_height(col_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        apply_form_spacing(ui);
+                        ui.set_min_width((left_w - 4.0).max(1.0));
+                        selected_client_editor(ui, state, engine, hubs, p);
+                        paint_connectivity_checklist(ui, state, p);
+                    });
+            },
+        );
+        ui.allocate_new_ui(
+            UiBuilder::new()
+                .max_rect(right)
+                .layout(Layout::top_down(egui::Align::Min)),
+            |ui| {
+                apply_form_spacing(ui);
+                browse_preview(ui, state, engine, host, p, col_h);
+            },
+        );
+        ui.allocate_rect(rem, Sense::hover());
+    } else {
+        ui.allocate_new_ui(
+            UiBuilder::new()
+                .max_rect(rem)
+                .layout(Layout::top_down(egui::Align::Min)),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("pb_opcua_stack")
+                    .max_height(col_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        apply_form_spacing(ui);
+                        ui.set_min_width((rem_size.x - 4.0).max(1.0));
+                        selected_client_editor(ui, state, engine, hubs, p);
+                        ui.add_space(space::SECTION - 2.0);
+                        // Tall tree even when stacked — avoids the old “peek then scroll” strip.
+                        browse_preview(ui, state, engine, host, p, (col_h * 0.55).max(240.0));
+                        paint_connectivity_checklist(ui, state, p);
+                    });
+            },
+        );
+        ui.allocate_rect(rem, Sense::hover());
+    }
+}
+
+fn paint_connectivity_checklist(ui: &mut egui::Ui, state: &OpcUaPanelState, p: &ThemePalette) {
+    if state.last_error.is_empty() && state.server_checklist.is_empty() {
+        return;
+    }
+    ui.add_space(space::AFTER_FIELD + 2.0);
+    panel_heading(ui, "Connectivity checklist", Color32::from_rgb(220, 140, 60), p);
+    ui.add_space(space::AFTER_HEADING);
+    if !state.last_error.is_empty() {
+        ui.label(
+            egui::RichText::new(&state.last_error)
+                .font(font_ui(12.0))
+                .color(Color32::from_rgb(220, 100, 80)),
+        );
+    }
+    if !state.server_checklist.is_empty() {
+        for line in state.server_checklist.lines() {
+            ui.label(
+                egui::RichText::new(line)
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            );
+        }
+    }
+}
+
+fn embedded_status_label(state: &OpcUaPanelState) -> String {
+    if !state.server_status.is_empty() {
+        state.server_status.clone()
+    } else if state.server_running {
+        "Running".into()
+    } else {
+        "Stopped".into()
+    }
 }
 
 fn edit_embedded(
@@ -464,7 +565,15 @@ fn edit_embedded(
         .color(p.muted),
     );
     ui.add_space(space::AFTER_BLURB);
+    edit_embedded_fields(ui, state, engine, p);
+}
 
+fn edit_embedded_fields(
+    ui: &mut egui::Ui,
+    state: &mut OpcUaPanelState,
+    engine: &EngineHandle,
+    p: &ThemePalette,
+) {
     let mut dirty = false;
     dirty |= labeled_text(ui, "Name", &mut state.embedded.name, p);
     dirty |= labeled_text(ui, "Bind", &mut state.embedded.bind, p);
@@ -539,15 +648,7 @@ fn edit_embedded(
                 start_embedded(engine, state);
             }
         }
-        let status = if state.server_status.is_empty() {
-            if running {
-                "Running"
-            } else {
-                "Stopped"
-            }
-        } else {
-            state.server_status.as_str()
-        };
+        let status = embedded_status_label(state);
         ui.label(
             egui::RichText::new(status)
                 .font(font_ui(12.0))
@@ -764,11 +865,60 @@ fn parse_browse_map(value: Option<&serde_json::Value>) -> BTreeMap<String, Vec<F
     out
 }
 
+fn endpoint_looks_local(url: &str) -> bool {
+    let u = url.to_ascii_lowercase();
+    u.contains("127.0.0.1") || u.contains("localhost") || u.contains("[::1]")
+}
+
+/// Fallback Objects → Points → variables from host points when browsing the
+/// local embedded hub and the client has no pack browse yet (PB-89 sample).
+fn seed_embedded_points_preview(tree: &mut BrowseTree, host: &HostSnapshot) {
+    if !tree.is_empty() {
+        return;
+    }
+    let points_id = "ns=2;s=Points";
+    tree.merge_children(
+        "Objects",
+        &[FlatBrowseRow {
+            node_id: points_id.into(),
+            browse_name: "Points".into(),
+            display_name: "Points".into(),
+            is_variable: false,
+        }],
+    );
+    let rows: Vec<FlatBrowseRow> = host
+        .points
+        .iter()
+        .take(48)
+        .map(|pt| FlatBrowseRow {
+            node_id: format!("ns=2;s={}", pt.name),
+            browse_name: pt.name.clone(),
+            display_name: pt.name.clone(),
+            is_variable: true,
+        })
+        .collect();
+    if rows.is_empty() {
+        tree.merge_children(
+            points_id,
+            &[FlatBrowseRow {
+                node_id: "ns=2;s=demo_temperature".into(),
+                browse_name: "demo_temperature".into(),
+                display_name: "demo_temperature".into(),
+                is_variable: true,
+            }],
+        );
+    } else {
+        tree.merge_children(points_id, &rows);
+    }
+}
+
 fn browse_preview(
     ui: &mut egui::Ui,
     state: &mut OpcUaPanelState,
     engine: &EngineHandle,
+    host: &HostSnapshot,
     p: &ThemePalette,
+    col_h: f32,
 ) {
     panel_heading(ui, "Browse", p.live, p);
     ui.add_space(space::AFTER_HEADING);
@@ -782,8 +932,22 @@ fn browse_preview(
     ui.add_space(space::AFTER_BLURB);
     apply_form_spacing(ui);
     let id = state.selected().map(|c| c.id.clone()).unwrap_or_default();
+    let local_preview = state
+        .selected()
+        .map(|c| endpoint_looks_local(&c.endpoint_url))
+        .unwrap_or(false);
+    {
+        let tree = state.trees.entry(id.clone()).or_default();
+        // Local hub only — real Connect/Browse replaces this via pack sync.
+        if state.server_running && local_preview {
+            seed_embedded_points_preview(tree, host);
+        }
+    }
     let tree = state.trees.entry(id.clone()).or_default().clone();
-    let action = opcua_browse::paint(ui, &tree, "pb_opcua_browse", BrowseMode::PickNode, p);
+    // Header + blurb ~56px; keep the tree on the remaining flex height (PB-90).
+    let tree_h = (col_h - 56.0).max(200.0);
+    let action =
+        opcua_browse::paint(ui, &tree, "pb_opcua_browse", BrowseMode::PickNode, p, tree_h);
     match action {
         Some(BrowseAction::Pick(pick)) => {
             if let Some(c) = state.selected_mut() {
