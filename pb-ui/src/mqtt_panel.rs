@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;
 
+use crate::chips::{self, ChipAction};
 use crate::hubs::HubModel;
 use crate::theme::{
     apply_form_spacing, font_semi, font_ui, form_inset, space, ThemePalette,
@@ -216,6 +217,8 @@ pub struct MqttPanelState {
     /// Live rumqttd listen state (session UI; not persisted).
     pub broker_running: bool,
     pub broker_status: String,
+    /// Pending chip delete confirm: (index, display name). Session UI only.
+    pub pending_delete: Option<(usize, String)>,
 }
 
 impl Default for MqttPanelState {
@@ -227,6 +230,7 @@ impl Default for MqttPanelState {
             embedded: EmbeddedBrokerConfig::default(),
             broker_running: false,
             broker_status: String::new(),
+            pending_delete: None,
         }
     }
 }
@@ -539,6 +543,9 @@ fn paint_body(
     ui.add_space(space::AFTER_BLURB);
 
     clients_bar(ui, state, engine, hubs, p);
+    if let Some(i) = chips::confirm_delete(ui.ctx(), &mut state.pending_delete, p) {
+        remove_mqtt_client(state, engine, hubs, i);
+    }
     ui.add_space(space::AFTER_FIELD + 2.0);
 
     if state.selected().is_none() {
@@ -620,7 +627,7 @@ fn clients_bar(
         // Explicit CHIP gaps so chips never sit flush (PB-88).
         ui.spacing_mut().item_spacing = Vec2::new(space::CHIP, space::CHIP);
         let mut select = None;
-        let mut remove = None;
+        let show_delete = state.clients.len() > 1;
         for (i, client) in state.clients.iter().enumerate() {
             if i > 0 {
                 ui.add_space(space::CHIP);
@@ -631,15 +638,12 @@ fn clients_bar(
             } else {
                 client.label.as_str()
             };
-            if text_btn(ui, label, selected, p).clicked() {
-                select = Some(i);
-            }
-            if state.clients.len() > 1
-                && text_btn(ui, "×", false, p)
-                    .on_hover_text("Remove connection")
-                    .clicked()
-            {
-                remove = Some(i);
+            match chips::selectable_chip(ui, label, selected, show_delete, p) {
+                Some(ChipAction::Select) => select = Some(i),
+                Some(ChipAction::Delete) => {
+                    state.pending_delete = Some((i, label.to_string()));
+                }
+                None => {}
             }
         }
         if let Some(i) = select {
@@ -648,17 +652,6 @@ fn clients_bar(
             } else {
                 Some(i)
             };
-        }
-        if let Some(i) = remove {
-            let was = state.selected;
-            state.clients.remove(i);
-            state.selected = match was {
-                Some(s) if s == i => None,
-                Some(s) if s > i => Some(s - 1),
-                other => other,
-            };
-            state.ensure_clients();
-            apply_mqtt_session(engine, state, hubs);
         }
         ui.add_space(space::CHIP);
         if secondary_btn(ui, "+ Add", p).clicked() {
@@ -672,6 +665,26 @@ fn clients_bar(
             apply_mqtt_session(engine, state, hubs);
         }
     });
+}
+
+fn remove_mqtt_client(
+    state: &mut MqttPanelState,
+    engine: &EngineHandle,
+    hubs: &HubModel,
+    i: usize,
+) {
+    if i >= state.clients.len() {
+        return;
+    }
+    let was = state.selected;
+    state.clients.remove(i);
+    state.selected = match was {
+        Some(s) if s == i => None,
+        Some(s) if s > i => Some(s - 1),
+        other => other,
+    };
+    state.ensure_clients();
+    apply_mqtt_session(engine, state, hubs);
 }
 
 fn selected_client_editor(
