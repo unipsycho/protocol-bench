@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use crate::hubs::HubModel;
 use crate::theme::{
-    after_field, apply_form_spacing, font_semi, font_ui, form_inset, space, ThemePalette,
+    apply_form_spacing, font_semi, font_ui, form_inset, space, ThemePalette,
 };
 use crate::topic_tree::{self, TopicTree, TreeMode};
 
