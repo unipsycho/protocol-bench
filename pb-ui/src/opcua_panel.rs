@@ -1013,7 +1013,11 @@ fn labeled_text(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePal
         );
         let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
         changed = ui
-            .add(egui::TextEdit::singleline(value).desired_width(w))
+            .add(
+                egui::TextEdit::singleline(value)
+                    .desired_width(w)
+                    .margin(egui::Margin::symmetric(6.0, 3.0)),
+            )
             .changed();
     });
     // Vertical rhythm from apply_form_spacing ITEM_Y (PB-91 — avoid double gap).
@@ -1030,7 +1034,12 @@ fn labeled_password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &Them
         );
         let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
         changed = ui
-            .add(egui::TextEdit::singleline(value).password(true).desired_width(w))
+            .add(
+                egui::TextEdit::singleline(value)
+                    .password(true)
+                    .desired_width(w)
+                    .margin(egui::Margin::symmetric(6.0, 3.0)),
+            )
             .changed();
     });
     changed

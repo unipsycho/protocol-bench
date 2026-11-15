@@ -1001,7 +1001,11 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
             ),
         );
         let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
-        ui.add(egui::TextEdit::singleline(value).desired_width(w));
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width(w)
+                .margin(egui::Margin::symmetric(6.0, 3.0)),
+        );
     });
     // Vertical rhythm from apply_form_spacing ITEM_Y (PB-91 — avoid double gap).
 }
@@ -1018,7 +1022,9 @@ fn client_id_field(ui: &mut egui::Ui, c: &mut MqttClient, p: &ThemePalette) {
             ),
         );
         let w = (ui.available_width() - 100.0).clamp(120.0, 280.0);
-        let edit = egui::TextEdit::singleline(&mut c.client_id).desired_width(w);
+        let edit = egui::TextEdit::singleline(&mut c.client_id)
+            .desired_width(w)
+            .margin(egui::Margin::symmetric(6.0, 3.0));
         if c.unique_client_id {
             ui.add_enabled(false, edit);
         } else {
@@ -1051,7 +1057,8 @@ fn password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette
         ui.add(
             egui::TextEdit::singleline(value)
                 .password(true)
-                .desired_width(w),
+                .desired_width(w)
+                .margin(egui::Margin::symmetric(6.0, 3.0)),
         );
     });
 }

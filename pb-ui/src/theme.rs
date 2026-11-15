@@ -357,7 +357,9 @@ pub fn form_inset(full: egui::Rect) -> egui::Rect {
 pub fn apply_form_spacing(ui: &mut egui::Ui) {
     let s = ui.spacing_mut();
     s.item_spacing = egui::vec2(space::ITEM_X, space::ITEM_Y);
-    s.button_padding = egui::vec2(10.0, 5.0);
+    // Keep form rows compact (chrome interact_size is taller for menus/tools).
+    s.interact_size.y = 22.0;
+    s.button_padding = egui::vec2(8.0, 3.0);
     s.icon_spacing = 6.0;
 }
 
