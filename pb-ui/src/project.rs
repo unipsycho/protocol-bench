@@ -1,21 +1,24 @@
 //! Protocol Bench project file (JSON) — MQTT connections, hub Input/Output binds,
-//! and point id bindings.
+//! point id bindings, and dock layout (PB-95).
 //!
 //! Default path: `directories` → `…/ProtocolBench/project.json`
-//! Layout/theme stay in `ui.toml` (hub diagram also mirrored here when saved).
+//! Theme + auto-run hubs stay in `ui.toml`. Hub diagram is mirrored here when saved.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::dock::DockPane;
 use crate::hubs::{HubModel, MqttInputBind, MqttOutputBind};
+use crate::layout::LayoutNode;
 use crate::mqtt_panel::{
     EmbeddedBrokerConfig, MqttClient, MqttOutput, MqttPanelState, MqttParseRule,
 };
 use crate::opcua_panel::{EmbeddedOpcUaConfig, OpcUaClient, OpcUaPanelState};
+use crate::persist::UiState;
 use pb_points::{is_address_path, is_short_point_id, PointBinding, PointStore};
 
-/// v7: additive `opcua` clients + embedded UA server hub.
-pub const PROJECT_VERSION: u32 = 7;
+/// v8: dock layout (tree / hidden / maximized) lives in the project (PB-95).
+pub const PROJECT_VERSION: u32 = 8;
 
 /// Project identity + options (Project panel / project.json).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -51,6 +54,50 @@ pub struct ProjectFile {
     pub hubs: Option<HubModel>,
     #[serde(default)]
     pub settings: ProjectSettings,
+    /// Dock visibility, tab order, splitters. Absent → seed once from current ui.toml (PB-95).
+    #[serde(default)]
+    pub layout: Option<DockLayout>,
+}
+
+/// Project-scoped dock layout (not theme / auto-run — those stay in `ui.toml`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DockLayout {
+    #[serde(default)]
+    pub tree: LayoutNode,
+    #[serde(default)]
+    pub hidden_panes: Vec<DockPane>,
+    #[serde(default)]
+    pub maximized: Option<DockPane>,
+}
+
+impl DockLayout {
+    pub fn from_ui(state: &UiState) -> Self {
+        Self {
+            tree: state.tree.clone(),
+            hidden_panes: state.hidden_panes.clone(),
+            maximized: state.maximized,
+        }
+    }
+
+    /// Apply tree / visibility / maximize; leaves theme, auto-run, and hubs alone.
+    pub fn apply_to_ui(&self, state: &mut UiState) {
+        state.tree = self.tree.clone();
+        state.hidden_panes = self.hidden_panes.clone();
+        state.maximized = self.maximized;
+        state.sanitize();
+    }
+}
+
+/// Restore project layout, or keep ui.toml and report that a seed write is needed.
+/// Returns `true` when the project had no layout (caller should save to seed).
+pub fn apply_or_seed_layout(file: &ProjectFile, ui: &mut UiState) -> bool {
+    match &file.layout {
+        Some(layout) => {
+            layout.apply_to_ui(ui);
+            false
+        }
+        None => true,
+    }
 }
 
 fn default_next_point_seq() -> u64 {
@@ -71,6 +118,7 @@ impl Default for ProjectFile {
             opcua: OpcUaProject::default(),
             hubs: None,
             settings: ProjectSettings::default(),
+            layout: None,
         }
     }
 }
@@ -631,6 +679,7 @@ pub fn load(path: &Path) -> Result<ProjectFile, String> {
             opcua: OpcUaProject::default(),
             hubs: None,
             settings: ProjectSettings::default(),
+            layout: None,
         });
     }
     let mut project: ProjectFile = serde_json::from_value(value).map_err(|e| e.to_string())?;
@@ -720,6 +769,7 @@ mod tests {
                 description: "Roundtrip fixture".into(),
                 auto_run_embedded_broker: false,
             },
+            layout: None,
         };
         let text = serde_json::to_string_pretty(&project).unwrap();
         let back: ProjectFile = serde_json::from_str(&text).unwrap();
@@ -731,6 +781,35 @@ mod tests {
         assert_eq!(back.mqtt.embedded.id, "hub");
         assert!(!back.mqtt.embedded.anonymous);
         assert_eq!(back.mqtt.embedded.username, "ops");
+    }
+
+    #[test]
+    fn dock_layout_roundtrip_and_seed() {
+        let mut ui = UiState::default();
+        ui.hidden_panes.push(DockPane::Traffic);
+        let layout = DockLayout::from_ui(&ui);
+        let project = ProjectFile {
+            layout: Some(layout.clone()),
+            ..ProjectFile::default()
+        };
+        let text = serde_json::to_string_pretty(&project).unwrap();
+        let back: ProjectFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.layout.as_ref(), Some(&layout));
+
+        // Old project without layout → seed flag, keep current ui tree.
+        let old: ProjectFile = serde_json::from_str(
+            r#"{"version":7,"mqtt":{"clients":[],"selected_id":""}}"#,
+        )
+        .unwrap();
+        assert!(old.layout.is_none());
+        let mut seeded = UiState::default();
+        seeded.hidden_panes.push(DockPane::Files);
+        assert!(apply_or_seed_layout(&old, &mut seeded));
+        assert_eq!(seeded.hidden_panes, vec![DockPane::Files]);
+
+        let mut restored = UiState::default();
+        assert!(!apply_or_seed_layout(&back, &mut restored));
+        assert_eq!(restored.hidden_panes, vec![DockPane::Traffic]);
     }
 
     #[test]

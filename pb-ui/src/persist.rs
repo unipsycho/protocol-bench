@@ -1,4 +1,5 @@
-//! Saved dock tree, theme, and hub diagram. Protocol I/O is not stored.
+//! App settings: theme, auto-run hubs, and a dock/hubs mirror in `ui.toml`.
+//! Authoritative dock layout for a project lives in `project.json` (PB-95).
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -77,7 +78,8 @@ impl UiState {
         true
     }
 
-    fn sanitize(&mut self) {
+    /// Ensure every pane exists in the tree; drop retired Calculations leaf.
+    pub fn sanitize(&mut self) {
         if !self.tree.contains_pane(DockPane::Hubs) {
             self.tree.band_north(DockPane::Hubs, 0.34);
         }

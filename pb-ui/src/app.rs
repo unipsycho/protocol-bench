@@ -20,7 +20,7 @@ use crate::opcua_panel::{self, OpcUaPanelState};
 use crate::panels::PointsPanelState;
 use crate::panels;
 use crate::persist::{self, UiState};
-use crate::project::{self, MqttProject, ProjectFile, ProjectSettings};
+use crate::project::{self, DockLayout, MqttProject, ProjectFile, ProjectSettings};
 use crate::theme::{
     self, apply_form_spacing, divider_bar, font_semi, font_ui, space, tint, AppTheme, ThemePalette,
     BAR_H, HEADER_H, MIN_PANE, RADIUS, RAIL_W, SEP, STATUS_H,
@@ -59,6 +59,8 @@ pub struct ProtocolBenchApp {
     mqtt_saved: MqttProject,
     /// Last hubs snapshot written to the project file.
     hubs_saved: crate::hubs::HubModel,
+    /// Last dock layout written to project.json (PB-95).
+    layout_saved: DockLayout,
     last_project_save: Instant,
     project_dialog: Option<ProjectDialog>,
     /// Live host snapshot for Calc/Agg/points — refreshed on poll, not mouse FPS (PB-64).
@@ -115,6 +117,7 @@ impl ProtocolBenchApp {
         let mut status = "Ready".into();
         let engine = EngineHandle::spawn();
         let mut ui_state = ui_state;
+        let mut seed_layout = false;
         if project_path.is_file() {
             match project::load(&project_path) {
                 Ok(file) => {
@@ -125,6 +128,8 @@ impl ProtocolBenchApp {
                     if file.settings.auto_run_embedded_broker && !ui_state.auto_run_embedded_hubs {
                         ui_state.auto_run_embedded_hubs = true;
                     }
+                    // PB-95: project dock layout, or seed from ui.toml once.
+                    seed_layout = project::apply_or_seed_layout(&file, &mut ui_state);
                     if let Some(hubs) = file.hubs {
                         ui_state.hubs = hubs;
                         // Rebuild ephemeral canvas selection from persisted selected/port.
@@ -162,9 +167,10 @@ impl ProtocolBenchApp {
         }
         let hubs_saved = ui_state.hubs.clone();
         let settings_saved = project_settings.clone();
+        let layout_saved = DockLayout::from_ui(&ui_state);
         let live_host = engine.snapshot();
         let live_points_fp = Self::points_fingerprint(&live_host);
-        Self {
+        let mut app = Self {
             engine,
             ui_state,
             theme,
@@ -177,7 +183,7 @@ impl ProtocolBenchApp {
             status,
             service_connected: true,
             aa_logo: AaLogoCache::default(),
-            dirty: false,
+            dirty: seed_layout,
             last_save: Instant::now(),
             mqtt,
             opcua,
@@ -187,12 +193,18 @@ impl ProtocolBenchApp {
             project_path,
             mqtt_saved,
             hubs_saved,
+            layout_saved,
             last_project_save: Instant::now(),
             project_dialog: None,
             live_host,
             live_points_fp,
             last_live_poll: Instant::now(),
+        };
+        // Persist seeded dock layout into project.json on first open (PB-95).
+        if seed_layout {
+            let _ = app.save_project_now();
         }
+        app
     }
 
     /// Fingerprint of live point values/stamps (drives preview + table refresh).
@@ -238,7 +250,8 @@ impl ProtocolBenchApp {
         let mqtt_dirty = current != self.mqtt_saved;
         let hubs_dirty = self.ui_state.hubs != self.hubs_saved;
         let settings_dirty = self.project_settings != self.settings_saved;
-        let min_age = if mqtt_dirty || hubs_dirty || settings_dirty {
+        let layout_dirty = DockLayout::from_ui(&self.ui_state) != self.layout_saved;
+        let min_age = if mqtt_dirty || hubs_dirty || settings_dirty || layout_dirty {
             Duration::from_millis(500)
         } else {
             // Flush new short-id bindings from live traffic.
@@ -255,6 +268,7 @@ impl ProtocolBenchApp {
 
     fn save_project_now(&mut self) -> Result<(), String> {
         let mqtt = MqttProject::from_panel(&self.mqtt);
+        let layout = DockLayout::from_ui(&self.ui_state);
         let (points, next_point_seq) = self
             .engine
             .points()
@@ -274,11 +288,13 @@ impl ProtocolBenchApp {
             opcua: project::OpcUaProject::from_panel(&self.opcua),
             hubs: Some(self.ui_state.hubs.clone()),
             settings: self.project_settings.clone(),
+            layout: Some(layout.clone()),
         };
         project::save(&self.project_path, &file)?;
         self.mqtt_saved = mqtt;
         self.hubs_saved = self.ui_state.hubs.clone();
         self.settings_saved = self.project_settings.clone();
+        self.layout_saved = layout;
         self.last_project_save = Instant::now();
         Ok(())
     }
@@ -292,6 +308,7 @@ impl ProtocolBenchApp {
             self.ui_state.auto_run_embedded_hubs = true;
             self.mark_dirty();
         }
+        let seed_layout = project::apply_or_seed_layout(&file, &mut self.ui_state);
         if let Some(hubs) = file.hubs {
             self.ui_state.hubs = hubs;
             self.ui_state.hubs.sanitize();
@@ -304,6 +321,7 @@ impl ProtocolBenchApp {
         self.mqtt_saved = MqttProject::from_panel(&self.mqtt);
         self.hubs_saved = self.ui_state.hubs.clone();
         self.settings_saved = self.project_settings.clone();
+        self.layout_saved = DockLayout::from_ui(&self.ui_state);
         self.project_path = path;
         opcua_panel::apply_opcua_session(&self.engine, &mut self.opcua, &self.ui_state.hubs);
         opcua_panel::maybe_auto_start_embedded(
@@ -318,6 +336,10 @@ impl ProtocolBenchApp {
             &self.ui_state.hubs,
             self.ui_state.auto_run_embedded_hubs,
         );
+        if seed_layout {
+            self.mark_dirty();
+            let _ = self.save_project_now();
+        }
         self.status = format!("Opened {}", self.project_path.display());
         Ok(())
     }
