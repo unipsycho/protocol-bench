@@ -326,10 +326,11 @@ pub mod space {
     /// Default horizontal gap between widgets in a row.
     pub const ITEM_X: f32 = 10.0;
     /// Default vertical gap egui inserts between sequential widgets.
-    /// Middle ground vs PB-88 breathe (was 10) — compact without jamming (PB-91).
-    pub const ITEM_Y: f32 = 6.0;
-    /// Extra space after a labeled field row (on top of ITEM_Y when needed).
-    pub const AFTER_FIELD: f32 = 4.0;
+    /// PB-91 middle ground: field rhythm comes from ITEM_Y alone (labeled rows
+    /// no longer also call after_field — that double-spaced PB-88).
+    pub const ITEM_Y: f32 = 8.0;
+    /// Explicit gap after checkbox / button blocks (not every labeled row).
+    pub const AFTER_FIELD: f32 = 6.0;
     /// Gap under a section heading bar.
     pub const AFTER_HEADING: f32 = 5.0;
     /// Gap under a muted blurb / tip line.

@@ -1003,7 +1003,7 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
         let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
         ui.add(egui::TextEdit::singleline(value).desired_width(w));
     });
-    after_field(ui);
+    // Vertical rhythm from apply_form_spacing ITEM_Y (PB-91 — avoid double gap).
 }
 
 fn client_id_field(ui: &mut egui::Ui, c: &mut MqttClient, p: &ThemePalette) {
@@ -1034,7 +1034,6 @@ fn client_id_field(ui: &mut egui::Ui, c: &mut MqttClient, p: &ThemePalette) {
             "Fresh random MQTT client id on each Connect — avoids collisions across sessions.",
         );
     });
-    after_field(ui);
 }
 
 fn password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
@@ -1055,7 +1054,6 @@ fn password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette
                 .desired_width(w),
         );
     });
-    after_field(ui);
 }
 
 fn transport(ui: &mut egui::Ui, value: &mut String, p: &ThemePalette) {
@@ -1082,7 +1080,6 @@ fn transport(ui: &mut egui::Ui, value: &mut String, p: &ThemePalette) {
                 }
             });
     });
-    after_field(ui);
 }
 
 fn text_btn(ui: &mut egui::Ui, label: &str, accent: bool, p: &ThemePalette) -> egui::Response {
