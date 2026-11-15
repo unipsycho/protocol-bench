@@ -488,6 +488,9 @@ fn project_panel(
                             .color(p.muted),
                     );
                     ui.add_space(space::AFTER_HEADING);
+                    // Compact accordion stack (PB-94): override form ITEM_Y between sections.
+                    let prev_y = ui.spacing().item_spacing.y;
+                    ui.spacing_mut().item_spacing.y = 2.0;
                     list_section(
                         ui,
                         "Hubs",
@@ -495,7 +498,6 @@ fn project_panel(
                         DockPane::Hubs.ink(p.is_light),
                         p,
                     );
-                    ui.add_space(space::AFTER_FIELD);
                     list_section(
                         ui,
                         "Inputs",
@@ -503,7 +505,6 @@ fn project_panel(
                         DockPane::Streams.ink(p.is_light),
                         p,
                     );
-                    ui.add_space(space::AFTER_FIELD);
                     list_section(
                         ui,
                         "Outputs",
@@ -511,7 +512,6 @@ fn project_panel(
                         DockPane::Mqtt.ink(p.is_light),
                         p,
                     );
-                    ui.add_space(space::AFTER_FIELD);
                     list_section(
                         ui,
                         "Calcs / Aggs",
@@ -519,6 +519,7 @@ fn project_panel(
                         p.accent,
                         p,
                     );
+                    ui.spacing_mut().item_spacing.y = prev_y;
                 });
         },
     );
@@ -730,18 +731,19 @@ fn stat_tile(
 
 fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, p: &ThemePalette) {
     // Accordion inventory — default collapsed so the diagram stays the source of truth (PB-58).
+    // Compact header + rows (PB-94).
     let id = ui.make_persistent_id(("pb_project_list", title));
     let mut state =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
     let open = state.is_open();
     let header = format!("{title}  ·  {}", names.len());
     let (bar, resp) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width().max(1.0), 22.0),
+        Vec2::new(ui.available_width().max(1.0), 18.0),
         Sense::click(),
     );
     if resp.hovered() {
         ui.painter()
-            .rect_filled(bar, Rounding::same(4.0), tint(p.accent, 16));
+            .rect_filled(bar, Rounding::same(3.0), tint(p.accent, 16));
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     // Chevron: ▶ collapsed, ▼ open.
@@ -750,11 +752,11 @@ fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, 
         Pos2::new(bar.min.x + 4.0, bar.center().y),
         Align2::LEFT_CENTER,
         chevron,
-        font_ui(9.0),
+        font_ui(8.5),
         p.muted,
     );
     ui.painter().text(
-        Pos2::new(bar.min.x + 18.0, bar.center().y),
+        Pos2::new(bar.min.x + 16.0, bar.center().y),
         Align2::LEFT_CENTER,
         header,
         font_ui(10.5),
@@ -767,32 +769,34 @@ fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, 
     if !state.is_open() {
         return;
     }
-    ui.add_space(2.0);
     if names.is_empty() {
         ui.label(
             egui::RichText::new("None yet")
-                .font(font_ui(12.0))
+                .font(font_ui(11.5))
                 .color(p.muted),
         );
         return;
     }
+    let row_y = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = 1.0;
     for name in names {
         let width = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
         ui.painter()
-            .circle_filled(Pos2::new(rect.min.x + 10.0, rect.center().y), 3.5, ink);
+            .circle_filled(Pos2::new(rect.min.x + 10.0, rect.center().y), 2.75, ink);
         let clip = Rect::from_min_max(
-            Pos2::new(rect.min.x + 22.0, rect.min.y),
+            Pos2::new(rect.min.x + 20.0, rect.min.y),
             Pos2::new(rect.max.x - 6.0, rect.max.y),
         );
         ui.painter().with_clip_rect(clip).text(
             Pos2::new(clip.min.x, rect.center().y),
             Align2::LEFT_CENTER,
             name,
-            font_ui(12.5),
+            font_ui(12.0),
             p.text,
         );
     }
+    ui.spacing_mut().item_spacing.y = row_y;
 }
 
 pub fn format_uptime(ms: u64) -> String {
