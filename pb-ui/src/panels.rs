@@ -83,7 +83,7 @@ pub fn paint(
             change
         }
         DockPane::Points => {
-            points_panel(ui, host, p, points);
+            points_panel(ui, host, hubs, p, points);
             crate::hubs::HubChange::quiet()
         }
         DockPane::Traffic => {
@@ -105,6 +105,7 @@ pub fn paint(
 fn points_panel(
     ui: &mut egui::Ui,
     host: &HostSnapshot,
+    hubs: &HubModel,
     p: &ThemePalette,
     state: &mut PointsPanelState,
 ) {
@@ -120,7 +121,7 @@ fn points_panel(
         egui::UiBuilder::new()
             .max_rect(inner)
             .layout(egui::Layout::top_down(egui::Align::Min)),
-        |ui| points_panel_body(ui, host, p, state, LABEL_W),
+        |ui| points_panel_body(ui, host, hubs, p, state, LABEL_W),
     );
     ui.allocate_rect(full, Sense::hover());
 }
@@ -128,6 +129,7 @@ fn points_panel(
 fn points_panel_body(
     ui: &mut egui::Ui,
     host: &HostSnapshot,
+    hubs: &HubModel,
     p: &ThemePalette,
     state: &mut PointsPanelState,
     label_w: f32,
@@ -159,28 +161,26 @@ fn points_panel_body(
     });
     ui.add_space(8.0);
 
-    if host.points.is_empty() {
+    // Bus snapshot + Hub Input bind placeholders (honest empty only when no binds).
+    let mut rows = point_rows::rows_for_points_panel(hubs, &host.points);
+    if rows.is_empty() {
         ui.label(
-            egui::RichText::new("No points yet. Connect an input and subscribe to populate.")
-                .font(font_ui(12.5))
-                .color(p.muted),
+            egui::RichText::new(
+                "No points yet. Bind a topic on a Hub Input to create one.",
+            )
+            .font(font_ui(12.5))
+            .color(p.muted),
         );
         return;
     }
 
     let filter = state.filter.trim().to_ascii_lowercase();
-    let mut rows: Vec<PointsTableRow> = host
-        .points
-        .iter()
-        .filter(|pt| {
-            if filter.is_empty() {
-                return true;
-            }
-            pt.name.to_ascii_lowercase().contains(&filter)
-                || pt.source.to_ascii_lowercase().contains(&filter)
-        })
-        .map(PointsTableRow::from_snapshot)
-        .collect();
+    if !filter.is_empty() {
+        rows.retain(|row| {
+            row.id.to_ascii_lowercase().contains(&filter)
+                || row.source.to_ascii_lowercase().contains(&filter)
+        });
+    }
 
     if rows.is_empty() {
         ui.label(

@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::dock::DockPane;
-use crate::hubs::{HubModel, MqttInputBind, MqttOutputBind};
+use crate::hubs::{HubModel, HubProto, MqttInputBind, MqttOutputBind};
+use crate::point_rows;
 use crate::layout::LayoutNode;
 use crate::mqtt_panel::{
     EmbeddedBrokerConfig, MqttClient, MqttOutput, MqttPanelState, MqttParseRule,
@@ -1047,9 +1048,121 @@ pub fn import_bindings_to_store(
     store.set_next_seq_at_least(next_point_seq.max(1));
 }
 
+/// Promote Hub Input (and aggregator) binds into the point bus.
+///
+/// New Input binds leave `point` empty — this allocates `mqtt_N` / `opc_N` and
+/// writes the id back onto the bind. Existing short ids are re-bound to their
+/// wire address so `project.points` and the live store stay aligned after IPC.
+/// Returns true when any hub bind field changed (caller should dirty-save).
+pub fn materialize_hub_point_binds(hubs: &mut HubModel, store: &mut PointStore) -> bool {
+    let mut dirty = false;
+    for hub in &mut hubs.hubs {
+        for port in hub.sources.iter_mut().chain(hub.outputs.iter_mut()) {
+            match port.protocol {
+                HubProto::Mqtt => {
+                    let conn = port.mqtt_connection.clone();
+                    for bind in &mut port.mqtt_inputs {
+                        let topic = bind.topic.trim();
+                        if topic.is_empty() {
+                            continue;
+                        }
+                        let source =
+                            point_rows::mqtt_bind_source(&conn, topic, bind.path.trim());
+                        if bind.point.trim().is_empty() {
+                            let id = store.ensure_id("mqtt", &source);
+                            bind.point = id;
+                            dirty = true;
+                        } else {
+                            store.bind(bind.point.trim(), &source);
+                        }
+                    }
+                }
+                HubProto::OpcUa => {
+                    let conn = port.opcua_connection.clone();
+                    for bind in &mut port.opcua_inputs {
+                        let node = bind.node_id.trim();
+                        if node.is_empty() {
+                            continue;
+                        }
+                        let source = if conn.trim().is_empty() {
+                            format!("opcua/{node}")
+                        } else {
+                            format!("opcua/{}/{node}", conn.trim())
+                        };
+                        if bind.point.trim().is_empty() {
+                            // 3-char proto code (opcua is 5 — short ids are XXX_n).
+                            let id = store.ensure_id("opc", &source);
+                            bind.point = id;
+                            dirty = true;
+                        } else {
+                            store.bind(bind.point.trim(), &source);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Aggregator outputs are host points (`agg_N`) published by Outputs.
+        for step in &hub.aggregators {
+            let id = format!("agg_{}", step.id);
+            let source = format!("agg/step/{}", step.id);
+            store.bind(&id, &source);
+        }
+    }
+    dirty
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialize_hub_binds_allocates_and_lists() {
+        let mut hubs = HubModel::default();
+        hubs.add_hub();
+        let hub = hubs.hubs[0].id;
+        let src = hubs.hub(hub).unwrap().sources[0].id;
+        if let Some(port) = hubs
+            .hub_mut(hub)
+            .and_then(|h| h.sources.iter_mut().find(|p| p.id == src))
+        {
+            port.protocol = HubProto::Mqtt;
+            port.mqtt_connection = "Mosquitto".into();
+            port.mqtt_inputs.push(MqttInputBind {
+                topic: "plant/t".into(),
+                path: String::new(),
+                point: String::new(),
+            });
+            port.mqtt_inputs.push(MqttInputBind {
+                topic: "plant/u".into(),
+                path: "v".into(),
+                point: "mqtt_9".into(),
+            });
+        }
+        let mut store = PointStore::new();
+        assert!(materialize_hub_point_binds(&mut hubs, &mut store));
+        let port = hubs
+            .hub(hub)
+            .unwrap()
+            .sources
+            .iter()
+            .find(|p| p.id == src)
+            .unwrap();
+        assert_eq!(port.mqtt_inputs[0].point, "mqtt_1");
+        assert_eq!(port.mqtt_inputs[1].point, "mqtt_9");
+        assert_eq!(
+            store.source_for_id("mqtt_1"),
+            Some("mqtt/Mosquitto/plant/t")
+        );
+        assert_eq!(
+            store.source_for_id("mqtt_9"),
+            Some("mqtt/Mosquitto/plant/u::v")
+        );
+        assert!(store.get("mqtt_1").is_some());
+        assert!(store.get("mqtt_9").is_some());
+        // Second pass is idempotent (no further bind edits).
+        assert!(!materialize_hub_point_binds(&mut hubs, &mut store));
+    }
 
     #[test]
     fn multi_client_roundtrip() {

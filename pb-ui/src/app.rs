@@ -25,6 +25,7 @@ use crate::traffic_panel::TrafficPanelState;
 use crate::panels;
 use crate::persist::{self, UiState};
 use crate::project::{self, DockLayout, HttpProject, MqttProject, ProjectFile, ProjectSettings, StreamsProject};
+use pb_ipc::PointBindingWire;
 use crate::theme::{
     self, apply_form_spacing, divider_bar, font_semi, font_ui, space, tint, AppTheme, ThemePalette,
     BAR_H, HEADER_H, MIN_PANE, RADIUS, RAIL_W, SEP, STATUS_H,
@@ -184,6 +185,10 @@ impl ProtocolBenchApp {
                             project::migrate_panel_point_refs(&mut mqtt, &mut store);
                         }
                         project::migrate_client_binds_to_hubs(&mut mqtt, &mut ui_state.hubs);
+                        // IPC: local PointStore is a mirror — promote hub binds and push to service.
+                        Self::push_hub_binds_to_service(&engine, &mut ui_state.hubs);
+                        // Persist rebuilt points[] when file was empty after IPC wipe.
+                        seed_layout = seed_layout || file.points.is_empty();
                         mqtt_saved = MqttProject::from_panel(&mqtt);
                         http_saved = HttpProject::from_panel(&http);
                         streams_saved = StreamsProject::from_panel(&streams);
@@ -365,7 +370,31 @@ impl ProtocolBenchApp {
         }
     }
 
+    /// Materialize Hub Input/agg binds into the local mirror and push to pb-service.
+    /// Fixes empty Points panel after IPC: RemoteHandle.points() is not the service store.
+    fn push_hub_binds_to_service(engine: &EngineHandle, hubs: &mut crate::hubs::HubModel) {
+        let (wire, next) = match engine.points().lock() {
+            Ok(mut store) => {
+                let _ = project::materialize_hub_point_binds(hubs, &mut store);
+                let wire: Vec<PointBindingWire> = store
+                    .export_bindings()
+                    .into_iter()
+                    .map(|b| PointBindingWire {
+                        id: b.id,
+                        source: b.source,
+                    })
+                    .collect();
+                (wire, store.next_seq())
+            }
+            Err(_) => return,
+        };
+        let _ = engine.import_bindings(wire, next);
+    }
+
     fn save_project_now(&mut self) -> Result<(), String> {
+        // Promote Input binds → point bus before reading bindings for project.json.
+        // Without this, the empty IPC mirror wiped `points: []` on every hubs autosave.
+        Self::push_hub_binds_to_service(&self.engine, &mut self.ui_state.hubs);
         let mqtt = MqttProject::from_panel(&self.mqtt);
         let layout = DockLayout::from_ui(&self.ui_state);
         let (points, next_point_seq) = self
@@ -432,6 +461,7 @@ impl ProtocolBenchApp {
             project::migrate_panel_point_refs(&mut self.mqtt, &mut store);
         }
         project::migrate_client_binds_to_hubs(&mut self.mqtt, &mut self.ui_state.hubs);
+        Self::push_hub_binds_to_service(&self.engine, &mut self.ui_state.hubs);
         self.mqtt_saved = MqttProject::from_panel(&self.mqtt);
         self.http_saved = HttpProject::from_panel(&self.http);
         self.streams_saved = StreamsProject::from_panel(&self.streams);
@@ -1549,6 +1579,8 @@ impl ProtocolBenchApp {
             );
             if hub_change.dirty {
                 self.mark_dirty();
+                // Allocate / refresh point ids for new Input binds, then push to service.
+                Self::push_hub_binds_to_service(&self.engine, &mut self.ui_state.hubs);
                 // Hub Input/Output MQTT binds feed the pack session.
                 mqtt_panel::apply_mqtt_session(
                     &self.engine,
