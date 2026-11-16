@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 publish.workspace = true
-description = "Headless Protocol Bench service host (loads protocol packs)"
+description = "Protocol Bench always-on service (packs, project, localhost IPC)"
 
 [[bin]]
 name = "pb-service"
@@ -14,4 +14,8 @@ path = "src/main.rs"
 [dependencies]
 pb-engine = { workspace = true }
 pb-points = { workspace = true }
+pb-ipc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 ctrlc = { workspace = true }
+directories = { workspace = true }

@@ -2,7 +2,8 @@
 //! MQTT lives in `mqtt_panel` (connections); hub Input/Output nodes own point binds.
 
 use egui::{Align2, Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
-use pb_engine::{EngineHandle, HostSnapshot};
+use crate::engine_api::EngineHandle;
+use pb_engine::HostSnapshot;
 
 use crate::art;
 use crate::dock::DockPane;

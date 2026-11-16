@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One aggregator step synced from the hub diagram.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct AggConfig {
     pub id: u64,
     pub label: String,

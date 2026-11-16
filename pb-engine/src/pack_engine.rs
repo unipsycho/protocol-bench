@@ -238,7 +238,7 @@ impl ProtocolEngine for PackEngine {
         };
         SlotSnapshot {
             id: self.id,
-            title: self.id.title(),
+            title: self.id.title().into(),
             state,
             note: self.id.note().into(),
             ticks: self.ticks,

@@ -10,6 +10,7 @@ mod calc_panel;
 mod chips;
 mod dnd;
 mod dock;
+mod engine_api;
 mod hubs;
 mod layout;
 mod mqtt_panel;

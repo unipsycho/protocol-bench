@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One calculation step synced from the hub diagram.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct CalcConfig {
     pub id: u64,
     pub kind: String,
