@@ -1,13 +1,47 @@
 //! Selectable connection list rows with in-row delete + confirm (MQTT / OPC UA).
 
-use egui::{Align2, Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
+use egui::{Align2, Color32, Layout, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
 
-use crate::theme::{font_ui, space, tint, ThemePalette};
+use crate::theme::{font_semi, font_ui, space, tint, ThemePalette};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowAction {
     Select,
     Delete,
+}
+
+/// Section title with a right-justified Add control on the same row (PB-105).
+pub fn heading_with_add(
+    ui: &mut egui::Ui,
+    title: &str,
+    add_label: &str,
+    title_color: Color32,
+    p: &ThemePalette,
+) -> bool {
+    let mut add = false;
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(title)
+                .font(font_semi(15.0))
+                .color(title_color),
+        );
+        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+            let resp = ui.add(
+                egui::Button::new(
+                    egui::RichText::new(add_label)
+                        .font(font_ui(12.5))
+                        .color(Color32::from_rgb(0x12, 0x14, 0x18)),
+                )
+                .fill(p.live)
+                .stroke(Stroke::new(1.0, p.line))
+                .min_size(Vec2::new(72.0, 26.0)),
+            );
+            if resp.clicked() {
+                add = true;
+            }
+        });
+    });
+    add
 }
 
 /// One full-width row: identity on the left, × on the same row when `show_delete`.
@@ -24,23 +58,26 @@ pub fn selectable_row(
     let pad_x = 10.0;
     let avail_w = ui.available_width().max(120.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(avail_w, row_h), Sense::hover());
+    let hovered = ui.rect_contains_pointer(rect);
 
-    let fill = if selected {
-        tint(p.accent, if p.is_light { 28 } else { 48 })
-    } else if ui.rect_contains_pointer(rect) {
-        tint(p.control, if p.is_light { 12 } else { 20 })
+    // Idle rows use solid control fill so they read against the pane (PB-105).
+    let (fill, stroke) = if selected {
+        (
+            tint(p.accent, if p.is_light { 56 } else { 96 }),
+            Stroke::new(1.5, p.accent),
+        )
+    } else if hovered {
+        (
+            tint(p.control, if p.is_light { 220 } else { 255 }),
+            Stroke::new(1.0, tint(p.accent, 140)),
+        )
     } else {
-        Color32::TRANSPARENT
+        (p.control, Stroke::new(1.0, p.line))
     };
     ui.painter()
         .rect_filled(rect, Rounding::same(4.0), fill);
-    if selected {
-        ui.painter().rect_stroke(
-            rect,
-            Rounding::same(4.0),
-            Stroke::new(1.0, tint(p.accent, 120)),
-        );
-    }
+    ui.painter()
+        .rect_stroke(rect, Rounding::same(4.0), stroke);
 
     let text_right = if show_delete {
         rect.max.x - pad_x - close_slot

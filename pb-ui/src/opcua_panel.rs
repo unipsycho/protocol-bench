@@ -429,7 +429,10 @@ fn paint_body(
         edit_embedded(ui, state, engine, p);
     }
     ui.add_space(space::SECTION);
-    panel_heading(ui, "External UA clients", p.live, p);
+    // Title + Add on one row (PB-105).
+    if connection_list::heading_with_add(ui, "External UA clients", "+ Add", p.live, p) {
+        add_opcua_client(state, engine, hubs);
+    }
     ui.add_space(space::AFTER_HEADING);
     ui.label(
         egui::RichText::new(
@@ -726,16 +729,16 @@ fn clients_list(
             Some(i)
         };
     }
-    ui.add_space(space::AFTER_FIELD);
-    if secondary_btn(ui, "+ Add client", p).clicked() {
-        let id = state.unique_id("ua");
-        let mut c = OpcUaClient::default_plant();
-        c.id = id.clone();
-        c.label = id;
-        state.clients.push(c);
-        state.selected = Some(state.clients.len() - 1);
-        apply_opcua_session(engine, state, hubs);
-    }
+}
+
+fn add_opcua_client(state: &mut OpcUaPanelState, engine: &EngineHandle, hubs: &HubModel) {
+    let id = state.unique_id("ua");
+    let mut c = OpcUaClient::default_plant();
+    c.id = id.clone();
+    c.label = id;
+    state.clients.push(c);
+    state.selected = Some(state.clients.len() - 1);
+    apply_opcua_session(engine, state, hubs);
 }
 
 fn remove_opcua_client(

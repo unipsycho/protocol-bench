@@ -532,7 +532,10 @@ fn paint_body(
 
     edit_embedded_broker(ui, state, engine, hubs, p);
     ui.add_space(space::SECTION + 2.0);
-    panel_heading(ui, "External brokers / connections", p.live, p);
+    // Title + Add on one row (PB-105).
+    if connection_list::heading_with_add(ui, "External brokers", "+ Add", p.live, p) {
+        add_mqtt_client(state, engine, hubs);
+    }
     ui.add_space(space::AFTER_HEADING);
     ui.label(
         egui::RichText::new(
@@ -650,17 +653,17 @@ fn clients_list(
             Some(i)
         };
     }
-    ui.add_space(space::AFTER_FIELD);
-    if secondary_btn(ui, "+ Add broker", p).clicked() {
-        let id = state.unique_id("broker");
-        let mut c = MqttClient::default_local();
-        c.id = id.clone();
-        c.label = id.clone();
-        c.client_id = fresh_mqtt_client_id(&id);
-        state.clients.push(c);
-        state.selected = Some(state.clients.len() - 1);
-        apply_mqtt_session(engine, state, hubs);
-    }
+}
+
+fn add_mqtt_client(state: &mut MqttPanelState, engine: &EngineHandle, hubs: &HubModel) {
+    let id = state.unique_id("broker");
+    let mut c = MqttClient::default_local();
+    c.id = id.clone();
+    c.label = id.clone();
+    c.client_id = fresh_mqtt_client_id(&id);
+    state.clients.push(c);
+    state.selected = Some(state.clients.len() - 1);
+    apply_mqtt_session(engine, state, hubs);
 }
 
 fn remove_mqtt_client(
