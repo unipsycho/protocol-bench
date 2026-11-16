@@ -117,7 +117,8 @@ impl ProtocolBenchApp {
         let mut opcua = OpcUaPanelState::default();
         let mut mqtt_saved = MqttProject::default();
         let mut project_settings = ProjectSettings::default();
-        let mut status = "Service disconnected".into();
+        // Quiet offline: chip shows disconnected; left status stays calm (PB-101).
+        let mut status = "Ready".into();
         let mut service_connected = false;
         let mut service_report = String::new();
         // Prefer live IPC; UI still opens when pb-service is down (auto-probe reconnects).
@@ -235,17 +236,24 @@ impl ProtocolBenchApp {
                 let report = Self::format_service_report(&st);
                 let was = self.service_connected;
                 self.service_connected = true;
+                // Only refresh left status when report changes (or we just reconnected).
                 if !was || self.service_report != report {
                     self.service_report = report.clone();
                     self.status = format!("Service · {report}");
                 }
             }
             Err(_) => {
-                if self.service_connected || !self.status.starts_with("Service disconnected") {
-                    self.status = "Service disconnected".into();
+                // Chip is enough when offline — do not spam the left status (PB-101).
+                if self.service_connected {
+                    self.service_connected = false;
+                    self.service_report.clear();
+                    if self.status.starts_with("Service ·")
+                        || self.status.starts_with("Could not save project")
+                        || self.status.starts_with("Service disconnected")
+                    {
+                        self.status = "Ready".into();
+                    }
                 }
-                self.service_connected = false;
-                self.service_report.clear();
             }
         }
     }
@@ -289,22 +297,28 @@ impl ProtocolBenchApp {
     }
 
     fn autosave_project(&mut self, _host: &pb_engine::HostSnapshot) {
+        // Offline: chip covers it — never hammer IPC or flash save errors (PB-101).
+        if !self.service_connected {
+            return;
+        }
         let current = MqttProject::from_panel(&self.mqtt);
         let mqtt_dirty = current != self.mqtt_saved;
         let hubs_dirty = self.ui_state.hubs != self.hubs_saved;
         let settings_dirty = self.project_settings != self.settings_saved;
-        let min_age = if mqtt_dirty || hubs_dirty || settings_dirty {
-            Duration::from_millis(500)
-        } else {
-            // Flush new short-id bindings from live traffic.
-            Duration::from_secs(2)
-        };
-        if self.last_project_save.elapsed() < min_age {
+        // Save only when something actually changed — no timer flush when clean.
+        if !(mqtt_dirty || hubs_dirty || settings_dirty) {
+            return;
+        }
+        if self.last_project_save.elapsed() < Duration::from_millis(500) {
             return;
         }
         match self.save_project_now() {
             Ok(()) => {}
-            Err(err) => self.status = format!("Could not save project: {err}"),
+            Err(err) => {
+                // One message if the link died mid-save; probe will quiet the bar.
+                self.status = format!("Could not save project: {err}");
+                self.service_connected = false;
+            }
         }
     }
 
@@ -1786,13 +1800,16 @@ fn menu_row(
     check: Option<bool>,
     p: &ThemePalette,
 ) -> egui::Response {
-    let width = if check.is_some() { 220.0 } else { 180.0 };
+    // Content-sized rows — File/View were hard-coded too wide (PB-101).
+    let text_x = if check.is_some() { 32.0 } else { 12.0 };
+    let pad_right = 14.0;
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font_ui(13.0), p.text));
+    let width = (text_x + galley.size().x + pad_right).max(96.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
     if resp.hovered() {
         ui.painter()
             .rect_filled(rect, Rounding::same(5.0), tint(p.accent, 18));
     }
-    let text_x = if check.is_some() { 32.0 } else { 12.0 };
     if check == Some(true) {
         art::paint_check(
             ui.painter(),
@@ -1800,11 +1817,9 @@ fn menu_row(
             p.accent,
         );
     }
-    ui.painter().text(
-        Pos2::new(rect.min.x + text_x, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        font_ui(13.0),
+    ui.painter().galley(
+        Pos2::new(rect.min.x + text_x, rect.center().y - galley.size().y * 0.5),
+        galley,
         p.text,
     );
     resp.on_hover_cursor(CursorIcon::PointingHand)
@@ -1812,7 +1827,7 @@ fn menu_row(
 
 fn menu_sep(ui: &mut egui::Ui, p: &ThemePalette) {
     let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width().max(160.0), 9.0),
+        Vec2::new(ui.available_width().max(96.0), 9.0),
         Sense::hover(),
     );
     let y = rect.center().y;
