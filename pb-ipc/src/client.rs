@@ -1,7 +1,7 @@
 //! UI-side localhost TCP client (no in-process engine).
 
 use std::io::{BufReader, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,9 +15,12 @@ use crate::frame::{read_json, write_json};
 use crate::paths::{self, IpcEndpoint};
 use crate::proto::*;
 
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+const IO_TIMEOUT: Duration = Duration::from_millis(800);
+
 /// Drop-in style handle used by the UI instead of `EngineHandle::spawn`.
 pub struct RemoteHandle {
-    stream: Mutex<TcpStream>,
+    stream: Mutex<Option<TcpStream>>,
     next_id: AtomicU64,
     points: Arc<Mutex<PointStore>>,
     calc_rt: Arc<Mutex<CalcRuntime>>,
@@ -26,44 +29,75 @@ pub struct RemoteHandle {
 }
 
 impl RemoteHandle {
-    /// Connect using `ipc.json` + `ipc.token` from the config dir.
-    pub fn connect() -> Result<Self, String> {
-        let ep = paths::read_endpoint()?;
-        let token = paths::read_token()?;
-        Self::connect_to(&ep, &token)
-    }
-
-    pub fn connect_to(ep: &IpcEndpoint, token: &str) -> Result<Self, String> {
-        let addr = format!("{}:{}", ep.host, ep.port);
-        let stream = TcpStream::connect(&addr).map_err(|e| {
-            format!(
-                "cannot connect to Protocol Bench service at {addr}: {e}\n\
-                 Start it first: PB_MODULES=./modules cargo run -p pb-service"
-            )
-        })?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .ok();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(10)))
-            .ok();
-        let handle = Self {
-            stream: Mutex::new(stream),
+    /// Offline stub — UI can open without pb-service; call [`Self::reconnect`].
+    pub fn disconnected() -> Self {
+        Self {
+            stream: Mutex::new(None),
             next_id: AtomicU64::new(1),
             points: Arc::new(Mutex::new(PointStore::new())),
             calc_rt: Arc::new(Mutex::new(CalcRuntime::default())),
             agg_rt: Arc::new(Mutex::new(AggRuntime::default())),
             last_status: Mutex::new(ServiceStatus::default()),
-        };
-        handle.call(
+        }
+    }
+
+    /// Connect using `ipc.json` + `ipc.token` from the config dir.
+    pub fn connect() -> Result<Self, String> {
+        let handle = Self::disconnected();
+        handle.reconnect()?;
+        Ok(handle)
+    }
+
+    pub fn connect_to(ep: &IpcEndpoint, token: &str) -> Result<Self, String> {
+        let handle = Self::disconnected();
+        handle.connect_stream(ep, token)?;
+        Ok(handle)
+    }
+
+    /// Re-read endpoint files and open a fresh hello'd socket.
+    pub fn reconnect(&self) -> Result<(), String> {
+        let ep = paths::read_endpoint()?;
+        let token = paths::read_token()?;
+        self.connect_stream(&ep, &token)
+    }
+
+    fn connect_stream(&self, ep: &IpcEndpoint, token: &str) -> Result<(), String> {
+        let addr = format!("{}:{}", ep.host, ep.port);
+        let sock = resolve_loopback(&addr)?;
+        let stream = TcpStream::connect_timeout(&sock, CONNECT_TIMEOUT).map_err(|e| {
+            format!("cannot connect to Protocol Bench service at {addr}: {e}")
+        })?;
+        stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
+        stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
+        {
+            let mut g = self
+                .stream
+                .lock()
+                .map_err(|_| "IPC stream lock poisoned".to_string())?;
+            *g = Some(stream);
+        }
+        self.call(
             METHOD_HELLO,
             serde_json::to_value(HelloParams {
                 token: token.into(),
                 client: "pb-ui".into(),
             })
             .unwrap_or(serde_json::Value::Null),
-        )?;
-        Ok(handle)
+        )
+        .map_err(|e| {
+            let _ = self.clear_stream();
+            e
+        })?;
+        Ok(())
+    }
+
+    fn clear_stream(&self) -> Result<(), String> {
+        let mut g = self
+            .stream
+            .lock()
+            .map_err(|_| "IPC stream lock poisoned".to_string())?;
+        *g = None;
+        Ok(())
     }
 
     fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -73,24 +107,40 @@ impl RemoteHandle {
             method: method.into(),
             params,
         };
-        let mut stream = self
+        let mut guard = self
             .stream
             .lock()
             .map_err(|_| "IPC stream lock poisoned".to_string())?;
-        write_json(&mut *stream, &req)?;
-        let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-        // Keep owning stream locked while reading the matching response.
-        let resp: Response = read_json(&mut reader)?;
-        if resp.id != id {
-            return Err(format!(
-                "IPC id mismatch: sent {id}, got {}",
-                resp.id
-            ));
+        let Some(stream) = guard.as_mut() else {
+            return Err("service disconnected".into());
+        };
+        let result = (|| {
+            write_json(stream, &req)?;
+            let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+            let resp: Response = read_json(&mut reader)?;
+            if resp.id != id {
+                return Err(format!("IPC id mismatch: sent {id}, got {}", resp.id));
+            }
+            if let Some(err) = resp.error {
+                return Err(err);
+            }
+            Ok(resp.result.unwrap_or(serde_json::Value::Null))
+        })();
+        if result.is_err() {
+            *guard = None;
         }
-        if let Some(err) = resp.error {
-            return Err(err);
+        result
+    }
+
+    /// Status with auto-reconnect when the socket is dead.
+    pub fn probe_status(&self) -> Result<ServiceStatus, String> {
+        match self.status() {
+            Ok(st) => Ok(st),
+            Err(_) => {
+                self.reconnect()?;
+                self.status()
+            }
         }
-        Ok(resp.result.unwrap_or(serde_json::Value::Null))
     }
 
     pub fn ping(&self) -> Result<(), String> {
@@ -203,6 +253,15 @@ impl RemoteHandle {
     pub fn shutdown(&mut self) {}
 }
 
+fn resolve_loopback(addr: &str) -> Result<SocketAddr, String> {
+    let mut addrs = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {addr}: {e}"))?;
+    addrs
+        .next()
+        .ok_or_else(|| format!("resolve {addr}: no addresses"))
+}
+
 fn empty_snap() -> HostSnapshot {
     HostSnapshot {
         thread_name: "disconnected".into(),
@@ -221,7 +280,10 @@ impl Drop for RemoteHandle {
     fn drop(&mut self) {
         // Leave the service running; just close the TCP socket.
         if let Ok(mut s) = self.stream.lock() {
-            let _ = s.flush();
+            if let Some(ref mut stream) = *s {
+                let _ = stream.flush();
+            }
+            *s = None;
         }
     }
 }

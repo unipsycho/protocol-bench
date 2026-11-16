@@ -7,7 +7,7 @@ mod app;
 mod art;
 mod brand_logo;
 mod calc_panel;
-mod chips;
+mod connection_list;
 mod dnd;
 mod dock;
 mod engine_api;

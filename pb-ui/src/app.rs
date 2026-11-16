@@ -70,6 +70,8 @@ pub struct ProtocolBenchApp {
     live_host: HostSnapshot,
     live_points_fp: u64,
     last_live_poll: Instant,
+    /// Last IPC status probe (chip + bottom report).
+    last_service_poll: Instant,
 }
 
 enum ProjectDialog {
@@ -117,80 +119,75 @@ impl ProtocolBenchApp {
         let mut opcua = OpcUaPanelState::default();
         let mut mqtt_saved = MqttProject::default();
         let mut project_settings = ProjectSettings::default();
+        // Quiet offline: chip shows disconnected; left status stays calm (PB-101).
         let mut status = "Ready".into();
         let mut service_connected = false;
         let mut service_report = String::new();
-        // Always two processes: connect to pb-service (no in-process engine).
+        // Prefer live IPC; UI still opens when pb-service is down (auto-probe reconnects).
         let engine = match EngineHandle::connect() {
             Ok(h) => {
                 service_connected = true;
-                if let Ok(st) = h.status() {
-                    service_report = format!(
-                        "packs={:?} points={} mqtt_hub={} opcua_hub={}",
-                        st.packs_loaded,
-                        st.point_count,
-                        st.mqtt_hub_running,
-                        st.opcua_hub_running
-                    );
-                }
                 h
             }
             Err(err) => {
                 eprintln!("protocol-bench: {err}");
-                eprintln!("Start the service first: PB_MODULES=./modules cargo run -p pb-service");
-                std::process::exit(1);
+                EngineHandle::disconnected()
             }
         };
         let mut ui_state = ui_state;
         let mut seed_layout = false;
-        // Service owns project.json — open (or load default) over IPC.
-        let open_path = project_path.display().to_string();
         let mut auto_run = ui_state.auto_run_embedded_hubs;
-        if let Err(err) = engine.open_project(&open_path, auto_run) {
-            status = format!("Service open project: {err}");
-        }
-        match engine.get_project_json() {
-            Ok(value) => match serde_json::from_value::<ProjectFile>(value) {
-                Ok(file) => {
-                    file.mqtt.apply_to_panel(&mut mqtt);
-                    file.opcua.apply_to_panel(&mut opcua);
-                    project_settings = file.settings.clone();
-                    // PB-58: legacy project auto-run → app setting (ui.toml).
-                    if file.settings.auto_run_embedded_broker && !ui_state.auto_run_embedded_hubs {
-                        ui_state.auto_run_embedded_hubs = true;
-                    }
-                    auto_run = ui_state.auto_run_embedded_hubs;
-                    // PB-95: project dock layout, or seed from ui.toml once.
-                    seed_layout = project::apply_or_seed_layout(&file, &mut ui_state);
-                    if let Some(hubs) = file.hubs {
-                        ui_state.hubs = hubs;
-                        ui_state.hubs.sanitize();
-                    }
-                    if let Ok(mut store) = engine.points().lock() {
-                        project::import_bindings_to_store(
-                            &mut store,
-                            &file.points,
-                            file.next_point_seq,
+        if service_connected {
+            // Service owns project.json — open (or load default) over IPC.
+            let open_path = project_path.display().to_string();
+            let _ = engine.open_project(&open_path, auto_run);
+            match engine.get_project_json() {
+                Ok(value) => match serde_json::from_value::<ProjectFile>(value) {
+                    Ok(file) => {
+                        file.mqtt.apply_to_panel(&mut mqtt);
+                        file.opcua.apply_to_panel(&mut opcua);
+                        project_settings = file.settings.clone();
+                        // PB-58: legacy project auto-run → app setting (ui.toml).
+                        if file.settings.auto_run_embedded_broker && !ui_state.auto_run_embedded_hubs
+                        {
+                            ui_state.auto_run_embedded_hubs = true;
+                        }
+                        auto_run = ui_state.auto_run_embedded_hubs;
+                        // PB-95: project dock layout, or seed from ui.toml once.
+                        seed_layout = project::apply_or_seed_layout(&file, &mut ui_state);
+                        if let Some(hubs) = file.hubs {
+                            ui_state.hubs = hubs;
+                            ui_state.hubs.sanitize();
+                        }
+                        if let Ok(mut store) = engine.points().lock() {
+                            project::import_bindings_to_store(
+                                &mut store,
+                                &file.points,
+                                file.next_point_seq,
+                            );
+                            project::migrate_panel_point_refs(&mut mqtt, &mut store);
+                        }
+                        project::migrate_client_binds_to_hubs(&mut mqtt, &mut ui_state.hubs);
+                        mqtt_saved = MqttProject::from_panel(&mqtt);
+                        mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &ui_state.hubs);
+                        mqtt_panel::maybe_auto_start_embedded(
+                            &engine,
+                            &mut mqtt,
+                            &ui_state.hubs,
+                            auto_run,
                         );
-                        project::migrate_panel_point_refs(&mut mqtt, &mut store);
+                        opcua_panel::apply_opcua_session(&engine, &mut opcua, &ui_state.hubs);
+                        opcua_panel::maybe_auto_start_embedded(&engine, &mut opcua, auto_run);
+                        status = format!("Connected · project {}", project_path.display());
                     }
-                    project::migrate_client_binds_to_hubs(&mut mqtt, &mut ui_state.hubs);
-                    mqtt_saved = MqttProject::from_panel(&mqtt);
-                    // Session apply still goes through IPC submit → service packs.
-                    mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &ui_state.hubs);
-                    mqtt_panel::maybe_auto_start_embedded(
-                        &engine,
-                        &mut mqtt,
-                        &ui_state.hubs,
-                        auto_run,
-                    );
-                    opcua_panel::apply_opcua_session(&engine, &mut opcua, &ui_state.hubs);
-                    opcua_panel::maybe_auto_start_embedded(&engine, &mut opcua, auto_run);
-                    status = format!("Connected · project {}", project_path.display());
-                }
-                Err(err) => status = format!("Project decode: {err}"),
-            },
-            Err(err) => status = format!("Get project: {err}"),
+                    Err(err) => status = format!("Project decode: {err}"),
+                },
+                Err(err) => status = format!("Get project: {err}"),
+            }
+            if let Ok(st) = engine.status() {
+                service_report = Self::format_service_report(&st);
+                status = format!("Service · {service_report}");
+            }
         }
         let hubs_saved = ui_state.hubs.clone();
         let settings_saved = project_settings.clone();
@@ -227,12 +224,55 @@ impl ProtocolBenchApp {
             live_host,
             live_points_fp,
             last_live_poll: Instant::now(),
+            last_service_poll: Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now),
         };
-        // Persist seeded dock layout into project.json on first open (PB-95).
         if seed_layout {
             let _ = app.save_project_now();
         }
         app
+    }
+
+    fn format_service_report(st: &pb_ipc::ServiceStatus) -> String {
+        format!(
+            "packs={:?} pts={} mqtt_hub={} opcua_hub={}",
+            st.packs_loaded, st.point_count, st.mqtt_hub_running, st.opcua_hub_running
+        )
+    }
+
+    /// Periodic IPC probe: chip + bottom rate without a click.
+    fn poll_service_link(&mut self) {
+        const SERVICE_POLL: Duration = Duration::from_millis(1500);
+        if self.last_service_poll.elapsed() < SERVICE_POLL {
+            return;
+        }
+        self.last_service_poll = Instant::now();
+        match self.engine.probe_status() {
+            Ok(st) => {
+                let report = Self::format_service_report(&st);
+                let was = self.service_connected;
+                self.service_connected = true;
+                // Only refresh left status when report changes (or we just reconnected).
+                if !was || self.service_report != report {
+                    self.service_report = report.clone();
+                    self.status = format!("Service · {report}");
+                }
+            }
+            Err(_) => {
+                // Chip is enough when offline — do not spam the left status (PB-101).
+                if self.service_connected {
+                    self.service_connected = false;
+                    self.service_report.clear();
+                    if self.status.starts_with("Service ·")
+                        || self.status.starts_with("Could not save project")
+                        || self.status.starts_with("Service disconnected")
+                    {
+                        self.status = "Ready".into();
+                    }
+                }
+            }
+        }
     }
 
     /// Fingerprint of live point values/stamps (drives preview + table refresh).
@@ -274,23 +314,29 @@ impl ProtocolBenchApp {
     }
 
     fn autosave_project(&mut self, _host: &pb_engine::HostSnapshot) {
+        // Offline: chip covers it — never hammer IPC or flash save errors (PB-101).
+        if !self.service_connected {
+            return;
+        }
         let current = MqttProject::from_panel(&self.mqtt);
         let mqtt_dirty = current != self.mqtt_saved;
         let hubs_dirty = self.ui_state.hubs != self.hubs_saved;
         let settings_dirty = self.project_settings != self.settings_saved;
         let layout_dirty = DockLayout::from_ui(&self.ui_state) != self.layout_saved;
-        let min_age = if mqtt_dirty || hubs_dirty || settings_dirty || layout_dirty {
-            Duration::from_millis(500)
-        } else {
-            // Flush new short-id bindings from live traffic.
-            Duration::from_secs(2)
-        };
-        if self.last_project_save.elapsed() < min_age {
+        // Save only when something actually changed — no timer flush when clean.
+        if !(mqtt_dirty || hubs_dirty || settings_dirty || layout_dirty) {
+            return;
+        }
+        if self.last_project_save.elapsed() < Duration::from_millis(500) {
             return;
         }
         match self.save_project_now() {
             Ok(()) => {}
-            Err(err) => self.status = format!("Could not save project: {err}"),
+            Err(err) => {
+                // One message if the link died mid-save; probe will quiet the bar.
+                self.status = format!("Could not save project: {err}");
+                self.service_connected = false;
+            }
         }
     }
 
@@ -321,7 +367,7 @@ impl ProtocolBenchApp {
         // Service owns project.json — persist only via IPC.
         let value = serde_json::to_value(&file).map_err(|e| e.to_string())?;
         self.engine
-            .put_project_json(value, self.project_settings.auto_run_embedded_broker)?;
+            .put_project_json(value, self.ui_state.auto_run_embedded_hubs)?;
         self.mqtt_saved = mqtt;
         self.hubs_saved = self.ui_state.hubs.clone();
         self.settings_saved = self.project_settings.clone();
@@ -331,7 +377,7 @@ impl ProtocolBenchApp {
     }
 
     fn load_project_from_path(&mut self, path: PathBuf) -> Result<(), String> {
-        let auto_run = self.project_settings.auto_run_embedded_broker;
+        let auto_run = self.ui_state.auto_run_embedded_hubs;
         self.engine
             .open_project(&path.display().to_string(), auto_run)?;
         let value = self.engine.get_project_json()?;
@@ -371,11 +417,10 @@ impl ProtocolBenchApp {
             &self.ui_state.hubs,
             self.ui_state.auto_run_embedded_hubs,
         );
+        self.status = format!("Opened {}", self.project_path.display());
         if seed_layout {
-            self.mark_dirty();
             let _ = self.save_project_now();
         }
-        self.status = format!("Opened {}", self.project_path.display());
         Ok(())
     }
 
@@ -568,6 +613,7 @@ impl eframe::App for ProtocolBenchApp {
                 self.live_host.uptime_ms = snap.uptime_ms;
             }
         }
+        self.poll_service_link();
         let p = self.theme.palette();
         theme::paint_root_bg(ctx, &p);
         self.pane_hits.clear();
@@ -899,25 +945,12 @@ impl ProtocolBenchApp {
                         )
                         .truncate(),
                     );
-                    // Refresh live service report on click; chip reflects IPC health.
+                    // Click forces an immediate probe; auto-probe also runs ~1.5s.
                     if service_connection_chip(ui, self.service_connected, p).clicked() {
-                        match self.engine.status() {
-                            Ok(st) => {
-                                self.service_connected = true;
-                                self.service_report = format!(
-                                    "packs={:?} pts={} mqtt_hub={} opcua_hub={}",
-                                    st.packs_loaded,
-                                    st.point_count,
-                                    st.mqtt_hub_running,
-                                    st.opcua_hub_running
-                                );
-                                self.status = format!("Service · {}", self.service_report);
-                            }
-                            Err(err) => {
-                                self.service_connected = false;
-                                self.status = format!("Service disconnected: {err}");
-                            }
-                        }
+                        self.last_service_poll = Instant::now()
+                            .checked_sub(Duration::from_secs(10))
+                            .unwrap_or_else(Instant::now);
+                        self.poll_service_link();
                     }
                 });
                 let clip = ui.clip_rect();
@@ -997,7 +1030,6 @@ impl ProtocolBenchApp {
                     .inner_margin(egui::Margin::same(16.0)),
             )
             .show(ctx, |ui| {
-                apply_form_spacing(ui);
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Settings")
@@ -1025,47 +1057,7 @@ impl ProtocolBenchApp {
                         .font(font_ui(12.0))
                         .color(p.muted),
                 );
-                ui.add_space(space::SECTION - 2.0);
-                ui.label(
-                    egui::RichText::new("HUBS")
-                        .font(font_ui(10.5))
-                        .color(p.muted),
-                );
-                ui.add_space(space::AFTER_HEADING);
-                let prev_auto = self.ui_state.auto_run_embedded_hubs;
-                if ui
-                    .checkbox(
-                        &mut self.ui_state.auto_run_embedded_hubs,
-                        "Auto-run embedded hubs",
-                    )
-                    .changed()
-                {
-                    self.mark_dirty();
-                    // Turning on at runtime starts MQTT + OPC UA hubs when configured.
-                    if self.ui_state.auto_run_embedded_hubs && !prev_auto {
-                        mqtt_panel::maybe_auto_start_embedded(
-                            &self.engine,
-                            &mut self.mqtt,
-                            &self.ui_state.hubs,
-                            true,
-                        );
-                        opcua_panel::maybe_auto_start_embedded(
-                            &self.engine,
-                            &mut self.opcua,
-                            true,
-                        );
-                    }
-                }
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(
-                        "When enabled, start the MQTT broker and OPC UA server hubs on load \
-(and when this is turned on) if they are configured in their panels.",
-                    )
-                    .font(font_ui(11.5))
-                    .color(p.muted),
-                );
-                ui.add_space(16.0);
+                ui.add_space(12.0);
                 if text_button(ui, "Reset layout", p).clicked() {
                     self.reset_layout();
                 }
@@ -1461,6 +1453,7 @@ impl ProtocolBenchApp {
                     .layout(Layout::top_down(egui::Align::Min)),
             );
             body_ui.set_clip_rect(body.expand(2.0).intersect(clip));
+            let prev_auto = self.project_settings.auto_run_embedded_broker;
             let hub_change = panels::paint(
                 &mut body_ui,
                 active,
@@ -1487,6 +1480,16 @@ impl ProtocolBenchApp {
                     &mut self.opcua,
                     &self.ui_state.hubs,
                 );
+            }
+            // Honor auto-run when the Project checkbox is turned on.
+            if self.project_settings.auto_run_embedded_broker && !prev_auto {
+                mqtt_panel::maybe_auto_start_embedded(
+                    &self.engine,
+                    &mut self.mqtt,
+                    &self.ui_state.hubs,
+                    true,
+                );
+                opcua_panel::maybe_auto_start_embedded(&self.engine, &mut self.opcua, true);
             }
             if let Some(pane) = hub_change.open {
                 self.ui_state.reveal_pane(pane);
@@ -1827,13 +1830,16 @@ fn menu_row(
     check: Option<bool>,
     p: &ThemePalette,
 ) -> egui::Response {
-    let width = if check.is_some() { 220.0 } else { 180.0 };
+    // Content-sized rows — File/View were hard-coded too wide (PB-101).
+    let text_x = if check.is_some() { 32.0 } else { 12.0 };
+    let pad_right = 14.0;
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font_ui(13.0), p.text));
+    let width = (text_x + galley.size().x + pad_right).max(96.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
     if resp.hovered() {
         ui.painter()
             .rect_filled(rect, Rounding::same(5.0), tint(p.accent, 18));
     }
-    let text_x = if check.is_some() { 32.0 } else { 12.0 };
     if check == Some(true) {
         art::paint_check(
             ui.painter(),
@@ -1841,11 +1847,9 @@ fn menu_row(
             p.accent,
         );
     }
-    ui.painter().text(
-        Pos2::new(rect.min.x + text_x, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        font_ui(13.0),
+    ui.painter().galley(
+        Pos2::new(rect.min.x + text_x, rect.center().y - galley.size().y * 0.5),
+        galley,
         p.text,
     );
     resp.on_hover_cursor(CursorIcon::PointingHand)
@@ -1853,7 +1857,7 @@ fn menu_row(
 
 fn menu_sep(ui: &mut egui::Ui, p: &ThemePalette) {
     let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width().max(160.0), 9.0),
+        Vec2::new(ui.available_width().max(96.0), 9.0),
         Sense::hover(),
     );
     let y = rect.center().y;
@@ -1937,7 +1941,7 @@ fn service_connection_chip(ui: &mut egui::Ui, connected: bool, p: &ThemePalette)
     ui.painter().circle_filled(dot, 3.5, ink);
     ui.painter()
         .galley(Pos2::new(rect.min.x + 16.0, rect.center().y - galley.size().y * 0.5), galley, p.text);
-    resp.on_hover_text("Mock service connection — click to toggle")
+    resp.on_hover_text("Backend service IPC — click to re-check")
 }
 
 fn paint_about_wordmark(ui: &mut egui::Ui, p: &ThemePalette) {

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;
 
-use crate::chips::{self, ChipAction};
+use crate::connection_list::{self, RowAction};
 use crate::hubs::HubModel;
 use crate::opcua_browse::{self, BrowseAction, BrowseMode, BrowseTree, FlatBrowseRow};
 use crate::theme::{
@@ -155,7 +155,7 @@ pub struct OpcUaPanelState {
     pub server_checklist: String,
     pub trees: BTreeMap<String, BrowseTree>,
     pub last_error: String,
-    /// Pending chip delete confirm: (index, display name). Session UI only.
+    /// Pending list-row delete confirm: (index, display name). Session UI only.
     pub pending_delete: Option<(usize, String)>,
 }
 
@@ -429,7 +429,10 @@ fn paint_body(
         edit_embedded(ui, state, engine, p);
     }
     ui.add_space(space::SECTION);
-    panel_heading(ui, "External UA clients", p.live, p);
+    // Title + Add on one row (PB-105).
+    if connection_list::heading_with_add(ui, "External UA clients", "+ Add", p.live, p) {
+        add_opcua_client(state, engine, hubs);
+    }
     ui.add_space(space::AFTER_HEADING);
     ui.label(
         egui::RichText::new(
@@ -439,8 +442,8 @@ fn paint_body(
         .color(p.muted),
     );
     ui.add_space(space::AFTER_BLURB);
-    clients_bar(ui, state, engine, hubs, p);
-    if let Some(i) = chips::confirm_delete(ui.ctx(), &mut state.pending_delete, p) {
+    clients_list(ui, state, engine, hubs, p);
+    if let Some(i) = connection_list::confirm_delete(ui.ctx(), &mut state.pending_delete, p) {
         remove_opcua_client(state, engine, hubs, i);
     }
     ui.add_space(space::AFTER_FIELD + 2.0);
@@ -693,54 +696,49 @@ fn stop_embedded(engine: &EngineHandle, state: &mut OpcUaPanelState) {
     state.server_status = "Stopped".into();
 }
 
-fn clients_bar(
+fn clients_list(
     ui: &mut egui::Ui,
     state: &mut OpcUaPanelState,
     engine: &EngineHandle,
     hubs: &HubModel,
     p: &ThemePalette,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        // Explicit CHIP gaps — item_spacing alone was collapsing between chips (PB-88).
-        ui.spacing_mut().item_spacing = Vec2::new(space::CHIP, space::CHIP);
-        let mut select = None;
-        let show_delete = state.clients.len() > 1;
-        for (i, client) in state.clients.iter().enumerate() {
-            if i > 0 {
-                ui.add_space(space::CHIP);
+    let mut select = None;
+    let show_delete = state.clients.len() > 1;
+    for (i, client) in state.clients.iter().enumerate() {
+        let selected = state.selected == Some(i);
+        let label = if client.label.is_empty() {
+            client.id.clone()
+        } else {
+            client.label.clone()
+        };
+        let subtitle = client.endpoint_url.clone();
+        match connection_list::selectable_row(ui, &label, &subtitle, selected, show_delete, p) {
+            Some(RowAction::Select) => select = Some(i),
+            Some(RowAction::Delete) => {
+                state.pending_delete = Some((i, label));
             }
-            let selected = state.selected == Some(i);
-            let label = if client.label.is_empty() {
-                client.id.as_str()
-            } else {
-                client.label.as_str()
-            };
-            match chips::selectable_chip(ui, label, selected, show_delete, p) {
-                Some(ChipAction::Select) => select = Some(i),
-                Some(ChipAction::Delete) => {
-                    state.pending_delete = Some((i, label.to_string()));
-                }
-                None => {}
-            }
+            None => {}
         }
-        if let Some(i) = select {
-            state.selected = if state.selected == Some(i) {
-                None
-            } else {
-                Some(i)
-            };
-        }
-        ui.add_space(space::CHIP);
-        if secondary_btn(ui, "+ Add", p).clicked() {
-            let id = state.unique_id("ua");
-            let mut c = OpcUaClient::default_plant();
-            c.id = id.clone();
-            c.label = id;
-            state.clients.push(c);
-            state.selected = Some(state.clients.len() - 1);
-            apply_opcua_session(engine, state, hubs);
-        }
-    });
+        ui.add_space(2.0);
+    }
+    if let Some(i) = select {
+        state.selected = if state.selected == Some(i) {
+            None
+        } else {
+            Some(i)
+        };
+    }
+}
+
+fn add_opcua_client(state: &mut OpcUaPanelState, engine: &EngineHandle, hubs: &HubModel) {
+    let id = state.unique_id("ua");
+    let mut c = OpcUaClient::default_plant();
+    c.id = id.clone();
+    c.label = id;
+    state.clients.push(c);
+    state.selected = Some(state.clients.len() - 1);
+    apply_opcua_session(engine, state, hubs);
 }
 
 fn remove_opcua_client(
@@ -1058,6 +1056,16 @@ fn labeled_password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &Them
             .changed();
     });
     changed
+}
+
+fn text_btn(ui: &mut egui::Ui, label: &str, selected: bool, p: &ThemePalette) -> egui::Response {
+    let fill = if selected { p.accent } else { p.control };
+    let text = if selected { Color32::WHITE } else { p.text };
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).font(font_ui(12.0)).color(text))
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, p.line)),
+    )
 }
 
 fn secondary_btn(ui: &mut egui::Ui, label: &str, p: &ThemePalette) -> egui::Response {
