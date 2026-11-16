@@ -11,7 +11,10 @@ use crate::mqtt_panel::{self, MqttPanelState};
 use crate::opcua_panel::{self, OpcUaPanelState};
 use crate::point_rows::{self, PointsTableRow, PointsTableState};
 use crate::project::ProjectSettings;
-use crate::theme::{font_semi, font_ui, scope, tint, ThemePalette};
+use crate::theme::{
+    after_field, apply_form_spacing, font_semi, font_ui, form_inset, space, scope, tint,
+    ThemePalette,
+};
 
 /// Points panel filter + sort (session UI state).
 #[derive(Debug, Clone)]
@@ -44,7 +47,7 @@ pub fn paint(
     project_path: &std::path::Path,
 ) -> crate::hubs::HubChange {
     match pane {
-        DockPane::Project => project_panel(ui, hubs, settings, project_path, p),
+        DockPane::Project => project_panel(ui, hubs, mqtt, opcua, host, settings, project_path, p),
         DockPane::Hubs => {
             // Sync trees so Input inspector can pick topics from live traffic.
             mqtt.sync_trees_from_host(host);
@@ -374,67 +377,252 @@ fn empty_message(pane: DockPane) -> &'static str {
 fn project_panel(
     ui: &mut egui::Ui,
     hubs: &HubModel,
+    mqtt: &MqttPanelState,
+    opcua: &OpcUaPanelState,
+    host: &HostSnapshot,
     settings: &mut ProjectSettings,
     project_path: &std::path::Path,
     p: &ThemePalette,
 ) -> crate::hubs::HubChange {
     let mut change = crate::hubs::HubChange::quiet();
-    egui::ScrollArea::vertical()
-        .id_salt("pb_project_scroll")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            title_row(ui, project_path, p);
-            ui.add_space(10.0);
-            stat_row(ui, hubs, p);
-            ui.add_space(16.0);
-            ui.label(
-                egui::RichText::new("OPTIONS")
-                    .font(font_ui(10.5))
-                    .color(p.muted),
-            );
-            ui.add_space(6.0);
-            if ui
-                .checkbox(
-                    &mut settings.auto_run_embedded_broker,
-                    "Auto-run embedded broker when present",
-                )
-                .changed()
-            {
-                change.dirty = true;
-            }
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(
-                    "When enabled, Protocol Bench starts the hub MQTT broker on project load \
-if the MQTT panel has an embedded broker configured.",
-                )
-                .font(font_ui(11.5))
-                .color(p.muted),
-            );
-            ui.add_space(16.0);
-            list_section(
-                ui,
-                "INPUTS",
-                &port_names(hubs, true),
-                DockPane::Streams.ink(p.is_light),
-                p,
-            );
-            ui.add_space(10.0);
-            list_section(
-                ui,
-                "OUTPUTS",
-                &port_names(hubs, false),
-                DockPane::Mqtt.ink(p.is_light),
-                p,
-            );
-            ui.add_space(10.0);
-            list_section(ui, "HUBS", &hub_names(hubs), DockPane::Hubs.ink(p.is_light), p);
-            ui.add_space(10.0);
-            list_section(ui, "AGGREGATORS", &step_names(hubs, true), p.accent, p);
-            ui.add_space(10.0);
-            list_section(ui, "CALCULATIONS", &step_names(hubs, false), p.accent, p);
-        });
+    let full = ui.available_rect_before_wrap();
+    let inner = form_inset(full);
+    ui.allocate_new_ui(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| {
+            apply_form_spacing(ui);
+            egui::ScrollArea::vertical()
+                .id_salt("pb_project_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    apply_form_spacing(ui);
+                    // Identity — name + description (PB-58). File → Save As covers JSON export.
+                    ui.label(
+                        egui::RichText::new("IDENTITY")
+                            .font(font_ui(10.5))
+                            .color(p.muted),
+                    );
+                    ui.add_space(space::AFTER_HEADING);
+                    let fallback = project_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Project");
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = space::ITEM_X;
+                        let (mark, _) =
+                            ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+                        art::paint_mark(ui.painter(), mark, p);
+                        ui.vertical(|ui| {
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut settings.name)
+                                        .desired_width(ui.available_width().max(120.0))
+                                        .hint_text(fallback)
+                                        .margin(egui::Margin::symmetric(6.0, 3.0)),
+                                )
+                                .changed()
+                            {
+                                change.dirty = true;
+                            }
+                            ui.label(
+                                egui::RichText::new(project_path.display().to_string())
+                                    .font(font_ui(11.0))
+                                    .color(p.muted),
+                            );
+                        });
+                    });
+                    after_field(ui);
+                    ui.label(
+                        egui::RichText::new("Description")
+                            .font(font_ui(12.0))
+                            .color(p.muted),
+                    );
+                    ui.add_space(2.0);
+                    if ui
+                        .add(
+                            egui::TextEdit::multiline(&mut settings.description)
+                                .desired_width(ui.available_width().max(120.0))
+                                .desired_rows(3)
+                                .hint_text("Optional notes for this project")
+                                .margin(egui::Margin::symmetric(6.0, 4.0)),
+                        )
+                        .changed()
+                    {
+                        change.dirty = true;
+                    }
+                    ui.add_space(space::SECTION);
+
+                    // Summary counts + which embedded hubs are running.
+                    ui.label(
+                        egui::RichText::new("SUMMARY")
+                            .font(font_ui(10.5))
+                            .color(p.muted),
+                    );
+                    ui.add_space(space::AFTER_HEADING);
+                    summary_row(ui, hubs, host.point_count, p);
+                    ui.add_space(space::AFTER_FIELD);
+                    running_hubs_line(ui, mqtt, opcua, p);
+                    ui.add_space(space::AFTER_BLURB);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Open Hub diagram")
+                                    .font(font_ui(12.5))
+                                    .color(p.text),
+                            )
+                            .fill(p.control)
+                            .stroke(Stroke::new(1.0, p.line)),
+                        )
+                        .clicked()
+                    {
+                        change.open = Some(DockPane::Hubs);
+                    }
+                    ui.add_space(space::SECTION);
+
+                    // Collapsed inventory — accordion per type (default closed).
+                    ui.label(
+                        egui::RichText::new("INVENTORY")
+                            .font(font_ui(10.5))
+                            .color(p.muted),
+                    );
+                    ui.add_space(space::AFTER_HEADING);
+                    // Compact accordion stack (PB-94): override form ITEM_Y between sections.
+                    let prev_y = ui.spacing().item_spacing.y;
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    list_section(
+                        ui,
+                        "Hubs",
+                        &hub_names(hubs),
+                        DockPane::Hubs.ink(p.is_light),
+                        p,
+                    );
+                    list_section(
+                        ui,
+                        "Inputs",
+                        &port_names(hubs, true),
+                        DockPane::Streams.ink(p.is_light),
+                        p,
+                    );
+                    list_section(
+                        ui,
+                        "Outputs",
+                        &port_names(hubs, false),
+                        DockPane::Mqtt.ink(p.is_light),
+                        p,
+                    );
+                    list_section(
+                        ui,
+                        "Calcs / Aggs",
+                        &step_names_combined(hubs),
+                        p.accent,
+                        p,
+                    );
+                    ui.spacing_mut().item_spacing.y = prev_y;
+                });
+        },
+    );
+    ui.allocate_rect(full, Sense::hover());
     change
+}
+
+fn running_hubs_line(
+    ui: &mut egui::Ui,
+    mqtt: &MqttPanelState,
+    opcua: &OpcUaPanelState,
+    p: &ThemePalette,
+) {
+    let mut parts = Vec::new();
+    if mqtt.embedded.enabled {
+        parts.push(if mqtt.broker_running {
+            format!("MQTT hub · running (:{})", mqtt.embedded.port)
+        } else {
+            "MQTT hub · stopped".into()
+        });
+    }
+    if opcua.embedded.enabled {
+        parts.push(if opcua.server_running {
+            format!("OPC UA hub · running (:{})", opcua.embedded.port)
+        } else {
+            "OPC UA hub · stopped".into()
+        });
+    }
+    let text = if parts.is_empty() {
+        "No embedded hubs configured.".into()
+    } else {
+        parts.join("  ·  ")
+    };
+    ui.label(
+        egui::RichText::new(text)
+            .font(font_ui(12.0))
+            .color(if mqtt.broker_running || opcua.server_running {
+                p.live
+            } else {
+                p.muted
+            }),
+    );
+}
+
+fn summary_row(ui: &mut egui::Ui, hubs: &HubModel, points: usize, p: &ThemePalette) {
+    let gap = space::CHIP;
+    let cols = 3.0;
+    let width = ((ui.available_width() - gap * (cols - 1.0)) / cols).max(48.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        stat_tile(
+            ui,
+            width,
+            "HUBS",
+            &hubs.hubs.len().to_string(),
+            DockPane::Hubs.ink(p.is_light),
+            p,
+        );
+        stat_tile(
+            ui,
+            width,
+            "INPUTS",
+            &input_count(hubs).to_string(),
+            DockPane::Streams.ink(p.is_light),
+            p,
+        );
+        stat_tile(
+            ui,
+            width,
+            "OUTPUTS",
+            &output_count(hubs).to_string(),
+            DockPane::Mqtt.ink(p.is_light),
+            p,
+        );
+    });
+    ui.add_space(space::AFTER_FIELD);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        stat_tile(
+            ui,
+            width,
+            "CALCS",
+            &calculation_count(hubs).to_string(),
+            p.accent,
+            p,
+        );
+        stat_tile(
+            ui,
+            width,
+            "AGGS",
+            &aggregator_count(hubs).to_string(),
+            p.accent,
+            p,
+        );
+        stat_tile(
+            ui,
+            width,
+            "POINTS",
+            &points.to_string(),
+            DockPane::Points.ink(p.is_light),
+            p,
+        );
+    });
 }
 
 fn hub_names(hubs: &HubModel) -> Vec<String> {
@@ -460,23 +648,28 @@ fn port_names(hubs: &HubModel, inputs: bool) -> Vec<String> {
     names
 }
 
-fn step_names(hubs: &HubModel, aggregator: bool) -> Vec<String> {
+fn step_names_combined(hubs: &HubModel) -> Vec<String> {
     let mut names = Vec::new();
     for hub in &hubs.hubs {
-        let list = if aggregator {
-            &hub.aggregators
-        } else {
-            &hub.calculations
-        };
-        for step in list {
+        for step in &hub.calculations {
             let edge = hub
                 .sources
                 .iter()
                 .chain(hub.outputs.iter())
                 .find(|port| port.id == step.edge_port)
                 .map(|port| port.label.as_str())
-                .unwrap_or("?");
-            names.push(format!("{} · {} · {}", step.label, edge, hub.name));
+                .unwrap_or(if step.edge_port == 0 { "free" } else { "?" });
+            names.push(format!("Calc · {} · {} · {}", step.label, edge, hub.name));
+        }
+        for step in &hub.aggregators {
+            let edge = hub
+                .sources
+                .iter()
+                .chain(hub.outputs.iter())
+                .find(|port| port.id == step.edge_port)
+                .map(|port| port.label.as_str())
+                .unwrap_or(if step.edge_port == 0 { "free" } else { "?" });
+            names.push(format!("Agg · {} · {} · {}", step.label, edge, hub.name));
         }
     }
     names
@@ -496,82 +689,6 @@ fn aggregator_count(hubs: &HubModel) -> usize {
 
 fn calculation_count(hubs: &HubModel) -> usize {
     hubs.hubs.iter().map(|hub| hub.calculations.len()).sum()
-}
-
-fn title_row(ui: &mut egui::Ui, project_path: &std::path::Path, p: &ThemePalette) {
-    let name = project_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("Project");
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
-        art::paint_mark(ui.painter(), rect, p);
-        ui.add_space(4.0);
-        ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new(name)
-                    .font(font_semi(16.0))
-                    .color(p.text),
-            );
-            ui.label(
-                egui::RichText::new(project_path.display().to_string())
-                    .font(font_ui(11.5))
-                    .color(p.muted),
-            );
-        });
-    });
-}
-
-fn stat_row(ui: &mut egui::Ui, hubs: &HubModel, p: &ThemePalette) {
-    let gap = 8.0;
-    let width = ((ui.available_width() - gap * 2.0) / 3.0).max(48.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        stat_tile(
-            ui,
-            width,
-            "INPUTS",
-            &input_count(hubs).to_string(),
-            DockPane::Streams.ink(p.is_light),
-            p,
-        );
-        stat_tile(
-            ui,
-            width,
-            "OUTPUTS",
-            &output_count(hubs).to_string(),
-            DockPane::Mqtt.ink(p.is_light),
-            p,
-        );
-        stat_tile(
-            ui,
-            width,
-            "HUBS",
-            &hubs.hubs.len().to_string(),
-            DockPane::Hubs.ink(p.is_light),
-            p,
-        );
-    });
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        stat_tile(
-            ui,
-            width,
-            "AGGREGATORS",
-            &aggregator_count(hubs).to_string(),
-            p.accent,
-            p,
-        );
-        stat_tile(
-            ui,
-            width,
-            "CALCULATIONS",
-            &calculation_count(hubs).to_string(),
-            p.accent,
-            p,
-        );
-    });
 }
 
 fn stat_tile(
@@ -613,19 +730,20 @@ fn stat_tile(
 }
 
 fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, p: &ThemePalette) {
-    // Expand/collapse so long hub / transform lists stay manageable.
+    // Accordion inventory — default collapsed so the diagram stays the source of truth (PB-58).
+    // Compact header + rows (PB-94).
     let id = ui.make_persistent_id(("pb_project_list", title));
     let mut state =
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
     let open = state.is_open();
     let header = format!("{title}  ·  {}", names.len());
     let (bar, resp) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width().max(1.0), 22.0),
+        Vec2::new(ui.available_width().max(1.0), 18.0),
         Sense::click(),
     );
     if resp.hovered() {
         ui.painter()
-            .rect_filled(bar, Rounding::same(4.0), tint(p.accent, 16));
+            .rect_filled(bar, Rounding::same(3.0), tint(p.accent, 16));
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     // Chevron: ▶ collapsed, ▼ open.
@@ -634,11 +752,11 @@ fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, 
         Pos2::new(bar.min.x + 4.0, bar.center().y),
         Align2::LEFT_CENTER,
         chevron,
-        font_ui(9.0),
+        font_ui(8.5),
         p.muted,
     );
     ui.painter().text(
-        Pos2::new(bar.min.x + 18.0, bar.center().y),
+        Pos2::new(bar.min.x + 16.0, bar.center().y),
         Align2::LEFT_CENTER,
         header,
         font_ui(10.5),
@@ -651,32 +769,34 @@ fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, 
     if !state.is_open() {
         return;
     }
-    ui.add_space(2.0);
     if names.is_empty() {
         ui.label(
             egui::RichText::new("None yet")
-                .font(font_ui(12.0))
+                .font(font_ui(11.5))
                 .color(p.muted),
         );
         return;
     }
+    let row_y = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = 1.0;
     for name in names {
         let width = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
         ui.painter()
-            .circle_filled(Pos2::new(rect.min.x + 10.0, rect.center().y), 3.5, ink);
+            .circle_filled(Pos2::new(rect.min.x + 10.0, rect.center().y), 2.75, ink);
         let clip = Rect::from_min_max(
-            Pos2::new(rect.min.x + 22.0, rect.min.y),
+            Pos2::new(rect.min.x + 20.0, rect.min.y),
             Pos2::new(rect.max.x - 6.0, rect.max.y),
         );
         ui.painter().with_clip_rect(clip).text(
             Pos2::new(clip.min.x, rect.center().y),
             Align2::LEFT_CENTER,
             name,
-            font_ui(12.5),
+            font_ui(12.0),
             p.text,
         );
     }
+    ui.spacing_mut().item_spacing.y = row_y;
 }
 
 pub fn format_uptime(ms: u64) -> String {

@@ -1,4 +1,5 @@
-//! Saved dock tree, theme, and hub diagram. Protocol I/O is not stored.
+//! App settings: theme, auto-run hubs, and a dock/hubs mirror in `ui.toml`.
+//! Authoritative dock layout for a project lives in `project.json` (PB-95).
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -22,6 +23,9 @@ pub struct UiState {
     /// Conversion hubs drawn in the Hubs panel. Missing files get the sample diagram.
     #[serde(default)]
     pub hubs: HubModel,
+    /// App-level: start MQTT + OPC UA embedded hubs on load when configured (PB-58).
+    #[serde(default)]
+    pub auto_run_embedded_hubs: bool,
 }
 
 fn default_theme() -> String {
@@ -36,6 +40,7 @@ impl Default for UiState {
             maximized: None,
             hidden_panes: Vec::new(),
             hubs: HubModel::sample(),
+            auto_run_embedded_hubs: false,
         }
     }
 }
@@ -73,7 +78,8 @@ impl UiState {
         true
     }
 
-    fn sanitize(&mut self) {
+    /// Ensure every pane exists in the tree; drop retired Calculations leaf.
+    pub fn sanitize(&mut self) {
         if !self.tree.contains_pane(DockPane::Hubs) {
             self.tree.band_north(DockPane::Hubs, 0.34);
         }
