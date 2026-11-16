@@ -1033,6 +1033,7 @@ impl ProtocolBenchApp {
                     .inner_margin(egui::Margin::same(16.0)),
             )
             .show(ctx, |ui| {
+                apply_form_spacing(ui);
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Settings")
@@ -1060,7 +1061,48 @@ impl ProtocolBenchApp {
                         .font(font_ui(12.0))
                         .color(p.muted),
                 );
-                ui.add_space(12.0);
+                // PB-58 control — dropped accidentally in PB-96 settings rewrite.
+                ui.add_space(space::SECTION - 2.0);
+                ui.label(
+                    egui::RichText::new("HUBS")
+                        .font(font_ui(10.5))
+                        .color(p.muted),
+                );
+                ui.add_space(space::AFTER_HEADING);
+                let prev_auto = self.ui_state.auto_run_embedded_hubs;
+                if ui
+                    .checkbox(
+                        &mut self.ui_state.auto_run_embedded_hubs,
+                        "Auto-run embedded hubs",
+                    )
+                    .changed()
+                {
+                    self.mark_dirty();
+                    // Turning on at runtime starts MQTT + OPC UA hubs when configured.
+                    if self.ui_state.auto_run_embedded_hubs && !prev_auto {
+                        mqtt_panel::maybe_auto_start_embedded(
+                            &self.engine,
+                            &mut self.mqtt,
+                            &self.ui_state.hubs,
+                            true,
+                        );
+                        opcua_panel::maybe_auto_start_embedded(
+                            &self.engine,
+                            &mut self.opcua,
+                            true,
+                        );
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "When enabled, start the MQTT broker and OPC UA server hubs on load \
+(and when this is turned on) if they are configured in their panels.",
+                    )
+                    .font(font_ui(11.5))
+                    .color(p.muted),
+                );
+                ui.add_space(16.0);
                 if text_button(ui, "Reset layout", p).clicked() {
                     self.reset_layout();
                 }
@@ -1456,7 +1498,6 @@ impl ProtocolBenchApp {
                     .layout(Layout::top_down(egui::Align::Min)),
             );
             body_ui.set_clip_rect(body.expand(2.0).intersect(clip));
-            let prev_auto = self.project_settings.auto_run_embedded_broker;
             let hub_change = panels::paint(
                 &mut body_ui,
                 active,
@@ -1485,16 +1526,7 @@ impl ProtocolBenchApp {
                     &self.ui_state.hubs,
                 );
             }
-            // Honor auto-run when the Project checkbox is turned on.
-            if self.project_settings.auto_run_embedded_broker && !prev_auto {
-                mqtt_panel::maybe_auto_start_embedded(
-                    &self.engine,
-                    &mut self.mqtt,
-                    &self.ui_state.hubs,
-                    true,
-                );
-                opcua_panel::maybe_auto_start_embedded(&self.engine, &mut self.opcua, true);
-            }
+            // Auto-run toggle lives in Settings (ui.toml), not Project panel.
             if let Some(pane) = hub_change.open {
                 self.ui_state.reveal_pane(pane);
                 self.ui_state.tree.set_active(pane);
