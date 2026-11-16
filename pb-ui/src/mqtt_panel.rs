@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;
 
+use crate::connection_list::{self, RowAction};
 use crate::hubs::HubModel;
 use crate::theme::{
     apply_form_spacing, font_semi, font_ui, form_inset, space, ThemePalette,
@@ -217,6 +218,8 @@ pub struct MqttPanelState {
     /// Live rumqttd listen state (session UI; not persisted).
     pub broker_running: bool,
     pub broker_status: String,
+    /// Pending list-row delete confirm: (index, display name). Session UI only.
+    pub pending_delete: Option<(usize, String)>,
 }
 
 impl Default for MqttPanelState {
@@ -228,6 +231,7 @@ impl Default for MqttPanelState {
             embedded: EmbeddedBrokerConfig::default(),
             broker_running: false,
             broker_status: String::new(),
+            pending_delete: None,
         }
     }
 }
@@ -539,7 +543,10 @@ fn paint_body(
     );
     ui.add_space(space::AFTER_BLURB);
 
-    clients_bar(ui, state, engine, hubs, p);
+    clients_list(ui, state, engine, hubs, p);
+    if let Some(i) = connection_list::confirm_delete(ui.ctx(), &mut state.pending_delete, p) {
+        remove_mqtt_client(state, engine, hubs, i);
+    }
     ui.add_space(space::AFTER_FIELD + 2.0);
 
     if state.selected().is_none() {
@@ -610,69 +617,70 @@ fn paint_body(
     }
 }
 
-fn clients_bar(
+fn clients_list(
     ui: &mut egui::Ui,
     state: &mut MqttPanelState,
     engine: &EngineHandle,
     hubs: &HubModel,
     p: &ThemePalette,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        // Explicit CHIP gaps so chips never sit flush (PB-88).
-        ui.spacing_mut().item_spacing = Vec2::new(space::CHIP, space::CHIP);
-        let mut select = None;
-        let mut remove = None;
-        for (i, client) in state.clients.iter().enumerate() {
-            if i > 0 {
-                ui.add_space(space::CHIP);
+    let mut select = None;
+    let show_delete = state.clients.len() > 1;
+    for (i, client) in state.clients.iter().enumerate() {
+        let selected = state.selected == Some(i);
+        let label = if client.label.is_empty() {
+            client.id.clone()
+        } else {
+            client.label.clone()
+        };
+        let subtitle = format!("{}:{}", client.host, client.port);
+        match connection_list::selectable_row(ui, &label, &subtitle, selected, show_delete, p) {
+            Some(RowAction::Select) => select = Some(i),
+            Some(RowAction::Delete) => {
+                state.pending_delete = Some((i, label));
             }
-            let selected = state.selected == Some(i);
-            let label = if client.label.is_empty() {
-                client.id.as_str()
-            } else {
-                client.label.as_str()
-            };
-            if text_btn(ui, label, selected, p).clicked() {
-                select = Some(i);
-            }
-            if state.clients.len() > 1
-                && text_btn(ui, "×", false, p)
-                    .on_hover_text("Remove connection")
-                    .clicked()
-            {
-                remove = Some(i);
-            }
+            None => {}
         }
-        if let Some(i) = select {
-            state.selected = if state.selected == Some(i) {
-                None
-            } else {
-                Some(i)
-            };
-        }
-        if let Some(i) = remove {
-            let was = state.selected;
-            state.clients.remove(i);
-            state.selected = match was {
-                Some(s) if s == i => None,
-                Some(s) if s > i => Some(s - 1),
-                other => other,
-            };
-            state.ensure_clients();
-            apply_mqtt_session(engine, state, hubs);
-        }
-        ui.add_space(space::CHIP);
-        if secondary_btn(ui, "+ Add", p).clicked() {
-            let id = state.unique_id("broker");
-            let mut c = MqttClient::default_local();
-            c.id = id.clone();
-            c.label = id.clone();
-            c.client_id = fresh_mqtt_client_id(&id);
-            state.clients.push(c);
-            state.selected = Some(state.clients.len() - 1);
-            apply_mqtt_session(engine, state, hubs);
-        }
-    });
+        ui.add_space(2.0);
+    }
+    if let Some(i) = select {
+        state.selected = if state.selected == Some(i) {
+            None
+        } else {
+            Some(i)
+        };
+    }
+    ui.add_space(space::AFTER_FIELD);
+    if secondary_btn(ui, "+ Add broker", p).clicked() {
+        let id = state.unique_id("broker");
+        let mut c = MqttClient::default_local();
+        c.id = id.clone();
+        c.label = id.clone();
+        c.client_id = fresh_mqtt_client_id(&id);
+        state.clients.push(c);
+        state.selected = Some(state.clients.len() - 1);
+        apply_mqtt_session(engine, state, hubs);
+    }
+}
+
+fn remove_mqtt_client(
+    state: &mut MqttPanelState,
+    engine: &EngineHandle,
+    hubs: &HubModel,
+    i: usize,
+) {
+    if i >= state.clients.len() {
+        return;
+    }
+    let was = state.selected;
+    state.clients.remove(i);
+    state.selected = match was {
+        Some(s) if s == i => None,
+        Some(s) if s > i => Some(s - 1),
+        other => other,
+    };
+    state.ensure_clients();
+    apply_mqtt_session(engine, state, hubs);
 }
 
 fn selected_client_editor(

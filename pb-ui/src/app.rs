@@ -68,6 +68,8 @@ pub struct ProtocolBenchApp {
     live_host: HostSnapshot,
     live_points_fp: u64,
     last_live_poll: Instant,
+    /// Last IPC status probe (chip + bottom report).
+    last_service_poll: Instant,
 }
 
 enum ProjectDialog {
@@ -115,72 +117,65 @@ impl ProtocolBenchApp {
         let mut opcua = OpcUaPanelState::default();
         let mut mqtt_saved = MqttProject::default();
         let mut project_settings = ProjectSettings::default();
-        let mut status = "Ready".into();
+        let mut status = "Service disconnected".into();
         let mut service_connected = false;
         let mut service_report = String::new();
-        // Always two processes: connect to pb-service (no in-process engine).
+        // Prefer live IPC; UI still opens when pb-service is down (auto-probe reconnects).
         let engine = match EngineHandle::connect() {
             Ok(h) => {
                 service_connected = true;
-                if let Ok(st) = h.status() {
-                    service_report = format!(
-                        "packs={:?} points={} mqtt_hub={} opcua_hub={}",
-                        st.packs_loaded,
-                        st.point_count,
-                        st.mqtt_hub_running,
-                        st.opcua_hub_running
-                    );
-                }
                 h
             }
             Err(err) => {
                 eprintln!("protocol-bench: {err}");
-                eprintln!("Start the service first: PB_MODULES=./modules cargo run -p pb-service");
-                std::process::exit(1);
+                EngineHandle::disconnected()
             }
         };
         let mut ui_state = ui_state;
         let auto_run = project_settings.auto_run_embedded_broker;
-        // Service owns project.json — open (or load default) over IPC.
-        let open_path = project_path.display().to_string();
-        if let Err(err) = engine.open_project(&open_path, auto_run) {
-            status = format!("Service open project: {err}");
-        }
-        match engine.get_project_json() {
-            Ok(value) => match serde_json::from_value::<ProjectFile>(value) {
-                Ok(file) => {
-                    file.mqtt.apply_to_panel(&mut mqtt);
-                    file.opcua.apply_to_panel(&mut opcua);
-                    project_settings = file.settings.clone();
-                    if let Some(hubs) = file.hubs {
-                        ui_state.hubs = hubs;
-                        ui_state.hubs.sanitize();
-                    }
-                    if let Ok(mut store) = engine.points().lock() {
-                        project::import_bindings_to_store(
-                            &mut store,
-                            &file.points,
-                            file.next_point_seq,
+        if service_connected {
+            // Service owns project.json — open (or load default) over IPC.
+            let open_path = project_path.display().to_string();
+            let _ = engine.open_project(&open_path, auto_run);
+            match engine.get_project_json() {
+                Ok(value) => match serde_json::from_value::<ProjectFile>(value) {
+                    Ok(file) => {
+                        file.mqtt.apply_to_panel(&mut mqtt);
+                        file.opcua.apply_to_panel(&mut opcua);
+                        project_settings = file.settings.clone();
+                        if let Some(hubs) = file.hubs {
+                            ui_state.hubs = hubs;
+                            ui_state.hubs.sanitize();
+                        }
+                        if let Ok(mut store) = engine.points().lock() {
+                            project::import_bindings_to_store(
+                                &mut store,
+                                &file.points,
+                                file.next_point_seq,
+                            );
+                            project::migrate_panel_point_refs(&mut mqtt, &mut store);
+                        }
+                        project::migrate_client_binds_to_hubs(&mut mqtt, &mut ui_state.hubs);
+                        mqtt_saved = MqttProject::from_panel(&mqtt);
+                        mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &ui_state.hubs);
+                        mqtt_panel::maybe_auto_start_embedded(
+                            &engine,
+                            &mut mqtt,
+                            &ui_state.hubs,
+                            auto_run,
                         );
-                        project::migrate_panel_point_refs(&mut mqtt, &mut store);
+                        opcua_panel::apply_opcua_session(&engine, &mut opcua, &ui_state.hubs);
+                        opcua_panel::maybe_auto_start_embedded(&engine, &mut opcua, auto_run);
+                        status = format!("Connected · project {}", project_path.display());
                     }
-                    project::migrate_client_binds_to_hubs(&mut mqtt, &mut ui_state.hubs);
-                    mqtt_saved = MqttProject::from_panel(&mqtt);
-                    // Session apply still goes through IPC submit → service packs.
-                    mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &ui_state.hubs);
-                    mqtt_panel::maybe_auto_start_embedded(
-                        &engine,
-                        &mut mqtt,
-                        &ui_state.hubs,
-                        auto_run,
-                    );
-                    opcua_panel::apply_opcua_session(&engine, &mut opcua, &ui_state.hubs);
-                    opcua_panel::maybe_auto_start_embedded(&engine, &mut opcua, auto_run);
-                    status = format!("Connected · project {}", project_path.display());
-                }
-                Err(err) => status = format!("Project decode: {err}"),
-            },
-            Err(err) => status = format!("Get project: {err}"),
+                    Err(err) => status = format!("Project decode: {err}"),
+                },
+                Err(err) => status = format!("Get project: {err}"),
+            }
+            if let Ok(st) = engine.status() {
+                service_report = Self::format_service_report(&st);
+                status = format!("Service · {service_report}");
+            }
         }
         let hubs_saved = ui_state.hubs.clone();
         let settings_saved = project_settings.clone();
@@ -215,6 +210,43 @@ impl ProtocolBenchApp {
             live_host,
             live_points_fp,
             last_live_poll: Instant::now(),
+            last_service_poll: Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    fn format_service_report(st: &pb_ipc::ServiceStatus) -> String {
+        format!(
+            "packs={:?} pts={} mqtt_hub={} opcua_hub={}",
+            st.packs_loaded, st.point_count, st.mqtt_hub_running, st.opcua_hub_running
+        )
+    }
+
+    /// Periodic IPC probe: chip + bottom rate without a click.
+    fn poll_service_link(&mut self) {
+        const SERVICE_POLL: Duration = Duration::from_millis(1500);
+        if self.last_service_poll.elapsed() < SERVICE_POLL {
+            return;
+        }
+        self.last_service_poll = Instant::now();
+        match self.engine.probe_status() {
+            Ok(st) => {
+                let report = Self::format_service_report(&st);
+                let was = self.service_connected;
+                self.service_connected = true;
+                if !was || self.service_report != report {
+                    self.service_report = report.clone();
+                    self.status = format!("Service · {report}");
+                }
+            }
+            Err(_) => {
+                if self.service_connected || !self.status.starts_with("Service disconnected") {
+                    self.status = "Service disconnected".into();
+                }
+                self.service_connected = false;
+                self.service_report.clear();
+            }
         }
     }
 
@@ -537,6 +569,7 @@ impl eframe::App for ProtocolBenchApp {
                 self.live_host.uptime_ms = snap.uptime_ms;
             }
         }
+        self.poll_service_link();
         let p = self.theme.palette();
         theme::paint_root_bg(ctx, &p);
         self.pane_hits.clear();
@@ -868,25 +901,12 @@ impl ProtocolBenchApp {
                         )
                         .truncate(),
                     );
-                    // Refresh live service report on click; chip reflects IPC health.
+                    // Click forces an immediate probe; auto-probe also runs ~1.5s.
                     if service_connection_chip(ui, self.service_connected, p).clicked() {
-                        match self.engine.status() {
-                            Ok(st) => {
-                                self.service_connected = true;
-                                self.service_report = format!(
-                                    "packs={:?} pts={} mqtt_hub={} opcua_hub={}",
-                                    st.packs_loaded,
-                                    st.point_count,
-                                    st.mqtt_hub_running,
-                                    st.opcua_hub_running
-                                );
-                                self.status = format!("Service · {}", self.service_report);
-                            }
-                            Err(err) => {
-                                self.service_connected = false;
-                                self.status = format!("Service disconnected: {err}");
-                            }
-                        }
+                        self.last_service_poll = Instant::now()
+                            .checked_sub(Duration::from_secs(10))
+                            .unwrap_or_else(Instant::now);
+                        self.poll_service_link();
                     }
                 });
                 let clip = ui.clip_rect();
@@ -1876,7 +1896,7 @@ fn service_connection_chip(ui: &mut egui::Ui, connected: bool, p: &ThemePalette)
     ui.painter().circle_filled(dot, 3.5, ink);
     ui.painter()
         .galley(Pos2::new(rect.min.x + 16.0, rect.center().y - galley.size().y * 0.5), galley, p.text);
-    resp.on_hover_text("Mock service connection — click to toggle")
+    resp.on_hover_text("Backend service IPC — click to re-check")
 }
 
 fn paint_about_wordmark(ui: &mut egui::Ui, p: &ThemePalette) {

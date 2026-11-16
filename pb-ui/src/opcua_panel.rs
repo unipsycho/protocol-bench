@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;
 
+use crate::connection_list::{self, RowAction};
 use crate::hubs::HubModel;
 use crate::opcua_browse::{self, BrowseAction, BrowseMode, BrowseTree, FlatBrowseRow};
 use crate::theme::{
@@ -154,6 +155,8 @@ pub struct OpcUaPanelState {
     pub server_checklist: String,
     pub trees: BTreeMap<String, BrowseTree>,
     pub last_error: String,
+    /// Pending list-row delete confirm: (index, display name). Session UI only.
+    pub pending_delete: Option<(usize, String)>,
 }
 
 impl Default for OpcUaPanelState {
@@ -167,6 +170,7 @@ impl Default for OpcUaPanelState {
             server_checklist: String::new(),
             trees: BTreeMap::new(),
             last_error: String::new(),
+            pending_delete: None,
         }
     }
 }
@@ -435,7 +439,10 @@ fn paint_body(
         .color(p.muted),
     );
     ui.add_space(space::AFTER_BLURB);
-    clients_bar(ui, state, engine, hubs, p);
+    clients_list(ui, state, engine, hubs, p);
+    if let Some(i) = connection_list::confirm_delete(ui.ctx(), &mut state.pending_delete, p) {
+        remove_opcua_client(state, engine, hubs, i);
+    }
     ui.add_space(space::AFTER_FIELD + 2.0);
 
     if state.selected().is_none() {
@@ -686,68 +693,70 @@ fn stop_embedded(engine: &EngineHandle, state: &mut OpcUaPanelState) {
     state.server_status = "Stopped".into();
 }
 
-fn clients_bar(
+fn clients_list(
     ui: &mut egui::Ui,
     state: &mut OpcUaPanelState,
     engine: &EngineHandle,
     hubs: &HubModel,
     p: &ThemePalette,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        // Explicit CHIP gaps — item_spacing alone was collapsing between chips (PB-88).
-        ui.spacing_mut().item_spacing = Vec2::new(space::CHIP, space::CHIP);
-        let mut select = None;
-        let mut remove = None;
-        for (i, client) in state.clients.iter().enumerate() {
-            if i > 0 {
-                ui.add_space(space::CHIP);
+    let mut select = None;
+    let show_delete = state.clients.len() > 1;
+    for (i, client) in state.clients.iter().enumerate() {
+        let selected = state.selected == Some(i);
+        let label = if client.label.is_empty() {
+            client.id.clone()
+        } else {
+            client.label.clone()
+        };
+        let subtitle = client.endpoint_url.clone();
+        match connection_list::selectable_row(ui, &label, &subtitle, selected, show_delete, p) {
+            Some(RowAction::Select) => select = Some(i),
+            Some(RowAction::Delete) => {
+                state.pending_delete = Some((i, label));
             }
-            let selected = state.selected == Some(i);
-            let label = if client.label.is_empty() {
-                client.id.as_str()
-            } else {
-                client.label.as_str()
-            };
-            if text_btn(ui, label, selected, p).clicked() {
-                select = Some(i);
-            }
-            if state.clients.len() > 1 {
-                ui.add_space(space::CHIP * 0.5);
-                if text_btn(ui, "×", false, p).clicked() {
-                    remove = Some(i);
-                }
-            }
+            None => {}
         }
-        if let Some(i) = select {
-            state.selected = if state.selected == Some(i) {
-                None
-            } else {
-                Some(i)
-            };
-        }
-        if let Some(i) = remove {
-            let was = state.selected;
-            let id = state.clients[i].id.clone();
-            state.clients.remove(i);
-            state.trees.remove(&id);
-            state.selected = match was {
-                Some(s) if s == i => None,
-                Some(s) if s > i => Some(s - 1),
-                other => other,
-            };
-            apply_opcua_session(engine, state, hubs);
-        }
-        ui.add_space(space::CHIP);
-        if secondary_btn(ui, "+ Add", p).clicked() {
-            let id = state.unique_id("ua");
-            let mut c = OpcUaClient::default_plant();
-            c.id = id.clone();
-            c.label = id;
-            state.clients.push(c);
-            state.selected = Some(state.clients.len() - 1);
-            apply_opcua_session(engine, state, hubs);
-        }
-    });
+        ui.add_space(2.0);
+    }
+    if let Some(i) = select {
+        state.selected = if state.selected == Some(i) {
+            None
+        } else {
+            Some(i)
+        };
+    }
+    ui.add_space(space::AFTER_FIELD);
+    if secondary_btn(ui, "+ Add client", p).clicked() {
+        let id = state.unique_id("ua");
+        let mut c = OpcUaClient::default_plant();
+        c.id = id.clone();
+        c.label = id;
+        state.clients.push(c);
+        state.selected = Some(state.clients.len() - 1);
+        apply_opcua_session(engine, state, hubs);
+    }
+}
+
+fn remove_opcua_client(
+    state: &mut OpcUaPanelState,
+    engine: &EngineHandle,
+    hubs: &HubModel,
+    i: usize,
+) {
+    if i >= state.clients.len() {
+        return;
+    }
+    let was = state.selected;
+    let id = state.clients[i].id.clone();
+    state.clients.remove(i);
+    state.trees.remove(&id);
+    state.selected = match was {
+        Some(s) if s == i => None,
+        Some(s) if s > i => Some(s - 1),
+        other => other,
+    };
+    apply_opcua_session(engine, state, hubs);
 }
 
 fn selected_client_editor(
