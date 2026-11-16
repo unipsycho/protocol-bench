@@ -16,6 +16,7 @@ use crate::theme::{
     after_field, apply_form_spacing, font_semi, font_ui, form_inset, space, scope, tint,
     ThemePalette,
 };
+use crate::traffic_panel::{self, TrafficPanelState};
 
 /// Points panel filter + sort (session UI state).
 #[derive(Debug, Clone)]
@@ -44,6 +45,7 @@ pub fn paint(
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     points: &mut PointsPanelState,
+    traffic: &mut TrafficPanelState,
     settings: &mut ProjectSettings,
     project_path: &std::path::Path,
 ) -> crate::hubs::HubChange {
@@ -66,6 +68,10 @@ pub fn paint(
         }
         DockPane::Points => {
             points_panel(ui, host, p, points);
+            crate::hubs::HubChange::quiet()
+        }
+        DockPane::Traffic => {
+            traffic_panel::paint(ui, host, mqtt, opcua, traffic, p);
             crate::hubs::HubChange::quiet()
         }
         DockPane::Calculations => {
@@ -210,7 +216,9 @@ fn blurb(pane: DockPane, host: &HostSnapshot) -> String {
         DockPane::Points => "Live values from every wired protocol input.".into(),
         DockPane::Calculations => "Moved into calculation node properties on the Hubs diagram.".into(),
         DockPane::Mappings => "A point that arrives on one link can leave on another.".into(),
-        DockPane::Traffic => "Bytes and frames from every link, when capture exists.".into(),
+        DockPane::Traffic => {
+            "Listeners, connected clients, and point throughput.".into()
+        }
         _ => String::new(),
     }
 }

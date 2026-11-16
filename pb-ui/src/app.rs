@@ -19,6 +19,7 @@ use crate::layout::{LayoutNode, SplitDir, TabGroup};
 use crate::mqtt_panel::{self, MqttPanelState};
 use crate::opcua_panel::{self, OpcUaPanelState};
 use crate::panels::PointsPanelState;
+use crate::traffic_panel::TrafficPanelState;
 use crate::panels;
 use crate::persist::{self, UiState};
 use crate::project::{self, DockLayout, MqttProject, ProjectFile, ProjectSettings};
@@ -52,6 +53,7 @@ pub struct ProtocolBenchApp {
     mqtt: MqttPanelState,
     opcua: OpcUaPanelState,
     points: PointsPanelState,
+    traffic: TrafficPanelState,
     /// Project-level options (Project panel / project.json).
     project_settings: ProjectSettings,
     /// Last settings snapshot written to the project file.
@@ -213,6 +215,7 @@ impl ProtocolBenchApp {
             mqtt,
             opcua,
             points: PointsPanelState::default(),
+            traffic: TrafficPanelState::default(),
             project_settings,
             settings_saved,
             project_path,
@@ -1464,6 +1467,7 @@ impl ProtocolBenchApp {
                 &mut self.mqtt,
                 &mut self.opcua,
                 &mut self.points,
+                &mut self.traffic,
                 &mut self.project_settings,
                 &self.project_path,
             );

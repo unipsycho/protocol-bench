@@ -22,6 +22,7 @@ mod point_rows;
 mod project;
 mod theme;
 mod topic_tree;
+mod traffic_panel;
 
 use eframe::egui;
 
