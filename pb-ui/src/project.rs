@@ -49,6 +49,9 @@ pub struct ProjectFile {
     /// OPC UA clients + embedded UA server. Absent on older files → defaults.
     #[serde(default)]
     pub opcua: OpcUaProject,
+    /// HTTP / REST outbound clients. Absent on older files → defaults.
+    #[serde(default)]
+    pub http: HttpProject,
     /// Hub diagram + Input/Output MQTT binds. Absent on older files → keep ui.toml hubs.
     #[serde(default)]
     pub hubs: Option<HubModel>,
@@ -116,10 +119,167 @@ impl Default for ProjectFile {
             next_point_seq: 1,
             mqtt: MqttProject::default(),
             opcua: OpcUaProject::default(),
+            http: HttpProject::default(),
             hubs: None,
             settings: ProjectSettings::default(),
             layout: None,
         }
+    }
+}
+
+/// HTTP / REST clients (outbound JSON).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HttpProject {
+    #[serde(default)]
+    pub clients: Vec<HttpClientSerde>,
+    #[serde(default)]
+    pub selected_id: String,
+}
+
+impl Default for HttpProject {
+    fn default() -> Self {
+        let client = HttpClientSerde::default_local();
+        Self {
+            selected_id: client.id.clone(),
+            clients: vec![client],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HttpClientSerde {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default = "default_http_base")]
+    pub base_url: String,
+    #[serde(default = "default_http_auth")]
+    pub auth: String,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_http_timeout")]
+    pub timeout_secs: u32,
+    #[serde(default)]
+    pub headers: Vec<HttpHeaderSerde>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpHeaderSerde {
+    pub name: String,
+    pub value: String,
+}
+
+fn default_http_base() -> String {
+    "http://127.0.0.1:8080".into()
+}
+fn default_http_auth() -> String {
+    "none".into()
+}
+fn default_http_timeout() -> u32 {
+    10
+}
+
+impl HttpClientSerde {
+    fn default_local() -> Self {
+        Self {
+            id: "api".into(),
+            label: "Local API".into(),
+            base_url: default_http_base(),
+            auth: default_http_auth(),
+            token: String::new(),
+            username: String::new(),
+            password: String::new(),
+            timeout_secs: default_http_timeout(),
+            headers: vec![HttpHeaderSerde {
+                name: "Content-Type".into(),
+                value: "application/json".into(),
+            }],
+        }
+    }
+
+    fn from_client(c: &crate::http_panel::HttpClient) -> Self {
+        Self {
+            id: c.id.clone(),
+            label: c.label.clone(),
+            base_url: c.base_url.clone(),
+            auth: c.auth.as_str().into(),
+            token: c.token.clone(),
+            username: c.username.clone(),
+            password: c.password.clone(),
+            timeout_secs: c.timeout_secs.parse().unwrap_or(10),
+            headers: c
+                .headers
+                .iter()
+                .map(|h| HttpHeaderSerde {
+                    name: h.name.clone(),
+                    value: h.value.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn to_client(&self) -> crate::http_panel::HttpClient {
+        crate::http_panel::HttpClient {
+            id: self.id.clone(),
+            label: if self.label.is_empty() {
+                self.id.clone()
+            } else {
+                self.label.clone()
+            },
+            base_url: self.base_url.clone(),
+            auth: crate::http_panel::HttpAuthKind::from_str(&self.auth),
+            token: self.token.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+            timeout_secs: self.timeout_secs.to_string(),
+            headers: self
+                .headers
+                .iter()
+                .map(|h| crate::http_panel::HttpHeader {
+                    name: h.name.clone(),
+                    value: h.value.clone(),
+                })
+                .collect(),
+            draft_header_name: String::new(),
+            draft_header_value: String::new(),
+        }
+    }
+}
+
+impl HttpProject {
+    pub fn from_panel(state: &crate::http_panel::HttpPanelState) -> Self {
+        let clients = state
+            .clients
+            .iter()
+            .map(HttpClientSerde::from_client)
+            .collect();
+        let selected_id = state
+            .selected()
+            .map(|c| c.id.clone())
+            .unwrap_or_default();
+        Self {
+            clients,
+            selected_id,
+        }
+    }
+
+    pub fn apply_to_panel(&self, state: &mut crate::http_panel::HttpPanelState) {
+        state.clients = self.clients.iter().map(|c| c.to_client()).collect();
+        if state.clients.is_empty() {
+            state.clients.push(crate::http_panel::HttpClient::default_local());
+        }
+        state.selected = if self.selected_id.is_empty() {
+            None
+        } else {
+            state
+                .clients
+                .iter()
+                .position(|c| c.id == self.selected_id)
+        };
     }
 }
 
@@ -677,6 +837,7 @@ pub fn load(path: &Path) -> Result<ProjectFile, String> {
                 embedded: EmbeddedBrokerConfig::default(),
             },
             opcua: OpcUaProject::default(),
+            http: HttpProject::default(),
             hubs: None,
             settings: ProjectSettings::default(),
             layout: None,
@@ -763,6 +924,7 @@ mod tests {
             next_point_seq: 2,
             mqtt: MqttProject::from_panel(&panel),
             opcua: OpcUaProject::default(),
+            http: HttpProject::default(),
             hubs: None,
             settings: ProjectSettings {
                 name: "Plant".into(),

@@ -8,6 +8,7 @@ use pb_engine::HostSnapshot;
 use crate::art;
 use crate::dock::DockPane;
 use crate::hubs::HubModel;
+use crate::http_panel::{self, HttpPanelState};
 use crate::mqtt_panel::{self, MqttPanelState};
 use crate::opcua_panel::{self, OpcUaPanelState};
 use crate::point_rows::{self, PointsTableRow, PointsTableState};
@@ -44,6 +45,7 @@ pub fn paint(
     engine: &EngineHandle,
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
+    http: &mut HttpPanelState,
     points: &mut PointsPanelState,
     traffic: &mut TrafficPanelState,
     settings: &mut ProjectSettings,
@@ -56,7 +58,7 @@ pub fn paint(
             mqtt.sync_trees_from_host(host);
             opcua.sync_from_host(host);
             let conns = mqtt.connection_choices();
-            crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, host, engine)
+            crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, http, host, engine)
         }
         DockPane::Mqtt => {
             mqtt_panel::paint(ui, host, p, engine, mqtt, hubs);
@@ -65,6 +67,12 @@ pub fn paint(
         DockPane::OpcUa => {
             opcua_panel::paint(ui, host, p, engine, opcua, hubs);
             crate::hubs::HubChange::quiet()
+        }
+        DockPane::Http => {
+            let dirty = http_panel::paint(ui, p, http);
+            let mut change = crate::hubs::HubChange::quiet();
+            change.dirty = dirty;
+            change
         }
         DockPane::Points => {
             points_panel(ui, host, p, points);
@@ -365,6 +373,7 @@ fn columns(pane: DockPane) -> &'static [(&'static str, f32)] {
         DockPane::Mqtt => &[("TOPIC", 0.50), ("DIR", 0.22), ("QOS", 0.28)],
         DockPane::OpcUa => &[("NODE", 0.42), ("ACCESS", 0.24), ("POINT", 0.34)],
         DockPane::Files => &[("PATH", 0.48), ("PARSER", 0.24), ("OFFSET", 0.28)],
+        DockPane::Http => &[("NAME", 0.28), ("URL", 0.52), ("AUTH", 0.20)],
         DockPane::Project | DockPane::Hubs | DockPane::Calculations => &[("NAME", 1.0)],
     }
 }
@@ -379,6 +388,7 @@ fn empty_message(pane: DockPane) -> &'static str {
         DockPane::Mqtt => "No topics yet",
         DockPane::OpcUa => "No nodes yet",
         DockPane::Files => "No files yet",
+        DockPane::Http => "No clients yet",
         DockPane::Project | DockPane::Hubs | DockPane::Calculations => "",
     }
 }

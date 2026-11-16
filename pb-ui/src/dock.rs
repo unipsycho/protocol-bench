@@ -21,11 +21,13 @@ pub enum DockPane {
     Mqtt,
     OpcUa,
     Files,
+    /// HTTP / REST JSON clients (Input/Output; no engine slot until pb-http).
+    Http,
 }
 
 impl DockPane {
     /// Rail order: bench views, then protocol links.
-    pub const ALL: [DockPane; 10] = [
+    pub const ALL: [DockPane; 11] = [
         DockPane::Project,
         DockPane::Hubs,
         DockPane::Points,
@@ -36,6 +38,7 @@ impl DockPane {
         DockPane::Mqtt,
         DockPane::OpcUa,
         DockPane::Files,
+        DockPane::Http,
     ];
 
     pub fn title(self) -> &'static str {
@@ -51,6 +54,7 @@ impl DockPane {
             Self::Mqtt => "MQTT",
             Self::OpcUa => "OPC UA",
             Self::Files => "File follow",
+            Self::Http => "HTTP / REST",
         }
     }
 
@@ -67,6 +71,7 @@ impl DockPane {
             Self::Mqtt => "mqtt",
             Self::OpcUa => "opcua",
             Self::Files => "files",
+            Self::Http => "http",
         }
     }
 
@@ -78,6 +83,7 @@ impl DockPane {
             Self::Mqtt => Some(EngineId::Mqtt),
             Self::OpcUa => Some(EngineId::OpcUa),
             Self::Files => Some(EngineId::FileFollow),
+            Self::Http => None,
             _ => None,
         }
     }
@@ -106,6 +112,7 @@ impl DockPane {
             Self::Mqtt => Proto::MQTT,
             Self::OpcUa => Proto::OPC,
             Self::Files => Proto::FILES,
+            Self::Http => Proto::HTTP,
         }
     }
 
@@ -126,6 +133,7 @@ impl DockPane {
             Self::Mqtt => Proto::MQTT_DEEP,
             Self::OpcUa => Proto::OPC_DEEP,
             Self::Files => Proto::FILES_DEEP,
+            Self::Http => Proto::HTTP_DEEP,
         }
     }
 }
