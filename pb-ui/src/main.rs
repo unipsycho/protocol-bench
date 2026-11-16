@@ -19,6 +19,7 @@ mod panels;
 mod persist;
 mod point_rows;
 mod project;
+mod service_link;
 mod theme;
 mod topic_tree;
 

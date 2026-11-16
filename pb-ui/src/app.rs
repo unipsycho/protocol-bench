@@ -21,6 +21,7 @@ use crate::panels::PointsPanelState;
 use crate::panels;
 use crate::persist::{self, UiState};
 use crate::project::{self, DockLayout, MqttProject, ProjectFile, ProjectSettings};
+use crate::service_link::ServiceLink;
 use crate::theme::{
     self, apply_form_spacing, divider_bar, font_semi, font_ui, space, tint, AppTheme, ThemePalette,
     BAR_H, HEADER_H, MIN_PANE, RADIUS, RAIL_W, SEP, STATUS_H,
@@ -41,8 +42,8 @@ pub struct ProtocolBenchApp {
     settings_open: bool,
     menu: Option<BarMenu>,
     status: String,
-    /// Mock always-on service link (UI ↔ service). Click status bar to flip.
-    service_connected: bool,
+    /// Real IPC reachability (pb-service). Offline when no listener — not a mock.
+    service_link: ServiceLink,
     aa_logo: AaLogoCache,
     dirty: bool,
     last_save: Instant,
@@ -181,7 +182,7 @@ impl ProtocolBenchApp {
             settings_open: std::env::var_os("PB_OPEN_SETTINGS").is_some(),
             menu: None,
             status,
-            service_connected: true,
+            service_link: ServiceLink::default(),
             aa_logo: AaLogoCache::default(),
             dirty: seed_layout,
             last_save: Instant::now(),
@@ -533,6 +534,8 @@ impl eframe::App for ProtocolBenchApp {
                 self.live_host.uptime_ms = snap.uptime_ms;
             }
         }
+        // PB-98: status chip tracks pb-service IPC listener, not in-process hubs.
+        self.service_link.poll(false);
         let p = self.theme.palette();
         theme::paint_root_bg(ctx, &p);
         self.pane_hits.clear();
@@ -864,14 +867,10 @@ impl ProtocolBenchApp {
                         )
                         .truncate(),
                     );
-                    if service_connection_chip(ui, self.service_connected, p).clicked() {
-                        self.service_connected = !self.service_connected;
-                        let state = if self.service_connected {
-                            "connected"
-                        } else {
-                            "disconnected"
-                        };
-                        self.status = format!("Service connection mock → {state}");
+                    // Click re-probes IPC; chip is not a mock toggle.
+                    if service_connection_chip(ui, self.service_link.connected(), p).clicked() {
+                        self.service_link.poll(true);
+                        self.status = self.service_link.detail().to_string();
                     }
                 });
                 let clip = ui.clip_rect();
@@ -1891,7 +1890,7 @@ fn service_connection_chip(ui: &mut egui::Ui, connected: bool, p: &ThemePalette)
     ui.painter().circle_filled(dot, 3.5, ink);
     ui.painter()
         .galley(Pos2::new(rect.min.x + 16.0, rect.center().y - galley.size().y * 0.5), galley, p.text);
-    resp.on_hover_text("Mock service connection — click to toggle")
+    resp.on_hover_text("Backend service IPC — click to re-check")
 }
 
 fn paint_about_wordmark(ui: &mut egui::Ui, p: &ThemePalette) {
