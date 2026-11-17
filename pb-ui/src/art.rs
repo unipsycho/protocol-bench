@@ -172,6 +172,20 @@ pub fn chrome_button(
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Two-column grip (6 dots) for drag handles — no emoji/font glyphs.
+pub fn paint_grip(painter: &Painter, rect: Rect, color: Color32) {
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    let r = 1.15;
+    let dx = 2.6;
+    let dy = 3.4;
+    for y in [-dy, 0.0, dy] {
+        for x in [-dx, dx] {
+            painter.circle_filled(Pos2::new(cx + x, cy + y), r, color);
+        }
+    }
+}
+
 pub fn paint_check(painter: &Painter, center: Pos2, color: Color32) {
     let stroke = Stroke::new(1.7, color);
     painter.line_segment(

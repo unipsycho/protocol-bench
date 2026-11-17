@@ -4,8 +4,8 @@
 //! the MQTT panel). Many Inputs may share one MQTT connection.
 
 use egui::{
-    pos2, vec2, Align, Align2, Color32, CursorIcon, Id, Layout, Pos2, Rect, Rounding, ScrollArea,
-    Sense, Shape, Stroke, Ui, Vec2,
+    pos2, vec2, Align2, Color32, CursorIcon, Id, Layout, Pos2, Rect, Rounding, ScrollArea, Sense,
+    Shape, Stroke, Ui, Vec2,
 };
 use serde::Deserialize;
 
@@ -5009,7 +5009,7 @@ fn apply_stream_emit_drop(
     }
 }
 
-/// Drop zone + reorderable emit rows for Streams Output.
+/// Drop zone + reorderable emit rows for Streams Output (tight Points-like rows).
 fn paint_stream_emit_dnd(
     ui: &mut Ui,
     model: &mut HubModel,
@@ -5019,40 +5019,52 @@ fn paint_stream_emit_dnd(
 ) -> bool {
     use crate::point_rows::PointEmitDrag;
 
+    const ROW_H: f32 = 18.0;
+    const GRIP_W: f32 = 14.0;
+    const REMOVE_W: f32 = 18.0;
+    // Insert line only while dragging — no idle whitespace between rows.
+    const INSERT_GAP: f32 = 3.0;
+
     let mut dirty = false;
     let mut remove = None;
-    // Hover insert index while a compatible payload is over the list.
     let mut hover_insert: Option<usize> = None;
+    let dragging =
+        egui::DragAndDrop::has_payload_of_type::<PointEmitDrag>(ui.ctx());
 
     let frame = egui::Frame::none()
-        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-        .rounding(Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+        .rounding(Rounding::same(4.0))
         .stroke(Stroke::new(1.0, p.line));
 
     let (_zone, dropped) = ui.dnd_drop_zone::<PointEmitDrag, _>(frame, |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
         let n = port_field(model, hub_id, port_id).stream_outputs.len();
         if n == 0 {
-            ui.label(
-                egui::RichText::new("Drop points here to build the emit map.")
-                    .font(font_ui(12.0))
-                    .color(p.muted),
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width().max(1.0), ROW_H), Sense::hover());
+            ui.painter().text(
+                Pos2::new(rect.min.x + 4.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                "Drop points here to build the emit map.",
+                font_ui(12.0),
+                p.muted,
             );
         }
 
         for i in 0..=n {
-            // Gap drop target between / before / after rows.
-            let gap_h = if i < n { 4.0 } else { 10.0 };
-            let (gap_rect, gap_resp) =
-                ui.allocate_exact_size(Vec2::new(ui.available_width().max(1.0), gap_h), Sense::hover());
-            let over_gap = gap_resp.contains_pointer()
-                && egui::DragAndDrop::has_payload_of_type::<PointEmitDrag>(ui.ctx());
-            if over_gap {
-                hover_insert = Some(i);
-                ui.painter().hline(
-                    gap_rect.x_range(),
-                    gap_rect.center().y,
-                    Stroke::new(2.0, p.accent),
+            if dragging {
+                let (gap_rect, gap_resp) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width().max(1.0), INSERT_GAP),
+                    Sense::hover(),
                 );
+                if gap_resp.contains_pointer() {
+                    hover_insert = Some(i);
+                    ui.painter().hline(
+                        gap_rect.x_range(),
+                        gap_rect.center().y,
+                        Stroke::new(2.0, p.accent),
+                    );
+                }
             }
 
             if i == n {
@@ -5061,36 +5073,60 @@ fn paint_stream_emit_dnd(
 
             let bind = port_field(model, hub_id, port_id).stream_outputs[i].clone();
             let drag_id = ui.id().with(("pb_stream_emit", port_id, i, bind.point.as_str()));
+            let row_w = ui.available_width().max(1.0);
             let row = ui.dnd_drag_source(drag_id, PointEmitDrag::ReorderEmit(i), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("⠿")
-                            .font(font_ui(13.0))
-                            .color(p.muted),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}  →  field {}",
-                            bind.point, bind.field
-                        ))
-                        .font(font_ui(12.0))
-                        .color(p.text),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if text_button(ui, "×", false, p).clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                });
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(row_w, ROW_H), Sense::hover());
+                let hot = ui.rect_contains_pointer(rect);
+                if hot {
+                    ui.painter()
+                        .rect_filled(rect, Rounding::same(4.0), tint(p.accent, 18));
+                }
+                let grip = Rect::from_min_size(rect.min, Vec2::new(GRIP_W, ROW_H));
+                let rm = Rect::from_min_max(
+                    Pos2::new(rect.max.x - REMOVE_W, rect.min.y),
+                    rect.max,
+                );
+                let label = Rect::from_min_max(
+                    Pos2::new(grip.max.x + 4.0, rect.min.y),
+                    Pos2::new(rm.min.x - 2.0, rect.max.y),
+                );
+                crate::art::paint_grip(
+                    ui.painter(),
+                    grip,
+                    if hot { p.accent } else { p.muted },
+                );
+                ui.painter().text(
+                    Pos2::new(label.min.x, label.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("{}  →  field {}", bind.point, bind.field),
+                    font_ui(12.0),
+                    p.text,
+                );
+                let rm_click = ui.interact(rm, ui.id().with(("emit_rm", port_id, i)), Sense::click());
+                if rm_click.hovered() {
+                    ui.painter()
+                        .rect_filled(rm, Rounding::same(4.0), tint(p.accent, 20));
+                }
+                ui.painter().text(
+                    rm.center(),
+                    Align2::CENTER_CENTER,
+                    "×",
+                    font_ui(13.0),
+                    if rm_click.hovered() { p.accent } else { p.muted },
+                );
+                if rm_click.clicked() {
+                    remove = Some(i);
+                }
+                rm_click.on_hover_cursor(CursorIcon::PointingHand);
             });
             let over_row = row.response.contains_pointer();
             if !ui.ctx().is_being_dragged(drag_id) {
                 row.response
-                    .on_hover_cursor(egui::CursorIcon::Grab)
+                    .on_hover_cursor(CursorIcon::Grab)
                     .on_hover_text("Drag to reorder");
             }
-            // Drop onto the row body → insert before this index.
-            if over_row && egui::DragAndDrop::has_payload_of_type::<PointEmitDrag>(ui.ctx()) {
+            if over_row && dragging {
                 hover_insert = Some(i);
             }
         }
