@@ -118,10 +118,15 @@ pub struct PointsTableRow {
 
 impl PointsTableRow {
     pub fn from_snapshot(point: &PointSnapshot) -> Self {
+        let value = if point.value.trim().is_empty() {
+            "—".into()
+        } else {
+            point.value.clone()
+        };
         Self {
             id: point.name.clone(),
             source: point.source.clone(),
-            value: point.value.clone(),
+            value,
             quality: point.quality.clone(),
             updated: format_updated(point.updated_ms),
             updated_ms: point.updated_ms,
