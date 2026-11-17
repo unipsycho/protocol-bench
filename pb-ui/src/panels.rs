@@ -135,9 +135,11 @@ fn points_panel_body(
     label_w: f32,
 ) {
     ui.label(
-        egui::RichText::new("Live values from wired inputs — every protocol lands here.")
-            .font(font_ui(12.5))
-            .color(p.muted),
+        egui::RichText::new(
+            "Live values from wired inputs — drag a row onto a Streams Output emit list.",
+        )
+        .font(font_ui(12.5))
+        .color(p.muted),
     );
     ui.add_space(8.0);
 
@@ -195,13 +197,14 @@ fn points_panel_body(
         .id_salt("pb_points_live")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            let _action = point_rows::paint_points_table(
+            let _action = point_rows::paint_points_table_ex(
                 ui,
                 &mut rows,
                 &mut state.table,
                 p,
                 "points-panel",
                 false,
+                true,
             );
         });
 }
