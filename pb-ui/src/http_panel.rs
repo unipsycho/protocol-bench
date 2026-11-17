@@ -123,6 +123,14 @@ impl HttpPanelState {
             .collect()
     }
 
+    pub fn client_by_id(&self, id: &str) -> Option<&HttpClient> {
+        let id = id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        self.clients.iter().find(|c| c.id == id)
+    }
+
     fn ensure_clients(&mut self) {
         if self.clients.is_empty() {
             self.clients.push(HttpClient::default_local());
@@ -143,6 +151,120 @@ impl HttpPanelState {
         }
         id
     }
+}
+
+/// Join client base URL with an Input path (`/v2/...` or query-only).
+pub fn join_url(base: &str, path: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    let path = path.trim();
+    if path.is_empty() {
+        return base.to_string();
+    }
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return path.to_string();
+    }
+    if path.starts_with('/') {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/{path}")
+    }
+}
+
+/// One-shot GET/POST preview for the Hub Input sample pane (UI only; pack polls later).
+pub fn fetch_preview(client: &HttpClient, method: &str, path: &str) -> Result<String, String> {
+    let url = join_url(&client.base_url, path);
+    if url.is_empty() || client.base_url.trim().is_empty() {
+        return Err("Pick an HTTP client with a Base URL.".into());
+    }
+    let timeout = client
+        .timeout_secs
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .unwrap_or(10);
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(timeout))
+        .build();
+    let method = method.trim().to_ascii_uppercase();
+    let mut req = match method.as_str() {
+        "POST" => agent.request("POST", &url),
+        _ => agent.get(&url),
+    };
+    match client.auth {
+        HttpAuthKind::None => {}
+        HttpAuthKind::Bearer => {
+            let token = client.token.trim();
+            if !token.is_empty() {
+                req = req.set("Authorization", &format!("Bearer {token}"));
+            }
+        }
+        HttpAuthKind::Basic => {
+            let raw = format!("{}:{}", client.username, client.password);
+            let b64 = basic_auth_b64(&raw);
+            req = req.set("Authorization", &format!("Basic {b64}"));
+        }
+    }
+    for h in &client.headers {
+        let name = h.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        // Don't override Authorization we just set.
+        if name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        req = req.set(name, &h.value);
+    }
+    let resp = req.call().map_err(|e| format!("Request failed: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .into_string()
+        .map_err(|e| format!("Read body failed: {e}"))?;
+    if !(200..300).contains(&status) {
+        let snip = body.chars().take(180).collect::<String>();
+        return Err(format!("HTTP {status}: {snip}"));
+    }
+    // Pretty-print when JSON; otherwise keep raw text for diagnosis.
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => serde_json::to_string_pretty(&v).map_err(|e| e.to_string()),
+        Err(_) => Ok(body),
+    }
+}
+
+fn basic_auth_b64(raw: &str) -> String {
+    // Minimal base64 (no extra crate) for Basic auth previews.
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = raw.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b0 = bytes[i] as u32;
+        let b1 = if i + 1 < bytes.len() {
+            bytes[i + 1] as u32
+        } else {
+            0
+        };
+        let b2 = if i + 2 < bytes.len() {
+            bytes[i + 2] as u32
+        } else {
+            0
+        };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 63) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 63) as usize] as char);
+        if i + 1 < bytes.len() {
+            out.push(TABLE[((triple >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if i + 2 < bytes.len() {
+            out.push(TABLE[(triple & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
+    }
+    out
 }
 
 /// Flatten JSON object/array keys into dotted paths (arrays use `[]` then `.field`).
@@ -452,6 +574,32 @@ fn password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette
         }
     });
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_url_handles_slashes() {
+        assert_eq!(
+            join_url("https://api.coinbase.com", "/v2/prices/BTC-USD/spot"),
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+        );
+        assert_eq!(
+            join_url("https://api.coinbase.com/", "v2/prices/BTC-USD/spot"),
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+        );
+    }
+
+    #[test]
+    fn leaf_paths_include_nested_amount() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"data":{"amount":"90000.12","currency":"USD"}}"#).unwrap();
+        let paths = json_leaf_paths(&v);
+        assert!(paths.iter().any(|p| p == "data.amount"));
+        assert!(paths.iter().any(|p| p == "data.currency"));
+    }
 }
 
 fn text_btn(ui: &mut egui::Ui, label: &str, selected: bool, p: &ThemePalette) -> egui::Response {

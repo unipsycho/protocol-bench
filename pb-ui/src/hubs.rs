@@ -321,6 +321,9 @@ pub struct HubPort {
     /// Sample JSON for HTTP Input path picking.
     #[serde(skip)]
     pub draft_http_sample: String,
+    /// Last Fetch preview status / error (not persisted).
+    #[serde(skip)]
+    pub draft_http_fetch_status: String,
     #[serde(skip)]
     pub draft_http_json_path: String,
     #[serde(skip)]
@@ -388,6 +391,7 @@ impl HubPort {
             draft_input_manual: false,
             draft_edit_bind: None,
             draft_http_sample: String::new(),
+            draft_http_fetch_status: String::new(),
             draft_http_json_path: String::new(),
             draft_http_out_point: String::new(),
             draft_http_out_json_path: String::new(),
@@ -2086,6 +2090,7 @@ pub fn paint(
                 &stream_connections,
                 mqtt,
                 opcua,
+                http,
                 host,
                 engine,
             ));
@@ -2105,6 +2110,7 @@ pub fn paint(
             &stream_connections,
             mqtt,
             opcua,
+            http,
             host,
             engine,
         ));
@@ -3689,6 +3695,7 @@ fn inspector(
     stream_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
+    http: &HttpPanelState,
     host: &HostSnapshot,
     engine: &crate::engine_api::EngineHandle,
 ) -> HubChange {
@@ -3724,6 +3731,7 @@ fn inspector(
                 stream_connections,
                 mqtt,
                 opcua,
+                http,
                 host,
                 engine,
             ));
@@ -3740,6 +3748,7 @@ fn edit_selected(
     stream_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
+    http: &HttpPanelState,
     host: &HostSnapshot,
     engine: &crate::engine_api::EngineHandle,
 ) -> HubChange {
@@ -3785,6 +3794,7 @@ fn edit_selected(
             stream_connections,
             mqtt,
             opcua,
+            http,
             host,
             engine,
         );
@@ -3909,10 +3919,11 @@ fn edit_port(
     model: &mut HubModel,
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
-    http_connections: &[(String, String)],
+    _http_connections: &[(String, String)],
     stream_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
+    http: &HttpPanelState,
     host: &HostSnapshot,
     engine: &crate::engine_api::EngineHandle,
 ) -> HubChange {
@@ -4028,7 +4039,7 @@ fn edit_port(
             hub_id,
             port_id,
             incoming,
-            http_connections,
+            http,
             p,
         ));
     }
@@ -4216,11 +4227,12 @@ fn edit_http_port_binds(
     hub_id: u64,
     port_id: u64,
     incoming: bool,
-    http_connections: &[(String, String)],
+    http: &HttpPanelState,
     p: &ThemePalette,
 ) -> HubChange {
     let mut change = HubChange::quiet();
     apply_form_spacing(ui);
+    let http_connections = http.connection_choices();
     ui.label(
         egui::RichText::new("HTTP CLIENT")
             .font(font_ui(10.5))
@@ -4243,7 +4255,7 @@ fn edit_http_port_binds(
         .width((ui.available_width()).min(240.0).max(120.0))
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut next, String::new(), "(none)");
-            for (id, label) in http_connections {
+            for (id, label) in &http_connections {
                 ui.selectable_value(&mut next, id.clone(), format!("{label} ({id})"));
             }
         });
@@ -4260,6 +4272,7 @@ fn edit_http_port_binds(
                 .color(p.muted),
         );
         ui.add_space(space::AFTER_HEADING);
+        let mut do_fetch = false;
         {
             let port = port_field(model, hub_id, port_id);
             let mut method = port.http_method.clone();
@@ -4300,6 +4313,47 @@ fn edit_http_port_binds(
                     change.dirty = true;
                 }
             });
+            ui.add_space(space::AFTER_FIELD);
+            if text_button(ui, "Fetch preview", false, p).clicked() {
+                do_fetch = true;
+            }
+            ui.label(
+                egui::RichText::new("Fetches client Base URL + Path into the sample below.")
+                    .font(font_ui(11.0))
+                    .color(p.muted),
+            );
+        }
+        if do_fetch {
+            let conn = port_field(model, hub_id, port_id).http_connection.clone();
+            let method = port_field(model, hub_id, port_id).http_method.clone();
+            let path = port_field(model, hub_id, port_id).http_url_path.clone();
+            let result = match http.client_by_id(&conn) {
+                Some(client) => http_panel::fetch_preview(client, &method, &path),
+                None => Err("Pick an HTTP client first.".into()),
+            };
+            let port = port_field(model, hub_id, port_id);
+            match result {
+                Ok(body) => {
+                    port.draft_http_sample = body;
+                    port.draft_http_fetch_status = "Preview loaded — click a path to bind.".into();
+                }
+                Err(err) => {
+                    port.draft_http_fetch_status = err;
+                }
+            }
+        }
+        {
+            let status = port_field(model, hub_id, port_id)
+                .draft_http_fetch_status
+                .clone();
+            if !status.is_empty() {
+                let color = if status.starts_with("Preview") {
+                    p.muted
+                } else {
+                    p.warn
+                };
+                ui.label(egui::RichText::new(status).font(font_ui(11.0)).color(color));
+            }
         }
 
         ui.add_space(space::SECTION - 2.0);
@@ -4314,7 +4368,7 @@ fn edit_http_port_binds(
             let port = port_field(model, hub_id, port_id);
             if port.http_inputs.is_empty() {
                 ui.label(
-                    egui::RichText::new("No binds yet — pick a path from the sample below.")
+                    egui::RichText::new("No binds yet — Fetch preview, then click a path.")
                         .font(font_ui(11.0))
                         .color(p.muted),
                 );
@@ -4355,8 +4409,8 @@ fn edit_http_port_binds(
             ui.add(
                 egui::TextEdit::multiline(&mut port.draft_http_sample)
                     .desired_width(ui.available_width().max(120.0))
-                    .desired_rows(5)
-                    .hint_text("{\"tank\":{\"level\":12.5}}")
+                    .desired_rows(8)
+                    .hint_text("Fetch preview, or paste JSON here — not a path like data.amount")
                     .margin(egui::Margin::symmetric(6.0, 4.0)),
             );
         }
@@ -4365,9 +4419,21 @@ fn edit_http_port_binds(
             Ok(v) => http_panel::json_leaf_paths(&v),
             Err(_) => Vec::new(),
         };
-        if !sample.trim().is_empty() && paths.is_empty() {
+        if sample.trim().is_empty() {
             ui.label(
-                egui::RichText::new("Invalid JSON or no leaf fields.")
+                egui::RichText::new("Empty — use Fetch preview (or paste a JSON body).")
+                    .font(font_ui(11.0))
+                    .color(p.muted),
+            );
+        } else if paths.is_empty() {
+            let tip = if !sample.trim_start().starts_with('{') && !sample.trim_start().starts_with('[')
+            {
+                "That looks like a JSON path, not a body. Put paths in Manual path / click a leaf after Fetch."
+            } else {
+                "Invalid JSON or no leaf fields."
+            };
+            ui.label(
+                egui::RichText::new(tip)
                     .font(font_ui(11.0))
                     .color(p.warn),
             );
