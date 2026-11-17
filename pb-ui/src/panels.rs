@@ -67,8 +67,10 @@ pub fn paint(
             crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, http, streams, las, snmp, host, engine)
         }
         DockPane::Mqtt => {
-            mqtt_panel::paint(ui, host, p, engine, mqtt, hubs);
-            crate::hubs::HubChange::quiet()
+            let dirty = mqtt_panel::paint(ui, host, p, engine, mqtt, hubs);
+            let mut change = crate::hubs::HubChange::quiet();
+            change.dirty = dirty;
+            change
         }
         DockPane::OpcUa => {
             opcua_panel::paint(ui, host, p, engine, opcua, hubs);
