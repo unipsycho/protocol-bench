@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::dock::DockPane;
-use crate::hubs::{HubModel, HubProto, MqttInputBind, MqttOutputBind};
+use crate::hubs::{HubModel, HubProto, HttpInputBind, MqttInputBind, MqttOutputBind};
 use crate::point_rows;
 use crate::layout::LayoutNode;
 use crate::mqtt_panel::{
@@ -1050,9 +1050,10 @@ pub fn import_bindings_to_store(
 
 /// Promote Hub Input (and aggregator) binds into the point bus.
 ///
-/// New Input binds leave `point` empty — this allocates `mqtt_N` / `opc_N` and
-/// writes the id back onto the bind. Existing short ids are re-bound to their
-/// wire address so `project.points` and the live store stay aligned after IPC.
+/// New Input binds leave `point` empty — this allocates `mqtt_N` / `opc_N` /
+/// `http_N` and writes the id back onto the bind. Existing short ids are
+/// re-bound to their wire address so `project.points` and the live store stay
+/// aligned after IPC.
 /// Returns true when any hub bind field changed (caller should dirty-save).
 pub fn materialize_hub_point_binds(hubs: &mut HubModel, store: &mut PointStore) -> bool {
     let mut dirty = false;
@@ -1092,6 +1093,27 @@ pub fn materialize_hub_point_binds(hubs: &mut HubModel, store: &mut PointStore) 
                         if bind.point.trim().is_empty() {
                             // 3-char proto code (opcua is 5 — short ids are XXX_n).
                             let id = store.ensure_id("opc", &source);
+                            bind.point = id;
+                            dirty = true;
+                        } else {
+                            store.bind(bind.point.trim(), &source);
+                        }
+                    }
+                }
+                HubProto::Http => {
+                    let conn = port.http_connection.clone();
+                    for bind in &mut port.http_inputs {
+                        let json_path = bind.json_path.trim();
+                        if json_path.is_empty() {
+                            continue;
+                        }
+                        let source = point_rows::http_bind_source(
+                            &conn,
+                            bind.path.trim(),
+                            json_path,
+                        );
+                        if bind.point.trim().is_empty() {
+                            let id = store.ensure_id("http", &source);
                             bind.point = id;
                             dirty = true;
                         } else {
@@ -1161,6 +1183,42 @@ mod tests {
         assert!(store.get("mqtt_1").is_some());
         assert!(store.get("mqtt_9").is_some());
         // Second pass is idempotent (no further bind edits).
+        assert!(!materialize_hub_point_binds(&mut hubs, &mut store));
+    }
+
+    #[test]
+    fn materialize_http_binds_allocates_http_n() {
+        let mut hubs = HubModel::default();
+        hubs.add_hub();
+        let hub = hubs.hubs[0].id;
+        let src = hubs.hub(hub).unwrap().sources[0].id;
+        if let Some(port) = hubs
+            .hub_mut(hub)
+            .and_then(|h| h.sources.iter_mut().find(|p| p.id == src))
+        {
+            port.protocol = HubProto::Http;
+            port.http_connection = "Api".into();
+            port.http_inputs.push(HttpInputBind {
+                path: "/v1/tank".into(),
+                json_path: "data.amount".into(),
+                point: String::new(),
+            });
+        }
+        let mut store = PointStore::new();
+        assert!(materialize_hub_point_binds(&mut hubs, &mut store));
+        let port = hubs
+            .hub(hub)
+            .unwrap()
+            .sources
+            .iter()
+            .find(|p| p.id == src)
+            .unwrap();
+        assert_eq!(port.http_inputs[0].point, "http_1");
+        assert_eq!(
+            store.source_for_id("http_1"),
+            Some("http/Api/v1/tank::data.amount")
+        );
+        assert!(store.get("http_1").is_some());
         assert!(!materialize_hub_point_binds(&mut hubs, &mut store));
     }
 

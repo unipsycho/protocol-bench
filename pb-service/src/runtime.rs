@@ -226,6 +226,27 @@ fn materialize_hub_binds_json(value: &serde_json::Value, store: &mut PointStore)
                         }
                     }
                 }
+                let http_conn = port
+                    .get("http_connection")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(binds) = port.get("http_inputs").and_then(|v| v.as_array()) {
+                    for bind in binds {
+                        let json_path =
+                            bind.get("json_path").and_then(|v| v.as_str()).unwrap_or("");
+                        if json_path.is_empty() {
+                            continue;
+                        }
+                        let url_path = bind.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        let source = http_bind_source(http_conn, url_path, json_path);
+                        let point = bind.get("point").and_then(|v| v.as_str()).unwrap_or("");
+                        if point.is_empty() {
+                            let _ = store.ensure_id("http", &source);
+                        } else {
+                            store.bind(point, &source);
+                        }
+                    }
+                }
             }
         }
         if let Some(aggs) = hub.get("aggregators").and_then(|v| v.as_array()) {
@@ -249,6 +270,28 @@ fn mqtt_bind_source(conn: &str, topic: &str, path: &str) -> String {
         base
     } else {
         format!("{base}::{path}")
+    }
+}
+
+fn http_bind_source(conn: &str, url_path: &str, json_path: &str) -> String {
+    let conn = conn.trim();
+    let url_path = url_path.trim().trim_start_matches('/');
+    let json_path = json_path.trim();
+    let base = if conn.is_empty() {
+        if url_path.is_empty() {
+            "http".to_string()
+        } else {
+            format!("http/{url_path}")
+        }
+    } else if url_path.is_empty() {
+        format!("http/{conn}")
+    } else {
+        format!("http/{conn}/{url_path}")
+    };
+    if json_path.is_empty() {
+        base
+    } else {
+        format!("{base}::{json_path}")
     }
 }
 
