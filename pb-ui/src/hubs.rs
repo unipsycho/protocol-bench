@@ -18,6 +18,7 @@ use crate::mqtt_panel::MqttPanelState;
 use crate::opcua_browse::{self, BrowseAction, BrowseMode};
 use crate::opcua_panel::OpcUaPanelState;
 use crate::point_rows;
+use crate::streams_panel::StreamsPanelState;
 use crate::theme::{
     after_field, apply_form_spacing, blend_scope, divider_bar, font_semi, font_ui, mix, space, tint,
     ThemePalette, SEP,
@@ -87,7 +88,7 @@ impl HubProto {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Streams => "Streams",
+            Self::Streams => "Streams / TCP",
             Self::Modbus => "Modbus",
             Self::Mqtt => "MQTT",
             Self::OpcUa => "OPC UA",
@@ -144,6 +145,25 @@ pub struct MqttInputBind {
     /// Persisted only for legacy migrated binds that already have an id.
     #[serde(default)]
     pub point: String,
+}
+
+/// Input node: field from a framed Streams text line → host point (`stream_N`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StreamInputBind {
+    /// Field index (0-based) or capture group name for regex.
+    #[serde(default)]
+    pub field: String,
+    /// Empty on new binds — host assigns `stream_N`.
+    #[serde(default)]
+    pub point: String,
+}
+
+/// Output node: host point → field slot / template on a Streams endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StreamOutputBind {
+    pub point: String,
+    #[serde(default)]
+    pub field: String,
 }
 
 /// Output node: host point → publish topic on a shared MQTT connection.
@@ -252,6 +272,37 @@ pub struct HubPort {
     /// Output binds (point → JSON field).
     #[serde(default)]
     pub http_outputs: Vec<HttpOutputBind>,
+    /// Streams / TCP endpoint id from the Streams panel.
+    #[serde(default)]
+    pub stream_endpoint: String,
+    /// `transparent` | `delimited`.
+    #[serde(default = "default_stream_frame")]
+    pub stream_frame: String,
+    /// `lf` | `crlf` | `cr` | `custom` | `idle` | `eol_idle`.
+    #[serde(default = "default_stream_eol")]
+    pub stream_eol: String,
+    #[serde(default)]
+    pub stream_eol_custom: String,
+    /// Idle gap (ms) when time-delimiting frames.
+    #[serde(default = "default_stream_idle")]
+    pub stream_idle_ms: f32,
+    /// `whole_line` | `csv` | `tsv` | `whitespace` | `fixed` | `regex`.
+    #[serde(default = "default_stream_parser")]
+    pub stream_parser: String,
+    /// Comma-separated column widths for fixed parser.
+    #[serde(default)]
+    pub stream_fixed_widths: String,
+    #[serde(default)]
+    pub stream_regex: String,
+    /// `none` | `receive` | `iso8601` | `epoch_ms` | `custom`.
+    #[serde(default = "default_stream_ts")]
+    pub stream_timestamp: String,
+    #[serde(default)]
+    pub stream_timestamp_custom: String,
+    #[serde(default)]
+    pub stream_inputs: Vec<StreamInputBind>,
+    #[serde(default)]
+    pub stream_outputs: Vec<StreamOutputBind>,
     /// Ephemeral inspector drafts — not persisted.
     #[serde(skip)]
     pub draft_mqtt_topic: String,
@@ -276,6 +327,14 @@ pub struct HubPort {
     pub draft_http_out_point: String,
     #[serde(skip)]
     pub draft_http_out_json_path: String,
+    #[serde(skip)]
+    pub draft_stream_sample: String,
+    #[serde(skip)]
+    pub draft_stream_field: String,
+    #[serde(skip)]
+    pub draft_stream_out_point: String,
+    #[serde(skip)]
+    pub draft_stream_out_field: String,
 }
 
 fn default_http_method() -> String {
@@ -285,6 +344,12 @@ fn default_http_method() -> String {
 fn default_http_interval() -> f32 {
     5.0
 }
+
+fn default_stream_frame() -> String { "delimited".into() }
+fn default_stream_eol() -> String { "lf".into() }
+fn default_stream_idle() -> f32 { 50.0 }
+fn default_stream_parser() -> String { "whole_line".into() }
+fn default_stream_ts() -> String { "receive".into() }
 
 impl HubPort {
     pub fn new(id: u64, protocol: HubProto, label: impl Into<String>) -> Self {
@@ -304,6 +369,18 @@ impl HubPort {
             http_interval_secs: default_http_interval(),
             http_inputs: Vec::new(),
             http_outputs: Vec::new(),
+            stream_endpoint: String::new(),
+            stream_frame: default_stream_frame(),
+            stream_eol: default_stream_eol(),
+            stream_eol_custom: String::new(),
+            stream_idle_ms: default_stream_idle(),
+            stream_parser: default_stream_parser(),
+            stream_fixed_widths: String::new(),
+            stream_regex: String::new(),
+            stream_timestamp: default_stream_ts(),
+            stream_timestamp_custom: String::new(),
+            stream_inputs: Vec::new(),
+            stream_outputs: Vec::new(),
             draft_mqtt_topic: String::new(),
             draft_mqtt_path: String::new(),
             draft_mqtt_out_point: String::new(),
@@ -314,6 +391,10 @@ impl HubPort {
             draft_http_json_path: String::new(),
             draft_http_out_point: String::new(),
             draft_http_out_json_path: String::new(),
+            draft_stream_sample: String::new(),
+            draft_stream_field: String::new(),
+            draft_stream_out_point: String::new(),
+            draft_stream_out_field: String::new(),
         }
     }
 }
@@ -1937,10 +2018,12 @@ pub fn paint(
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     http: &HttpPanelState,
+    streams: &StreamsPanelState,
     host: &HostSnapshot,
     engine: &crate::engine_api::EngineHandle,
 ) -> HubChange {
     let http_connections = http.connection_choices();
+    let stream_connections = streams.connection_choices();
     let mut change = HubChange::quiet();
     // Keep Output auto-binds aligned with inbound feed wires (PB-63).
     if model.sync_output_feed_binds(&host.points) {
@@ -2000,6 +2083,7 @@ pub fn paint(
                 p,
                 mqtt_connections,
                 &http_connections,
+                &stream_connections,
                 mqtt,
                 opcua,
                 host,
@@ -2018,6 +2102,7 @@ pub fn paint(
             p,
             mqtt_connections,
             &http_connections,
+            &stream_connections,
             mqtt,
             opcua,
             host,
@@ -3601,6 +3686,7 @@ fn inspector(
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
     http_connections: &[(String, String)],
+    stream_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
@@ -3635,6 +3721,7 @@ fn inspector(
                 p,
                 mqtt_connections,
                 http_connections,
+                stream_connections,
                 mqtt,
                 opcua,
                 host,
@@ -3650,6 +3737,7 @@ fn edit_selected(
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
     http_connections: &[(String, String)],
+    stream_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
@@ -3694,6 +3782,7 @@ fn edit_selected(
             p,
             mqtt_connections,
             http_connections,
+            stream_connections,
             mqtt,
             opcua,
             host,
@@ -3821,6 +3910,7 @@ fn edit_port(
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
     http_connections: &[(String, String)],
+    stream_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
@@ -3939,6 +4029,18 @@ fn edit_port(
             port_id,
             incoming,
             http_connections,
+            p,
+        ));
+    }
+    if proto == HubProto::Streams {
+        ui.add_space(space::SECTION - 2.0);
+        change = change.join(edit_streams_port_binds(
+            ui,
+            model,
+            hub_id,
+            port_id,
+            incoming,
+            stream_connections,
             p,
         ));
     }
@@ -4423,6 +4525,458 @@ fn edit_http_port_binds(
         }
     }
     change
+}
+
+fn edit_streams_port_binds(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    hub_id: u64,
+    port_id: u64,
+    incoming: bool,
+    stream_connections: &[(String, String)],
+    p: &ThemePalette,
+) -> HubChange {
+    let mut change = HubChange::quiet();
+    apply_form_spacing(ui);
+    ui.label(
+        egui::RichText::new("STREAMS / TCP ENDPOINT")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(space::AFTER_HEADING);
+    let current = port_field(model, hub_id, port_id).stream_endpoint.clone();
+    let current_label = stream_connections
+        .iter()
+        .find(|(id, _)| id == &current)
+        .map(|(_, label)| label.as_str())
+        .unwrap_or(if current.is_empty() {
+            "(pick endpoint)"
+        } else {
+            current.as_str()
+        });
+    let mut next = current.clone();
+    egui::ComboBox::from_id_salt(("pb_hub_stream_ep", port_id))
+        .selected_text(current_label)
+        .width((ui.available_width()).min(280.0).max(140.0))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut next, String::new(), "(none)");
+            for (id, label) in stream_connections {
+                ui.selectable_value(&mut next, id.clone(), label);
+            }
+        });
+    if next != current {
+        port_field(model, hub_id, port_id).stream_endpoint = next;
+        change.dirty = true;
+    }
+
+    ui.add_space(space::AFTER_FIELD);
+    ui.label(
+        egui::RichText::new("FRAMING")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(space::AFTER_HEADING);
+    {
+        let port = port_field(model, hub_id, port_id);
+        change.dirty |= combo_owned(
+            ui,
+            "Mode",
+            &mut port.stream_frame,
+            &[("delimited", "Delimited"), ("transparent", "Transparent")],
+            ("pb_stream_frame", port_id),
+            p,
+        );
+        if port.stream_frame != "transparent" {
+            change.dirty |= combo_owned(
+                ui,
+                "EOL",
+                &mut port.stream_eol,
+                &[
+                    ("lf", "LF (\\n)"),
+                    ("crlf", "CRLF"),
+                    ("cr", "CR"),
+                    ("custom", "Custom"),
+                    ("idle", "Idle time only"),
+                    ("eol_idle", "EOL or idle"),
+                ],
+                ("pb_stream_eol", port_id),
+                p,
+            );
+            if port.stream_eol == "custom" {
+                inspect_field(ui, "Custom EOL", &mut port.stream_eol_custom, p);
+            }
+            if matches!(port.stream_eol.as_str(), "idle" | "eol_idle")
+                || port.stream_frame == "delimited"
+            {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = space::ITEM_X;
+                    ui.label(
+                        egui::RichText::new("Idle (ms)")
+                            .font(font_ui(12.0))
+                            .color(p.muted),
+                    );
+                    let mut idle = port.stream_idle_ms;
+                    if ui
+                        .add(egui::DragValue::new(&mut idle).speed(1.0).range(1.0..=10_000.0))
+                        .changed()
+                    {
+                        port.stream_idle_ms = idle;
+                        change.dirty = true;
+                    }
+                });
+            }
+        }
+    }
+
+    if incoming {
+        ui.add_space(space::SECTION - 2.0);
+        ui.label(
+            egui::RichText::new("SCAN → stream_N")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        {
+            let port = port_field(model, hub_id, port_id);
+            change.dirty |= combo_owned(
+                ui,
+                "Parser",
+                &mut port.stream_parser,
+                &[
+                    ("whole_line", "Whole line"),
+                    ("csv", "CSV"),
+                    ("tsv", "TSV (tab)"),
+                    ("whitespace", "Whitespace"),
+                    ("fixed", "Fixed width"),
+                    ("regex", "Regex"),
+                ],
+                ("pb_stream_parser", port_id),
+                p,
+            );
+            if port.stream_parser == "fixed" {
+                inspect_field(ui, "Widths", &mut port.stream_fixed_widths, p);
+                ui.label(
+                    egui::RichText::new("Comma-separated column widths, e.g. 8,12,6")
+                        .font(font_ui(11.0))
+                        .color(p.muted),
+                );
+            }
+            if port.stream_parser == "regex" {
+                inspect_field(ui, "Regex", &mut port.stream_regex, p);
+            }
+            change.dirty |= combo_owned(
+                ui,
+                "Timestamp",
+                &mut port.stream_timestamp,
+                &[
+                    ("none", "None"),
+                    ("receive", "Receive time"),
+                    ("iso8601", "ISO-8601 field"),
+                    ("epoch_ms", "Epoch ms field"),
+                    ("custom", "Custom format"),
+                ],
+                ("pb_stream_ts", port_id),
+                p,
+            );
+            if port.stream_timestamp == "custom" {
+                inspect_field(ui, "Format", &mut port.stream_timestamp_custom, p);
+            }
+        }
+
+        let mut remove = None;
+        {
+            let port = port_field(model, hub_id, port_id);
+            if port.stream_inputs.is_empty() {
+                ui.label(
+                    egui::RichText::new("No binds — add a field below (host assigns stream_N).")
+                        .font(font_ui(11.0))
+                        .color(p.muted),
+                );
+            } else {
+                for (i, bind) in port.stream_inputs.iter().enumerate() {
+                    let id = if bind.point.is_empty() {
+                        "stream_N".to_string()
+                    } else {
+                        bind.point.clone()
+                    };
+                    let field = if bind.field.is_empty() {
+                        "(whole)".to_string()
+                    } else {
+                        bind.field.clone()
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{id}  ·  field {field}"))
+                                .font(font_ui(12.0))
+                                .color(p.text),
+                        );
+                        if text_button(ui, "×", false, p).clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+            }
+        }
+        if let Some(i) = remove {
+            port_field(model, hub_id, port_id).stream_inputs.remove(i);
+            change.dirty = true;
+        }
+
+        ui.add_space(space::SECTION - 2.0);
+        ui.label(
+            egui::RichText::new("SAMPLE LINE — click a field index to bind")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        {
+            let port = port_field(model, hub_id, port_id);
+            ui.add(
+                egui::TextEdit::multiline(&mut port.draft_stream_sample)
+                    .desired_width(ui.available_width().max(120.0))
+                    .desired_rows(3)
+                    .hint_text("12.5,OK,2024-01-01T00:00:00Z")
+                    .margin(egui::Margin::symmetric(6.0, 4.0)),
+            );
+        }
+        let sample = port_field(model, hub_id, port_id).draft_stream_sample.clone();
+        let parser = port_field(model, hub_id, port_id).stream_parser.clone();
+        let widths = port_field(model, hub_id, port_id).stream_fixed_widths.clone();
+        let regex = port_field(model, hub_id, port_id).stream_regex.clone();
+        let fields = sample_fields(&sample, &parser, &widths, &regex);
+        let mut add_field: Option<String> = None;
+        for (i, val) in fields.iter().enumerate() {
+            let key = i.to_string();
+            let label = format!("[{i}] {val}");
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new(label).font(font_ui(12.0)).color(p.text))
+                        .fill(p.control)
+                        .stroke(Stroke::new(1.0, p.line)),
+                )
+                .clicked()
+            {
+                add_field = Some(key);
+            }
+        }
+        if let Some(field) = add_field {
+            let port = port_field(model, hub_id, port_id);
+            if !port.stream_inputs.iter().any(|b| b.field == field) {
+                port.stream_inputs.push(StreamInputBind {
+                    field,
+                    point: String::new(),
+                });
+                change.dirty = true;
+            }
+        }
+
+        ui.add_space(space::AFTER_FIELD);
+        let mut add_manual = false;
+        {
+            let port = port_field(model, hub_id, port_id);
+            inspect_field(ui, "Field #", &mut port.draft_stream_field, p);
+            if text_button(ui, "Add bind", false, p).clicked() {
+                add_manual = true;
+            }
+        }
+        if add_manual {
+            let port = port_field(model, hub_id, port_id);
+            let field = port.draft_stream_field.trim().to_string();
+            if !field.is_empty() && !port.stream_inputs.iter().any(|b| b.field == field) {
+                port.stream_inputs.push(StreamInputBind {
+                    field,
+                    point: String::new(),
+                });
+                port.draft_stream_field.clear();
+                change.dirty = true;
+            } else if field.is_empty()
+                && parser == "whole_line"
+                && !port.stream_inputs.iter().any(|b| b.field.is_empty())
+            {
+                port.stream_inputs.push(StreamInputBind {
+                    field: String::new(),
+                    point: String::new(),
+                });
+                change.dirty = true;
+            }
+        }
+    } else {
+        // Output
+        ui.add_space(space::SECTION - 2.0);
+        ui.label(
+            egui::RichText::new("EMIT — points → text fields")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        {
+            let port = port_field(model, hub_id, port_id);
+            change.dirty |= combo_owned(
+                ui,
+                "Layout",
+                &mut port.stream_parser,
+                &[
+                    ("whole_line", "Whole line"),
+                    ("csv", "CSV"),
+                    ("tsv", "TSV"),
+                    ("whitespace", "Whitespace"),
+                    ("fixed", "Fixed width"),
+                ],
+                ("pb_stream_out_layout", port_id),
+                p,
+            );
+            change.dirty |= combo_owned(
+                ui,
+                "Trailer",
+                &mut port.stream_eol,
+                &[
+                    ("lf", "LF (\\n)"),
+                    ("crlf", "CRLF"),
+                    ("cr", "CR"),
+                    ("custom", "Custom"),
+                    ("none", "None"),
+                ],
+                ("pb_stream_out_eol", port_id),
+                p,
+            );
+            if port.stream_eol == "custom" {
+                inspect_field(ui, "Custom", &mut port.stream_eol_custom, p);
+            }
+        }
+
+        let mut remove = None;
+        {
+            let port = port_field(model, hub_id, port_id);
+            for (i, bind) in port.stream_outputs.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{}  →  field {}", bind.point, bind.field))
+                            .font(font_ui(12.0))
+                            .color(p.text),
+                    );
+                    if text_button(ui, "×", false, p).clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+        }
+        if let Some(i) = remove {
+            port_field(model, hub_id, port_id).stream_outputs.remove(i);
+            change.dirty = true;
+        }
+
+        let mut add_out = false;
+        {
+            let port = port_field(model, hub_id, port_id);
+            inspect_field(ui, "Point", &mut port.draft_stream_out_point, p);
+            inspect_field(ui, "Field #", &mut port.draft_stream_out_field, p);
+            if text_button(ui, "Add emit", false, p).clicked() {
+                add_out = true;
+            }
+        }
+        if add_out {
+            let port = port_field(model, hub_id, port_id);
+            let point = port.draft_stream_out_point.trim().to_string();
+            let field = port.draft_stream_out_field.trim().to_string();
+            if !point.is_empty() {
+                port.stream_outputs.push(StreamOutputBind { point, field });
+                port.draft_stream_out_point.clear();
+                port.draft_stream_out_field.clear();
+                change.dirty = true;
+            }
+        }
+        ui.add_space(space::AFTER_FIELD);
+        ui.label(
+            egui::RichText::new("TCP listeners broadcast each emit to all connected peers.")
+                .font(font_ui(11.0))
+                .color(p.muted),
+        );
+    }
+    change
+}
+
+/// Split a sample line for clickable field picks (UI authoring only).
+fn sample_fields(sample: &str, parser: &str, widths: &str, regex: &str) -> Vec<String> {
+    let line = sample.lines().next().unwrap_or(sample).trim_end_matches('\r');
+    if line.is_empty() {
+        return Vec::new();
+    }
+    match parser {
+        "csv" => split_csv_like(line, ','),
+        "tsv" => split_csv_like(line, '\t'),
+        "whitespace" => line.split_whitespace().map(|s| s.to_string()).collect(),
+        "fixed" => {
+            let mut out = Vec::new();
+            let mut at = 0usize;
+            for part in widths.split(',') {
+                let Ok(w) = part.trim().parse::<usize>() else {
+                    continue;
+                };
+                if w == 0 || at >= line.len() {
+                    break;
+                }
+                let end = (at + w).min(line.len());
+                out.push(line[at..end].to_string());
+                at = end;
+            }
+            if out.is_empty() {
+                vec![line.to_string()]
+            } else {
+                out
+            }
+        }
+        "regex" => {
+            // UI preview: no regex crate — show whole line + note; binds still by group index.
+            if regex.trim().is_empty() {
+                vec![line.to_string()]
+            } else {
+                vec![line.to_string(), format!("(regex: {regex})")]
+            }
+        }
+        _ => vec![line.to_string()],
+    }
+}
+
+fn split_csv_like(line: &str, sep: char) -> Vec<String> {
+    line.split(sep).map(|s| s.trim().to_string()).collect()
+}
+
+fn combo_owned(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut String,
+    options: &[(&str, &str)],
+    id: (impl std::hash::Hash, u64),
+    p: &ThemePalette,
+) -> bool {
+    let mut changed = false;
+    let shown = options
+        .iter()
+        .find(|(k, _)| *k == value.as_str())
+        .map(|(_, l)| (*l).to_string())
+        .unwrap_or_else(|| value.clone());
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
+        ui.label(
+            egui::RichText::new(label)
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        let mut next = value.clone();
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(&shown)
+            .width(160.0)
+            .show_ui(ui, |ui| {
+                for (k, l) in options {
+                    ui.selectable_value(&mut next, (*k).to_string(), *l);
+                }
+            });
+        if next != *value {
+            *value = next;
+            changed = true;
+        }
+    });
+    changed
 }
 
 fn edit_mqtt_port_binds(

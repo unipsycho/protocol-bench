@@ -49,7 +49,7 @@ impl DockPane {
             Self::Calculations => "Calculations",
             Self::Mappings => "Mappings",
             Self::Traffic => "Traffic",
-            Self::Streams => "Streams",
+            Self::Streams => "Streams / TCP",
             Self::Modbus => "Modbus",
             Self::Mqtt => "MQTT",
             Self::OpcUa => "OPC UA",
