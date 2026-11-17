@@ -439,6 +439,29 @@ pub fn mqtt_bind_source(conn: &str, topic: &str, path: &str) -> String {
     }
 }
 
+/// HTTP wire address: `http/<conn>/<url_path>::<json_path>`.
+pub fn http_bind_source(conn: &str, url_path: &str, json_path: &str) -> String {
+    let conn = conn.trim();
+    let url_path = url_path.trim().trim_start_matches('/');
+    let json_path = json_path.trim();
+    let base = if conn.is_empty() {
+        if url_path.is_empty() {
+            "http".to_string()
+        } else {
+            format!("http/{url_path}")
+        }
+    } else if url_path.is_empty() {
+        format!("http/{conn}")
+    } else {
+        format!("http/{conn}/{url_path}")
+    };
+    if json_path.is_empty() {
+        base
+    } else {
+        format!("{base}::{json_path}")
+    }
+}
+
 /// Global Points panel rows: live bus + Hub Input bind / aggregator placeholders.
 ///
 /// Honest empty only when there are no host points and no Input/agg binds.
@@ -517,6 +540,37 @@ pub fn rows_for_points_panel(
                             bind_index: None,
                             topic: String::new(),
                             path: String::new(),
+                        });
+                    }
+                }
+                HubProto::Http => {
+                    let conn = port.http_connection.as_str();
+                    for bind in &port.http_inputs {
+                        let json_path = bind.json_path.trim();
+                        if json_path.is_empty() {
+                            continue;
+                        }
+                        let source =
+                            http_bind_source(conn, bind.path.trim(), json_path);
+                        let id = if bind.point.trim().is_empty() {
+                            "http_N".to_string()
+                        } else {
+                            bind.point.trim().to_string()
+                        };
+                        if seen.contains(&id) {
+                            continue;
+                        }
+                        seen.insert(id.clone());
+                        rows.push(PointsTableRow {
+                            id,
+                            source,
+                            value: "—".into(),
+                            quality: "uncertain".into(),
+                            updated: "—".into(),
+                            updated_ms: 0,
+                            bind_index: None,
+                            topic: String::new(),
+                            path: bind.json_path.clone(),
                         });
                     }
                 }
