@@ -1051,9 +1051,9 @@ pub fn import_bindings_to_store(
 /// Promote Hub Input (and aggregator) binds into the point bus.
 ///
 /// New Input binds leave `point` empty — this allocates `mqtt_N` / `opc_N` /
-/// `http_N` and writes the id back onto the bind. Existing short ids are
-/// re-bound to their wire address so `project.points` and the live store stay
-/// aligned after IPC.
+/// `http_N` / `stream_N` and writes the id back onto the bind. Existing short
+/// ids are re-bound to their wire address so `project.points` and the live
+/// store stay aligned after IPC.
 /// Returns true when any hub bind field changed (caller should dirty-save).
 pub fn materialize_hub_point_binds(hubs: &mut HubModel, store: &mut PointStore) -> bool {
     let mut dirty = false;
@@ -1114,6 +1114,20 @@ pub fn materialize_hub_point_binds(hubs: &mut HubModel, store: &mut PointStore) 
                         );
                         if bind.point.trim().is_empty() {
                             let id = store.ensure_id("http", &source);
+                            bind.point = id;
+                            dirty = true;
+                        } else {
+                            store.bind(bind.point.trim(), &source);
+                        }
+                    }
+                }
+                HubProto::Streams => {
+                    let endpoint = port.stream_endpoint.clone();
+                    for bind in &mut port.stream_inputs {
+                        let source =
+                            point_rows::stream_bind_source(&endpoint, bind.field.trim());
+                        if bind.point.trim().is_empty() {
+                            let id = store.ensure_id("stream", &source);
                             bind.point = id;
                             dirty = true;
                         } else {
