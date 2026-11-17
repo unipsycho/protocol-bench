@@ -565,6 +565,22 @@ pub fn stream_bind_source(endpoint: &str, field: &str) -> String {
     }
 }
 
+/// Wire address for a LAS Input curve bind (`las/<endpoint>::<curve>`).
+pub fn las_bind_source(endpoint: &str, curve: &str) -> String {
+    let endpoint = endpoint.trim();
+    let curve = curve.trim();
+    let base = if endpoint.is_empty() {
+        "las".to_string()
+    } else {
+        format!("las/{endpoint}")
+    };
+    if curve.is_empty() {
+        base
+    } else {
+        format!("{base}::{curve}")
+    }
+}
+
 /// Global Points panel rows: live bus + Hub Input bind / aggregator placeholders.
 ///
 /// Honest empty only when there are no host points and no Input/agg binds.
@@ -701,6 +717,36 @@ pub fn rows_for_points_panel(
                             bind_index: None,
                             topic: String::new(),
                             path: bind.field.clone(),
+                        });
+                    }
+                }
+                HubProto::Las => {
+                    let endpoint = port.las_endpoint.as_str();
+                    for bind in &port.las_inputs {
+                        let curve = bind.curve.trim();
+                        if curve.is_empty() {
+                            continue;
+                        }
+                        let source = las_bind_source(endpoint, curve);
+                        let id = if bind.point.trim().is_empty() {
+                            "las_N".to_string()
+                        } else {
+                            bind.point.trim().to_string()
+                        };
+                        if seen.contains(&id) {
+                            continue;
+                        }
+                        seen.insert(id.clone());
+                        rows.push(PointsTableRow {
+                            id,
+                            source,
+                            value: "—".into(),
+                            quality: "uncertain".into(),
+                            updated: "—".into(),
+                            updated_ms: 0,
+                            bind_index: None,
+                            topic: String::new(),
+                            path: bind.curve.clone(),
                         });
                     }
                 }
