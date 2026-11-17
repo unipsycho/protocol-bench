@@ -8,6 +8,21 @@ use pb_engine::PointSnapshot;
 use crate::hubs::{HubModel, HubProto};
 use crate::theme::{font_ui, tint, ThemePalette};
 
+/// Drag payload: Points bus → Streams emit map, or reorder within that map.
+#[derive(Clone, Debug)]
+pub enum PointEmitDrag {
+    /// Live / bound point id from the Points panel.
+    FromPoints(String),
+    /// Index into a Streams Output `stream_outputs` list (same-port reorder).
+    ReorderEmit(usize),
+}
+
+/// Skip placeholder template ids (`mqtt_N`, `stream_N`, …).
+pub fn is_draggable_point_id(id: &str) -> bool {
+    let id = id.trim();
+    !id.is_empty() && !id.ends_with("_N")
+}
+
 const ROW_H: f32 = 18.0;
 const GAP: f32 = 5.0;
 const DOT: f32 = 12.0;
@@ -173,6 +188,9 @@ pub struct PointsTableAction {
 }
 
 /// Sort + paint the shared Points table.
+///
+/// When `drag_from_bus` is true, each real point row is a drag source
+/// ([`PointEmitDrag::FromPoints`]) for Streams Output emit maps.
 pub fn paint_points_table(
     ui: &mut egui::Ui,
     rows: &mut [PointsTableRow],
@@ -180,6 +198,19 @@ pub fn paint_points_table(
     p: &ThemePalette,
     id_salt: impl Into<Id>,
     with_remove: bool,
+) -> PointsTableAction {
+    paint_points_table_ex(ui, rows, state, p, id_salt, with_remove, false)
+}
+
+/// Like [`paint_points_table`], with optional bus → emit drag handles.
+pub fn paint_points_table_ex(
+    ui: &mut egui::Ui,
+    rows: &mut [PointsTableRow],
+    state: &mut PointsTableState,
+    p: &ThemePalette,
+    id_salt: impl Into<Id>,
+    with_remove: bool,
+    drag_from_bus: bool,
 ) -> PointsTableAction {
     let id_salt = id_salt.into();
     sort_table_rows(rows, state);
@@ -202,7 +233,25 @@ pub fn paint_points_table(
 
     let mut out = PointsTableAction::default();
     for row in rows.iter() {
-        let action = paint_full_row(ui, cols, PointRowRef::from_table_row(row), p, row.bind_index);
+        let can_drag = drag_from_bus && is_draggable_point_id(&row.id);
+        let action = if can_drag {
+            let point_id = row.id.clone();
+            let drag_id = ui.id().with(("pb_pt_drag", point_id.as_str()));
+            let inner = ui.dnd_drag_source(
+                drag_id,
+                PointEmitDrag::FromPoints(point_id),
+                |ui| paint_full_row(ui, cols, PointRowRef::from_table_row(row), p, row.bind_index),
+            );
+            if !ui.ctx().is_being_dragged(drag_id) {
+                inner
+                    .response
+                    .on_hover_cursor(egui::CursorIcon::Grab)
+                    .on_hover_text("Drag onto a Streams Output emit list");
+            }
+            inner.inner
+        } else {
+            paint_full_row(ui, cols, PointRowRef::from_table_row(row), p, row.bind_index)
+        };
         if action.remove_clicked {
             out.remove = row.bind_index;
         } else if action.row_clicked {

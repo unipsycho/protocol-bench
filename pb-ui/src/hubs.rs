@@ -4,8 +4,8 @@
 //! the MQTT panel). Many Inputs may share one MQTT connection.
 
 use egui::{
-    pos2, vec2, Align2, Color32, CursorIcon, Id, Layout, Pos2, Rect, Rounding, ScrollArea, Sense,
-    Shape, Stroke, Ui, Vec2,
+    pos2, vec2, Align, Align2, Color32, CursorIcon, Id, Layout, Pos2, Rect, Rounding, ScrollArea,
+    Sense, Shape, Stroke, Ui, Vec2,
 };
 use serde::Deserialize;
 
@@ -4910,26 +4910,17 @@ fn edit_streams_port_binds(
             }
         }
 
-        let mut remove = None;
-        {
-            let port = port_field(model, hub_id, port_id);
-            for (i, bind) in port.stream_outputs.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{}  →  field {}", bind.point, bind.field))
-                            .font(font_ui(12.0))
-                            .color(p.text),
-                    );
-                    if text_button(ui, "×", false, p).clicked() {
-                        remove = Some(i);
-                    }
-                });
-            }
-        }
-        if let Some(i) = remove {
-            port_field(model, hub_id, port_id).stream_outputs.remove(i);
-            change.dirty = true;
-        }
+        ui.add_space(space::AFTER_FIELD);
+        ui.label(
+            egui::RichText::new(
+                "Drag points from the Points panel. Drag rows here to reorder.",
+            )
+            .font(font_ui(11.0))
+            .color(p.muted),
+        );
+        ui.add_space(4.0);
+
+        change.dirty |= paint_stream_emit_dnd(ui, model, hub_id, port_id, p);
 
         let mut add_out = false;
         {
@@ -4943,9 +4934,13 @@ fn edit_streams_port_binds(
         if add_out {
             let port = port_field(model, hub_id, port_id);
             let point = port.draft_stream_out_point.trim().to_string();
-            let field = port.draft_stream_out_field.trim().to_string();
+            let mut field = port.draft_stream_out_field.trim().to_string();
             if !point.is_empty() {
+                if field.is_empty() {
+                    field = port.stream_outputs.len().to_string();
+                }
                 port.stream_outputs.push(StreamOutputBind { point, field });
+                renumber_stream_emit_fields(&mut port.stream_outputs);
                 port.draft_stream_out_point.clear();
                 port.draft_stream_out_field.clear();
                 change.dirty = true;
@@ -4959,6 +4954,167 @@ fn edit_streams_port_binds(
         );
     }
     change
+}
+
+/// Keep field indices aligned with emit list order (CSV/TSV column map).
+fn renumber_stream_emit_fields(binds: &mut [StreamOutputBind]) {
+    for (i, bind) in binds.iter_mut().enumerate() {
+        bind.field = i.to_string();
+    }
+}
+
+/// Apply a Points-bus or reorder drop into `stream_outputs` at `insert_at`.
+fn apply_stream_emit_drop(
+    binds: &mut Vec<StreamOutputBind>,
+    payload: &crate::point_rows::PointEmitDrag,
+    insert_at: usize,
+) -> bool {
+    use crate::point_rows::PointEmitDrag;
+    let insert_at = insert_at.min(binds.len());
+    match payload {
+        PointEmitDrag::FromPoints(point) => {
+            let point = point.trim();
+            if point.is_empty() || !crate::point_rows::is_draggable_point_id(point) {
+                return false;
+            }
+            // Avoid duplicate emit of the same point id.
+            if binds.iter().any(|b| b.point == point) {
+                return false;
+            }
+            binds.insert(
+                insert_at,
+                StreamOutputBind {
+                    point: point.to_string(),
+                    field: insert_at.to_string(),
+                },
+            );
+            renumber_stream_emit_fields(binds);
+            true
+        }
+        PointEmitDrag::ReorderEmit(from) => {
+            let from = *from;
+            if from >= binds.len() || insert_at == from || insert_at == from + 1 {
+                return false;
+            }
+            let item = binds.remove(from);
+            let to = if insert_at > from {
+                insert_at - 1
+            } else {
+                insert_at
+            };
+            binds.insert(to.min(binds.len()), item);
+            renumber_stream_emit_fields(binds);
+            true
+        }
+    }
+}
+
+/// Drop zone + reorderable emit rows for Streams Output.
+fn paint_stream_emit_dnd(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    hub_id: u64,
+    port_id: u64,
+    p: &ThemePalette,
+) -> bool {
+    use crate::point_rows::PointEmitDrag;
+
+    let mut dirty = false;
+    let mut remove = None;
+    // Hover insert index while a compatible payload is over the list.
+    let mut hover_insert: Option<usize> = None;
+
+    let frame = egui::Frame::none()
+        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+        .rounding(Rounding::same(6.0))
+        .stroke(Stroke::new(1.0, p.line));
+
+    let (_zone, dropped) = ui.dnd_drop_zone::<PointEmitDrag, _>(frame, |ui| {
+        let n = port_field(model, hub_id, port_id).stream_outputs.len();
+        if n == 0 {
+            ui.label(
+                egui::RichText::new("Drop points here to build the emit map.")
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            );
+        }
+
+        for i in 0..=n {
+            // Gap drop target between / before / after rows.
+            let gap_h = if i < n { 4.0 } else { 10.0 };
+            let (gap_rect, gap_resp) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width().max(1.0), gap_h), Sense::hover());
+            let over_gap = gap_resp.contains_pointer()
+                && egui::DragAndDrop::has_payload_of_type::<PointEmitDrag>(ui.ctx());
+            if over_gap {
+                hover_insert = Some(i);
+                ui.painter().hline(
+                    gap_rect.x_range(),
+                    gap_rect.center().y,
+                    Stroke::new(2.0, p.accent),
+                );
+            }
+
+            if i == n {
+                break;
+            }
+
+            let bind = port_field(model, hub_id, port_id).stream_outputs[i].clone();
+            let drag_id = ui.id().with(("pb_stream_emit", port_id, i, bind.point.as_str()));
+            let row = ui.dnd_drag_source(drag_id, PointEmitDrag::ReorderEmit(i), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("⠿")
+                            .font(font_ui(13.0))
+                            .color(p.muted),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}  →  field {}",
+                            bind.point, bind.field
+                        ))
+                        .font(font_ui(12.0))
+                        .color(p.text),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if text_button(ui, "×", false, p).clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                });
+            });
+            let over_row = row.response.contains_pointer();
+            if !ui.ctx().is_being_dragged(drag_id) {
+                row.response
+                    .on_hover_cursor(egui::CursorIcon::Grab)
+                    .on_hover_text("Drag to reorder");
+            }
+            // Drop onto the row body → insert before this index.
+            if over_row && egui::DragAndDrop::has_payload_of_type::<PointEmitDrag>(ui.ctx()) {
+                hover_insert = Some(i);
+            }
+        }
+    });
+
+    if let Some(payload) = dropped {
+        let insert_at = hover_insert.unwrap_or_else(|| {
+            port_field(model, hub_id, port_id).stream_outputs.len()
+        });
+        let binds = &mut port_field(model, hub_id, port_id).stream_outputs;
+        if apply_stream_emit_drop(binds, payload.as_ref(), insert_at) {
+            dirty = true;
+        }
+    }
+
+    if let Some(i) = remove {
+        let binds = &mut port_field(model, hub_id, port_id).stream_outputs;
+        if i < binds.len() {
+            binds.remove(i);
+            renumber_stream_emit_fields(binds);
+            dirty = true;
+        }
+    }
+    dirty
 }
 
 /// Split a sample line for clickable field picks (UI authoring only).
@@ -6564,5 +6720,41 @@ mod tests {
             "live tip on body must not decide the latch"
         );
         assert!(wire_mode_at_press(true, true, rect, tip_after_drag)); // Alt still wires
+    }
+
+    #[test]
+    fn stream_emit_drop_adds_and_reorders() {
+        use crate::point_rows::PointEmitDrag;
+        let mut binds = Vec::new();
+        assert!(apply_stream_emit_drop(
+            &mut binds,
+            &PointEmitDrag::FromPoints("mqtt_1".into()),
+            0
+        ));
+        assert!(apply_stream_emit_drop(
+            &mut binds,
+            &PointEmitDrag::FromPoints("mqtt_2".into()),
+            1
+        ));
+        assert_eq!(binds.len(), 2);
+        assert_eq!(binds[0].point, "mqtt_1");
+        assert_eq!(binds[0].field, "0");
+        assert_eq!(binds[1].field, "1");
+        // Duplicate ignored.
+        assert!(!apply_stream_emit_drop(
+            &mut binds,
+            &PointEmitDrag::FromPoints("mqtt_1".into()),
+            0
+        ));
+        // Reorder last → front.
+        assert!(apply_stream_emit_drop(
+            &mut binds,
+            &PointEmitDrag::ReorderEmit(1),
+            0
+        ));
+        assert_eq!(binds[0].point, "mqtt_2");
+        assert_eq!(binds[0].field, "0");
+        assert_eq!(binds[1].point, "mqtt_1");
+        assert_eq!(binds[1].field, "1");
     }
 }
