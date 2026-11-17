@@ -1528,7 +1528,7 @@ mod tests {
         panel.embedded.name = "Plant hub".into();
         panel.embedded.enabled = true;
         panel.embedded.bind = "0.0.0.0".into();
-        panel.embedded.port = 1884;
+        panel.embedded.port = 1885;
         panel.embedded.anonymous = false;
         panel.embedded.username = "ops".into();
         panel.embedded.password = "secret".into();
@@ -1558,7 +1558,7 @@ mod tests {
         assert_eq!(back.mqtt.clients[0].host, "broker.local");
         assert_eq!(back.points[0].id, "mqtt_1");
         assert!(back.mqtt.embedded.enabled);
-        assert_eq!(back.mqtt.embedded.port, 1884);
+        assert_eq!(back.mqtt.embedded.port, 1885);
         assert_eq!(back.mqtt.embedded.name, "Plant hub");
         assert_eq!(back.mqtt.embedded.id, "hub");
         assert!(!back.mqtt.embedded.anonymous);
@@ -1600,7 +1600,7 @@ mod tests {
         let back: ProjectFile = serde_json::from_str(raw).unwrap();
         assert!(!back.mqtt.embedded.enabled);
         assert_eq!(back.mqtt.embedded.bind, "0.0.0.0");
-        assert_eq!(back.mqtt.embedded.port, 1883);
+        assert_eq!(back.mqtt.embedded.port, 1885);
         assert_eq!(back.mqtt.embedded.id, "hub");
         assert_eq!(back.mqtt.embedded.name, "Hub broker");
         assert!(back.mqtt.embedded.anonymous);

@@ -471,14 +471,36 @@ impl PackState {
             }
             return self.reconcile_clients(vec![legacy]);
         }
-        let clients: Vec<ClientConfig> = value
+        // Peel `role: "broker"` entries — they are not rumqttc clients. Auto-start
+        // when requested; never stop here (manual Start / broker_stop own that).
+        let raw_clients = value
             .get("clients")
+            .and_then(|v| v.as_array())
             .cloned()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|e| format!("configure clients: {e}"))?
             .unwrap_or_default();
-        self.reconcile_clients(clients)
+        let mut client_vals = Vec::new();
+        let mut broker: Option<Value> = None;
+        for c in raw_clients {
+            if c.get("role").and_then(|v| v.as_str()) == Some("broker") {
+                broker = Some(c);
+            } else {
+                client_vals.push(c);
+            }
+        }
+        let clients: Vec<ClientConfig> = serde_json::from_value(Value::Array(client_vals))
+            .map_err(|e| format!("configure clients: {e}"))?;
+        self.reconcile_clients(clients)?;
+        if let Some(b) = broker {
+            let auto = b
+                .get("auto_start")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if auto {
+                let start = broker_start_payload(&b);
+                self.start_embedded(&start)?;
+            }
+        }
+        Ok(())
     }
 
     fn reconcile_clients(&mut self, clients: Vec<ClientConfig>) -> Result<(), String> {
@@ -636,7 +658,6 @@ impl PackState {
     }
 
     fn start_embedded(&mut self, value: &Value) -> Result<(), String> {
-        self.stop_embedded();
         let bind = value
             .get("bind")
             .and_then(|v| v.as_str())
@@ -644,7 +665,22 @@ impl PackState {
         let port = value
             .get("port")
             .and_then(|v| v.as_u64())
-            .unwrap_or(1883) as u16;
+            .unwrap_or(1885) as u16;
+        // Already listening on this address — keep the accept loop.
+        if let Some(broker) = self.embedded.as_ref() {
+            let want: std::net::SocketAddr = format!("{bind}:{port}")
+                .parse()
+                .unwrap_or_else(|_| broker.listen_addr());
+            if broker.listen_addr() == want
+                || (bind == "0.0.0.0"
+                    && broker.listen_addr().port() == port
+                    && broker.listen_addr().ip().is_unspecified())
+            {
+                self.embedded_error.clear();
+                return Ok(());
+            }
+        }
+        self.stop_embedded();
         let users: Vec<(String, String)> = value
             .get("users")
             .and_then(|v| v.as_array())
@@ -691,7 +727,8 @@ impl PackState {
     }
 
     fn any_connected(&self) -> bool {
-        self.clients.values().any(|c| c.connected)
+        // Hub broker count as "up" so egress / status treat the pack as live.
+        self.embedded.is_some() || self.clients.values().any(|c| c.connected)
     }
 
     fn aggregate_state(&self) -> String {
@@ -724,36 +761,57 @@ impl PackState {
     }
 
     fn clients_snapshot_json(&self) -> String {
-        let rows: Vec<Value> = self
-            .clients
-            .values()
-            .map(|rt| {
-                // Cap snapshot traffic so host buffer growth stays bounded under `#`.
-                let traffic: Vec<Value> = rt
-                    .traffic
-                    .iter()
-                    .take(400)
-                    .map(|(topic, leaf)| {
-                        serde_json::json!({
-                            "topic": topic,
-                            "payload": truncate_preview(&leaf.payload, 96),
-                            "count": leaf.count,
-                        })
+        let mut rows: Vec<Value> = Vec::new();
+        if let Some(broker) = self.embedded.as_ref() {
+            rows.push(serde_json::json!({
+                "id": "hub",
+                "label": "Hub broker",
+                "role": "broker",
+                "state": "listening",
+                "connected": true,
+                "listen": broker.listen_addr().to_string(),
+                "last_error": "",
+                "topics": [],
+                "traffic": [],
+            }));
+        } else if !self.embedded_error.is_empty() {
+            rows.push(serde_json::json!({
+                "id": "hub",
+                "label": "Hub broker",
+                "role": "broker",
+                "state": "error",
+                "connected": false,
+                "last_error": self.embedded_error,
+                "topics": [],
+                "traffic": [],
+            }));
+        }
+        for rt in self.clients.values() {
+            // Cap snapshot traffic so host buffer growth stays bounded under `#`.
+            let traffic: Vec<Value> = rt
+                .traffic
+                .iter()
+                .take(400)
+                .map(|(topic, leaf)| {
+                    serde_json::json!({
+                        "topic": topic,
+                        "payload": truncate_preview(&leaf.payload, 96),
+                        "count": leaf.count,
                     })
-                    .collect();
-                serde_json::json!({
-                    "id": rt.config.id,
-                    "label": rt.config.label,
-                    "state": rt.state,
-                    "connected": rt.connected,
-                    "last_error": rt.last_error,
-                    "topics": rt.config.subscriptions,
-                    "host": rt.config.host,
-                    "port": rt.config.port,
-                    "traffic": traffic,
                 })
-            })
-            .collect();
+                .collect();
+            rows.push(serde_json::json!({
+                "id": rt.config.id,
+                "label": rt.config.label,
+                "state": rt.state,
+                "connected": rt.connected,
+                "last_error": rt.last_error,
+                "topics": rt.config.subscriptions,
+                "host": rt.config.host,
+                "port": rt.config.port,
+                "traffic": traffic,
+            }));
+        }
         serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
     }
 
@@ -797,6 +855,49 @@ fn normalize_transport(raw: &str) -> String {
         "wss" => "wss".into(),
         _ => "tcp".into(),
     }
+}
+
+/// Shape a `role: broker` project entry into `broker_start` fields.
+fn broker_start_payload(raw: &Value) -> Value {
+    let bind = raw
+        .get("bind")
+        .and_then(|v| v.as_str())
+        .or_else(|| raw.get("host").and_then(|v| v.as_str()))
+        .unwrap_or("0.0.0.0");
+    let port = raw
+        .get("port")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1885) as u16;
+    let anonymous = raw
+        .get("anonymous")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let users = if anonymous {
+        Value::Array(Vec::new())
+    } else if let Some(arr) = raw.get("users").cloned() {
+        arr
+    } else {
+        let username = raw
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let password = raw
+            .get("password")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if username.trim().is_empty() {
+            Value::Array(Vec::new())
+        } else {
+            serde_json::json!([{ "username": username, "password": password }])
+        }
+    };
+    serde_json::json!({
+        "bind": bind,
+        "port": port,
+        "users": users,
+    })
 }
 
 fn truncate_preview(value: &str, max: usize) -> String {
@@ -1153,6 +1254,26 @@ mod tests {
         let topics = v[0]["topics"].as_array().unwrap();
         assert!(topics.iter().any(|t| t == "pb/#"));
         assert!(topics.iter().any(|t| t == "sensor/+/temp"));
+    }
+
+    #[test]
+    fn configure_broker_role_auto_starts() {
+        let host = PbHostApi {
+            abi_version: PB_ABI_VERSION,
+            ctx: std::ptr::null_mut(),
+            upsert_point: None,
+            log_message: None,
+        };
+        let mut state = PackState::new(host);
+        let port = 1895u16;
+        let json = format!(
+            r#"{{"clients":[{{"id":"hub","role":"broker","auto_start":true,"anonymous":true,"bind":"127.0.0.1","port":{port}}}]}}"#
+        );
+        state.configure_json(&json).expect("configure");
+        assert!(state.embedded.is_some(), "hub broker should auto-start");
+        assert_eq!(state.aggregate_state(), "broker");
+        assert!(state.any_connected());
+        state.stop_embedded();
     }
 
     #[test]

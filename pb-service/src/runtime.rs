@@ -50,10 +50,16 @@ impl Runtime {
         );
         // Prefer detail_json flags when packs expose them.
         if let Some(slot) = host.slot(EngineId::Mqtt) {
-            if slot.detail_json.contains("\"role\":\"broker\"")
-                || slot.detail_json.contains("broker")
+            // Pack reports state "broker" while rumqttd is accepting; detail also
+            // carries a role=broker row when the hub listener is up (or last error).
+            if slot.state == "broker"
+                || slot.state.contains("listen")
+                || slot.detail_json.contains("\"role\":\"broker\"")
             {
-                st.mqtt_hub_running = slot.connected || slot.state.contains("listen");
+                st.mqtt_hub_running = slot.connected
+                    || slot.state == "broker"
+                    || slot.state.contains("listen")
+                    || slot.detail_json.contains("\"state\":\"listening\"");
             }
         }
         if let Some(slot) = host.slot(EngineId::OpcUa) {
@@ -373,6 +379,32 @@ fn build_mqtt_configure(
                 "auto_start".into(),
                 serde_json::json!(auto_run_hubs && enabled),
             );
+            // Pack start_embedded reads `users[]` — fold username/password when needed.
+            let anonymous = obj
+                .get("anonymous")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !obj.contains_key("users") {
+                if anonymous {
+                    obj.insert("users".into(), serde_json::json!([]));
+                } else if let Some(username) = obj.get("username").and_then(|v| v.as_str()) {
+                    if !username.trim().is_empty() {
+                        let password = obj
+                            .get("password")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        obj.insert(
+                            "users".into(),
+                            serde_json::json!([{
+                                "username": username,
+                                "password": password,
+                            }]),
+                        );
+                    } else {
+                        obj.insert("users".into(), serde_json::json!([]));
+                    }
+                }
+            }
             merge_hub_mqtt_binds(obj, hubs, emb_id);
         }
         clients.push(emb);

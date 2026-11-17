@@ -26,7 +26,8 @@ fn default_broker_bind() -> String {
 }
 
 fn default_broker_listen_port() -> u16 {
-    1883
+    // Avoid clashing with a system Mosquitto (often 1883/1884 on Omarchy/dev boxes).
+    1885
 }
 
 fn default_broker_id() -> String {
@@ -494,6 +495,7 @@ pub fn paint(
     hubs: &HubModel,
 ) {
     state.ensure_clients();
+    sync_broker_running_from_host(host, state);
     state.sync_trees_from_host(host);
     // Claim the full pane body with an explicit rect — nested horizontal rows
     // collapse available_height and clip the config editor.
@@ -903,7 +905,8 @@ fn edit_embedded_broker(
         ui.add_space(6.0);
     }
     let (start, stop) = {
-        let can_start = state.embedded.enabled && !state.broker_running;
+        // Start is always available when not running — it also turns Enabled on.
+        let can_start = !state.broker_running;
         let running = state.broker_running;
         let start_label = if running { "Running" } else { "Start broker" };
         ui.horizontal(|ui| {
@@ -924,6 +927,8 @@ fn edit_embedded_broker(
 }
 
 fn start_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState, hubs: &HubModel) {
+    // Start implies intent to run — keep Enabled in sync for auto-run / project save.
+    state.embedded.enabled = true;
     if !state.embedded.anonymous && state.embedded.username.trim().is_empty() {
         state.broker_status = "Username required when Anonymous login is off".into();
         return;
@@ -943,22 +948,26 @@ fn start_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState, hubs
     .to_string();
     engine.submit(EngineId::Mqtt, EngineCommand::Configure { json });
     let addr = format!("{}:{}", state.embedded.bind, state.embedded.port);
-    // Engine applies configure asynchronously; probe loopback after a short wait.
     let port = state.embedded.port;
-    let probe = std::thread::spawn(move || {
-        for _ in 0..20 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let sock = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            if std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(100))
-                .is_ok()
+    // Wait for the pack to own the listener — not merely "something" on the port
+    // (system Mosquitto on 1883 used to false-positive the TCP probe).
+    let mut ok = false;
+    let mut pack_err = String::new();
+    for _ in 0..25 {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let snap = engine.snapshot();
+        if let Some(slot) = snap.slot(EngineId::Mqtt) {
+            if !slot.last_error.is_empty() {
+                pack_err = slot.last_error.clone();
+            }
+            if slot.state == "broker"
+                || slot.detail_json.contains("\"state\":\"listening\"")
             {
-                return true;
+                ok = true;
+                break;
             }
         }
-        false
-    });
-    // Block briefly so the status line is honest before the next frame.
-    let ok = probe.join().unwrap_or(false);
+    }
     if ok {
         state.broker_running = true;
         state.broker_status = format!("Listening on {addr}");
@@ -966,7 +975,42 @@ fn start_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState, hubs
         apply_mqtt_session(engine, state, hubs);
     } else {
         state.broker_running = false;
-        state.broker_status = format!("Could not confirm listen on {addr}");
+        if pack_err.is_empty() {
+            // Hint when another process already owns the port (common: Mosquitto @ 1883).
+            let busy = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                std::time::Duration::from_millis(80),
+            )
+            .is_ok();
+            state.broker_status = if busy {
+                format!(
+                    "Could not start hub broker on {addr} — port is already in use \
+                     (e.g. system Mosquitto). Change Port or stop the other broker."
+                )
+            } else {
+                format!("Could not start hub broker on {addr}")
+            };
+        } else {
+            state.broker_status = pack_err;
+        }
+    }
+}
+
+/// Mirror pack hub-broker state into the panel so Stop/Start stay honest after reload.
+fn sync_broker_running_from_host(host: &HostSnapshot, state: &mut MqttPanelState) {
+    let Some(slot) = host.slot(EngineId::Mqtt) else {
+        return;
+    };
+    let running = slot.state == "broker"
+        || slot.detail_json.contains("\"state\":\"listening\"");
+    if running != state.broker_running {
+        state.broker_running = running;
+        if running && state.broker_status.is_empty() {
+            state.broker_status = format!(
+                "Listening on {}:{}",
+                state.embedded.bind, state.embedded.port
+            );
+        }
     }
 }
 
