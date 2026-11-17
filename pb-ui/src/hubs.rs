@@ -13,6 +13,7 @@ use pb_engine::{HostSnapshot, PointSnapshot};
 use std::collections::BTreeMap;
 
 use crate::dock::DockPane;
+use crate::http_panel::{self, HttpPanelState};
 use crate::mqtt_panel::MqttPanelState;
 use crate::opcua_browse::{self, BrowseAction, BrowseMode};
 use crate::opcua_panel::OpcUaPanelState;
@@ -67,15 +68,18 @@ pub enum HubProto {
     Mqtt,
     OpcUa,
     Files,
+    /// HTTP / REST — Input/Output only (not hub-capable).
+    Http,
 }
 
 impl HubProto {
-    pub const ALL: [HubProto; 5] = [
+    pub const ALL: [HubProto; 6] = [
         HubProto::Streams,
         HubProto::Modbus,
         HubProto::Mqtt,
         HubProto::OpcUa,
         HubProto::Files,
+        HubProto::Http,
     ];
 
     /// Protocols that can own a hub (server / broker role).
@@ -88,6 +92,7 @@ impl HubProto {
             Self::Mqtt => "MQTT",
             Self::OpcUa => "OPC UA",
             Self::Files => "Files",
+            Self::Http => "HTTP / REST",
         }
     }
 
@@ -98,6 +103,7 @@ impl HubProto {
             Self::Mqtt => DockPane::Mqtt,
             Self::OpcUa => DockPane::OpcUa,
             Self::Files => DockPane::Files,
+            Self::Http => DockPane::Http,
         }
     }
 
@@ -154,6 +160,29 @@ pub struct MqttOutputBind {
     pub auto: bool,
 }
 
+/// Input node: HTTP client poll + JSON path → host point (`http_N`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HttpInputBind {
+    /// Relative URL path (e.g. `/v1/tank`).
+    #[serde(default)]
+    pub path: String,
+    /// JSON field path within the response body.
+    #[serde(default)]
+    pub json_path: String,
+    /// Empty on new binds — host assigns `http_N`.
+    #[serde(default)]
+    pub point: String,
+}
+
+/// Output node: point → JSON field in HTTP request body.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HttpOutputBind {
+    pub point: String,
+    /// JSON field path in the request body.
+    #[serde(default)]
+    pub json_path: String,
+}
+
 /// Input node: OPC UA client + NodeId → host point (PB-81).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OpcUaInputBind {
@@ -205,6 +234,24 @@ pub struct HubPort {
     /// Input binds (sources with protocol OPC UA).
     #[serde(default)]
     pub opcua_inputs: Vec<OpcUaInputBind>,
+    /// HTTP client id from the HTTP / REST panel.
+    #[serde(default)]
+    pub http_connection: String,
+    /// Poll method for HTTP Input (GET / POST).
+    #[serde(default = "default_http_method")]
+    pub http_method: String,
+    /// Relative request path for HTTP Input poll or Output push.
+    #[serde(default)]
+    pub http_url_path: String,
+    /// Poll interval seconds (HTTP Input).
+    #[serde(default = "default_http_interval")]
+    pub http_interval_secs: f32,
+    /// Input binds (HTTP JSON paths).
+    #[serde(default)]
+    pub http_inputs: Vec<HttpInputBind>,
+    /// Output binds (point → JSON field).
+    #[serde(default)]
+    pub http_outputs: Vec<HttpOutputBind>,
     /// Ephemeral inspector drafts — not persisted.
     #[serde(skip)]
     pub draft_mqtt_topic: String,
@@ -220,6 +267,23 @@ pub struct HubPort {
     /// When set, Manual edits this existing bind index.
     #[serde(skip)]
     pub draft_edit_bind: Option<usize>,
+    /// Sample JSON for HTTP Input path picking.
+    #[serde(skip)]
+    pub draft_http_sample: String,
+    #[serde(skip)]
+    pub draft_http_json_path: String,
+    #[serde(skip)]
+    pub draft_http_out_point: String,
+    #[serde(skip)]
+    pub draft_http_out_json_path: String,
+}
+
+fn default_http_method() -> String {
+    "GET".into()
+}
+
+fn default_http_interval() -> f32 {
+    5.0
 }
 
 impl HubPort {
@@ -234,12 +298,22 @@ impl HubPort {
             mqtt_outputs: Vec::new(),
             opcua_connection: String::new(),
             opcua_inputs: Vec::new(),
+            http_connection: String::new(),
+            http_method: default_http_method(),
+            http_url_path: String::new(),
+            http_interval_secs: default_http_interval(),
+            http_inputs: Vec::new(),
+            http_outputs: Vec::new(),
             draft_mqtt_topic: String::new(),
             draft_mqtt_path: String::new(),
             draft_mqtt_out_point: String::new(),
             draft_mqtt_out_topic: String::new(),
             draft_input_manual: false,
             draft_edit_bind: None,
+            draft_http_sample: String::new(),
+            draft_http_json_path: String::new(),
+            draft_http_out_point: String::new(),
+            draft_http_out_json_path: String::new(),
         }
     }
 }
@@ -1862,9 +1936,11 @@ pub fn paint(
     mqtt_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
+    http: &HttpPanelState,
     host: &HostSnapshot,
     engine: &crate::engine_api::EngineHandle,
 ) -> HubChange {
+    let http_connections = http.connection_choices();
     let mut change = HubChange::quiet();
     // Keep Output auto-binds aligned with inbound feed wires (PB-63).
     if model.sync_output_feed_binds(&host.points) {
@@ -1923,6 +1999,7 @@ pub fn paint(
                 height,
                 p,
                 mqtt_connections,
+                &http_connections,
                 mqtt,
                 opcua,
                 host,
@@ -1940,6 +2017,7 @@ pub fn paint(
             ui.available_height().max(120.0),
             p,
             mqtt_connections,
+            &http_connections,
             mqtt,
             opcua,
             host,
@@ -3522,6 +3600,7 @@ fn inspector(
     height: f32,
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
+    http_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
@@ -3555,6 +3634,7 @@ fn inspector(
                 model,
                 p,
                 mqtt_connections,
+                http_connections,
                 mqtt,
                 opcua,
                 host,
@@ -3569,6 +3649,7 @@ fn edit_selected(
     model: &mut HubModel,
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
+    http_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
@@ -3607,7 +3688,17 @@ fn edit_selected(
         {
             return edit_step(ui, model, p, host, engine);
         }
-        return edit_port(ui, model, p, mqtt_connections, mqtt, opcua, host, engine);
+        return edit_port(
+            ui,
+            model,
+            p,
+            mqtt_connections,
+            http_connections,
+            mqtt,
+            opcua,
+            host,
+            engine,
+        );
     }
     edit_hub(ui, model, p)
 }
@@ -3729,6 +3820,7 @@ fn edit_port(
     model: &mut HubModel,
     p: &ThemePalette,
     mqtt_connections: &[(String, String)],
+    http_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
@@ -3836,6 +3928,18 @@ fn edit_port(
         ui.add_space(space::SECTION - 2.0);
         change = change.join(edit_opcua_input_binds(
             ui, model, hub_id, port_id, opcua, engine, p,
+        ));
+    }
+    if proto == HubProto::Http {
+        ui.add_space(space::SECTION - 2.0);
+        change = change.join(edit_http_port_binds(
+            ui,
+            model,
+            hub_id,
+            port_id,
+            incoming,
+            http_connections,
+            p,
         ));
     }
     // MQTT Input: no Hub details / Remove — delete via diagram select/Delete or right-click.
@@ -4001,6 +4105,323 @@ fn edit_opcua_input_binds(
         .font(font_ui(11.0))
         .color(p.muted),
     );
+    change
+}
+
+fn edit_http_port_binds(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    hub_id: u64,
+    port_id: u64,
+    incoming: bool,
+    http_connections: &[(String, String)],
+    p: &ThemePalette,
+) -> HubChange {
+    let mut change = HubChange::quiet();
+    apply_form_spacing(ui);
+    ui.label(
+        egui::RichText::new("HTTP CLIENT")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(space::AFTER_HEADING);
+    let current = port_field(model, hub_id, port_id).http_connection.clone();
+    let current_label = http_connections
+        .iter()
+        .find(|(id, _)| id == &current)
+        .map(|(_, label)| label.as_str())
+        .unwrap_or(if current.is_empty() {
+            "(pick client)"
+        } else {
+            current.as_str()
+        });
+    let mut next = current.clone();
+    egui::ComboBox::from_id_salt(("pb_hub_http_conn", port_id))
+        .selected_text(current_label)
+        .width((ui.available_width()).min(240.0).max(120.0))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut next, String::new(), "(none)");
+            for (id, label) in http_connections {
+                ui.selectable_value(&mut next, id.clone(), format!("{label} ({id})"));
+            }
+        });
+    if next != current {
+        port_field(model, hub_id, port_id).http_connection = next;
+        change.dirty = true;
+    }
+
+    if incoming {
+        ui.add_space(space::AFTER_FIELD);
+        ui.label(
+            egui::RichText::new("POLL")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        {
+            let port = port_field(model, hub_id, port_id);
+            let mut method = port.http_method.clone();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::ITEM_X;
+                ui.label(
+                    egui::RichText::new("Method")
+                        .font(font_ui(12.0))
+                        .color(p.muted),
+                );
+                egui::ComboBox::from_id_salt(("pb_http_method", port_id))
+                    .selected_text(&method)
+                    .width(80.0)
+                    .show_ui(ui, |ui| {
+                        for m in ["GET", "POST"] {
+                            ui.selectable_value(&mut method, m.to_string(), m);
+                        }
+                    });
+            });
+            if method != port.http_method {
+                port.http_method = method;
+                change.dirty = true;
+            }
+            inspect_field(ui, "Path", &mut port.http_url_path, p);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::ITEM_X;
+                ui.label(
+                    egui::RichText::new("Every (s)")
+                        .font(font_ui(12.0))
+                        .color(p.muted),
+                );
+                let mut interval = port.http_interval_secs;
+                if ui
+                    .add(egui::DragValue::new(&mut interval).speed(0.25).range(0.5..=3600.0))
+                    .changed()
+                {
+                    port.http_interval_secs = interval;
+                    change.dirty = true;
+                }
+            });
+        }
+
+        ui.add_space(space::SECTION - 2.0);
+        ui.label(
+            egui::RichText::new("INPUT BINDS — JSON path → http_N")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        let mut remove = None;
+        {
+            let port = port_field(model, hub_id, port_id);
+            if port.http_inputs.is_empty() {
+                ui.label(
+                    egui::RichText::new("No binds yet — pick a path from the sample below.")
+                        .font(font_ui(11.0))
+                        .color(p.muted),
+                );
+            } else {
+                for (i, bind) in port.http_inputs.iter().enumerate() {
+                    let id = if bind.point.is_empty() {
+                        "http_N".to_string()
+                    } else {
+                        bind.point.clone()
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{}  ·  {}", id, bind.json_path))
+                                .font(font_ui(12.0))
+                                .color(p.text),
+                        );
+                        if text_button(ui, "×", false, p).clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+            }
+        }
+        if let Some(i) = remove {
+            port_field(model, hub_id, port_id).http_inputs.remove(i);
+            change.dirty = true;
+        }
+
+        ui.add_space(space::SECTION - 2.0);
+        ui.label(
+            egui::RichText::new("SAMPLE JSON — click a path to bind")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        {
+            let port = port_field(model, hub_id, port_id);
+            ui.add(
+                egui::TextEdit::multiline(&mut port.draft_http_sample)
+                    .desired_width(ui.available_width().max(120.0))
+                    .desired_rows(5)
+                    .hint_text("{\"tank\":{\"level\":12.5}}")
+                    .margin(egui::Margin::symmetric(6.0, 4.0)),
+            );
+        }
+        let sample = port_field(model, hub_id, port_id).draft_http_sample.clone();
+        let paths = match serde_json::from_str::<serde_json::Value>(&sample) {
+            Ok(v) => http_panel::json_leaf_paths(&v),
+            Err(_) => Vec::new(),
+        };
+        if !sample.trim().is_empty() && paths.is_empty() {
+            ui.label(
+                egui::RichText::new("Invalid JSON or no leaf fields.")
+                    .font(font_ui(11.0))
+                    .color(p.warn),
+            );
+        }
+        let mut add_path: Option<String> = None;
+        for path in &paths {
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new(path)
+                            .font(font_ui(12.0))
+                            .color(p.text),
+                    )
+                    .fill(p.control)
+                    .stroke(Stroke::new(1.0, p.line)),
+                )
+                .clicked()
+            {
+                add_path = Some(path.clone());
+            }
+        }
+        if let Some(json_path) = add_path {
+            let port = port_field(model, hub_id, port_id);
+            let url_path = port.http_url_path.clone();
+            if !port
+                .http_inputs
+                .iter()
+                .any(|b| b.json_path == json_path && b.path == url_path)
+            {
+                port.http_inputs.push(HttpInputBind {
+                    path: url_path,
+                    json_path,
+                    point: String::new(),
+                });
+                change.dirty = true;
+            }
+        }
+
+        ui.add_space(space::AFTER_FIELD);
+        ui.label(
+            egui::RichText::new("MANUAL PATH")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        let mut add_manual = false;
+        {
+            let port = port_field(model, hub_id, port_id);
+            inspect_field(ui, "JSON path", &mut port.draft_http_json_path, p);
+            if text_button(ui, "Add bind", false, p).clicked() {
+                add_manual = true;
+            }
+        }
+        if add_manual {
+            let port = port_field(model, hub_id, port_id);
+            let json_path = port.draft_http_json_path.trim().to_string();
+            let url_path = port.http_url_path.clone();
+            if !json_path.is_empty()
+                && !port
+                    .http_inputs
+                    .iter()
+                    .any(|b| b.json_path == json_path && b.path == url_path)
+            {
+                port.http_inputs.push(HttpInputBind {
+                    path: url_path,
+                    json_path,
+                    point: String::new(),
+                });
+                port.draft_http_json_path.clear();
+                change.dirty = true;
+            }
+        }
+    } else {
+        // Output
+        ui.add_space(space::AFTER_FIELD);
+        ui.label(
+            egui::RichText::new("REQUEST")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        {
+            let port = port_field(model, hub_id, port_id);
+            let mut method = if port.http_method == "GET" {
+                "POST".to_string()
+            } else {
+                port.http_method.clone()
+            };
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::ITEM_X;
+                ui.label(
+                    egui::RichText::new("Method")
+                        .font(font_ui(12.0))
+                        .color(p.muted),
+                );
+                egui::ComboBox::from_id_salt(("pb_http_out_method", port_id))
+                    .selected_text(&method)
+                    .width(90.0)
+                    .show_ui(ui, |ui| {
+                        for m in ["POST", "PUT", "PATCH"] {
+                            ui.selectable_value(&mut method, m.to_string(), m);
+                        }
+                    });
+            });
+            if method != port.http_method {
+                port.http_method = method;
+                change.dirty = true;
+            }
+            inspect_field(ui, "Path", &mut port.http_url_path, p);
+        }
+
+        ui.add_space(space::SECTION - 2.0);
+        ui.label(
+            egui::RichText::new("BODY BINDS — point → JSON field")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        let mut remove = None;
+        let mut add = false;
+        {
+            let port = port_field(model, hub_id, port_id);
+            for (i, bind) in port.http_outputs.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} → {}", bind.point, bind.json_path))
+                            .font(font_ui(12.0))
+                            .color(p.text),
+                    );
+                    if text_button(ui, "×", false, p).clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            inspect_field(ui, "Point", &mut port.draft_http_out_point, p);
+            inspect_field(ui, "JSON path", &mut port.draft_http_out_json_path, p);
+            if text_button(ui, "Add bind", false, p).clicked() {
+                add = true;
+            }
+        }
+        if let Some(i) = remove {
+            port_field(model, hub_id, port_id).http_outputs.remove(i);
+            change.dirty = true;
+        }
+        if add {
+            let port = port_field(model, hub_id, port_id);
+            let point = port.draft_http_out_point.trim().to_string();
+            let json_path = port.draft_http_out_json_path.trim().to_string();
+            if !point.is_empty() && !json_path.is_empty() {
+                port.http_outputs.push(HttpOutputBind { point, json_path });
+                port.draft_http_out_point.clear();
+                port.draft_http_out_json_path.clear();
+                change.dirty = true;
+            }
+        }
+    }
     change
 }
 

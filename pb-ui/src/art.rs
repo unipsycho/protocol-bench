@@ -104,6 +104,7 @@ pub fn paint_pane_icon(painter: &Painter, rect: Rect, pane: DockPane, ink: Color
         DockPane::Mqtt => icon_mqtt(painter, rect, stroke, ink),
         DockPane::OpcUa => icon_opc(painter, rect, stroke),
         DockPane::Files => icon_file(painter, rect, stroke),
+        DockPane::Http => icon_http(painter, rect, stroke, ink),
     }
 }
 
@@ -124,6 +125,7 @@ pub fn paint_hero(painter: &Painter, pane: DockPane, rect: Rect) {
         DockPane::Mqtt => hero_mqtt(painter, rect),
         DockPane::OpcUa => hero_opc(painter, rect),
         DockPane::Files => hero_files(painter, rect),
+        DockPane::Http => hero_http(painter, rect),
     }
 }
 
@@ -336,6 +338,19 @@ fn icon_mqtt(painter: &Painter, r: Rect, stroke: Stroke, ink: Color32) {
     }
 }
 
+fn icon_http(painter: &Painter, r: Rect, stroke: Stroke, ink: Color32) {
+    // Bracket + slash — REST-ish glyph.
+    let left = nrect(r, 0.18, 0.18, 0.18, 0.64);
+    painter.line_segment([left.left_top(), left.left_bottom()], stroke);
+    painter.line_segment([left.left_top(), left.right_top()], stroke);
+    painter.line_segment([left.left_bottom(), left.right_bottom()], stroke);
+    let right = nrect(r, 0.64, 0.18, 0.18, 0.64);
+    painter.line_segment([right.right_top(), right.right_bottom()], stroke);
+    painter.line_segment([right.left_top(), right.right_top()], stroke);
+    painter.line_segment([right.left_bottom(), right.right_bottom()], stroke);
+    painter.line_segment([n(r, 0.42, 0.22), n(r, 0.58, 0.78)], Stroke::new(stroke.width, ink));
+}
+
 fn icon_opc(painter: &Painter, r: Rect, stroke: Stroke) {
     let root = nrect(r, 0.34, 0.12, 0.32, 0.22);
     painter.rect_stroke(root, Rounding::same(1.5), stroke);
@@ -473,6 +488,25 @@ fn hero_mqtt(painter: &Painter, r: Rect) {
         painter.circle_filled(node, node_r, scope::BG);
         painter.circle_stroke(node, node_r, stroke_of(Proto::MQTT, 1.4));
     }
+}
+
+fn hero_http(painter: &Painter, r: Rect) {
+    let box_r = nrect(r, 0.28, 0.28, 0.44, 0.44);
+    painter.rect_stroke(box_r, Rounding::same(6.0), stroke_of(Proto::HTTP, 1.8));
+    painter.line_segment(
+        [n(r, 0.36, 0.42), n(r, 0.64, 0.42)],
+        stroke_of(Proto::HTTP, 1.4),
+    );
+    painter.line_segment(
+        [n(r, 0.36, 0.52), n(r, 0.58, 0.52)],
+        stroke_of(Proto::HTTP, 1.4),
+    );
+    painter.line_segment(
+        [n(r, 0.36, 0.62), n(r, 0.54, 0.62)],
+        stroke_of(Proto::HTTP, 1.4),
+    );
+    let tip = n(r, 0.78, 0.50);
+    painter.circle_filled(tip, r.height() * 0.05, Proto::HTTP);
 }
 
 fn hero_opc(painter: &Painter, r: Rect) {
