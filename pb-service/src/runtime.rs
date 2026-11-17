@@ -100,32 +100,33 @@ impl Runtime {
         auto_run_hubs: bool,
     ) -> Result<(), String> {
         self.project_json = value.clone();
-        // Points bindings.
-        if let Some(points) = value.get("points").and_then(|v| v.as_array()) {
-            let mut bindings = Vec::new();
-            for p in points {
-                let id = p
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let source = p
-                    .get("source")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !id.is_empty() {
-                    bindings.push(PointBinding { id, source });
+        // Points bindings from project.points[], then Hub Input/agg binds (IPC wipe recovery).
+        let next = value
+            .get("next_point_seq")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+        if let Ok(mut store) = self.engine.points().lock() {
+            if let Some(points) = value.get("points").and_then(|v| v.as_array()) {
+                let mut bindings = Vec::new();
+                for p in points {
+                    let id = p
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let source = p
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !id.is_empty() && !source.is_empty() {
+                        bindings.push(PointBinding { id, source });
+                    }
                 }
-            }
-            let next = value
-                .get("next_point_seq")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1);
-            if let Ok(mut store) = self.engine.points().lock() {
                 store.import_bindings(&bindings);
-                store.set_next_seq_at_least(next.max(1));
             }
+            materialize_hub_binds_json(&value, &mut store);
+            store.set_next_seq_at_least(next.max(1));
         }
         // MQTT pack configure — pass through mqtt section as session JSON the pack understands.
         if let Some(mqtt) = value.get("mqtt") {
@@ -163,6 +164,91 @@ impl Runtime {
             store.set_next_seq_at_least(next_point_seq.max(1));
         }
         Ok(())
+    }
+}
+
+/// Derive point-bus rows from hub Input / OPC UA / aggregator JSON when
+/// `points[]` was wiped by an empty UI mirror (PB-108).
+fn materialize_hub_binds_json(value: &serde_json::Value, store: &mut PointStore) {
+    let Some(hubs) = value
+        .get("hubs")
+        .and_then(|h| h.get("hubs"))
+        .and_then(|v| v.as_array())
+    else {
+        return;
+    };
+    for hub in hubs {
+        for key in ["sources", "outputs"] {
+            let Some(ports) = hub.get(key).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for port in ports {
+                let mqtt_conn = port
+                    .get("mqtt_connection")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(binds) = port.get("mqtt_inputs").and_then(|v| v.as_array()) {
+                    for bind in binds {
+                        let topic = bind.get("topic").and_then(|v| v.as_str()).unwrap_or("");
+                        if topic.is_empty() {
+                            continue;
+                        }
+                        let path = bind.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        let source = mqtt_bind_source(mqtt_conn, topic, path);
+                        let point = bind.get("point").and_then(|v| v.as_str()).unwrap_or("");
+                        if point.is_empty() {
+                            let _ = store.ensure_id("mqtt", &source);
+                        } else {
+                            store.bind(point, &source);
+                        }
+                    }
+                }
+                let opc_conn = port
+                    .get("opcua_connection")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(binds) = port.get("opcua_inputs").and_then(|v| v.as_array()) {
+                    for bind in binds {
+                        let node = bind.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
+                        if node.is_empty() {
+                            continue;
+                        }
+                        let source = if opc_conn.is_empty() {
+                            format!("opcua/{node}")
+                        } else {
+                            format!("opcua/{opc_conn}/{node}")
+                        };
+                        let point = bind.get("point").and_then(|v| v.as_str()).unwrap_or("");
+                        if point.is_empty() {
+                            let _ = store.ensure_id("opc", &source);
+                        } else {
+                            store.bind(point, &source);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(aggs) = hub.get("aggregators").and_then(|v| v.as_array()) {
+            for step in aggs {
+                let Some(id) = step.get("id").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                store.bind(&format!("agg_{id}"), &format!("agg/step/{id}"));
+            }
+        }
+    }
+}
+
+fn mqtt_bind_source(conn: &str, topic: &str, path: &str) -> String {
+    let base = if conn.is_empty() {
+        format!("mqtt/{topic}")
+    } else {
+        format!("mqtt/{conn}/{topic}")
+    };
+    if path.is_empty() {
+        base
+    } else {
+        format!("{base}::{path}")
     }
 }
 

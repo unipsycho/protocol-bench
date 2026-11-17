@@ -203,6 +203,8 @@ impl PointStore {
 
     /// Register an explicit id ↔ source pair (project load / user override).
     /// Does not free or reuse earlier sequence numbers.
+    /// Also inserts a placeholder row when the id is new so the Points panel
+    /// lists binds before the first live pack upsert.
     pub fn bind(&mut self, id: &str, source: &str) {
         let id = id.trim();
         let source = source.trim();
@@ -221,6 +223,26 @@ impl PointStore {
             }
         }
         self.note_issued_id(id);
+        // Placeholder bus row — keep any live value already upserted by a pack.
+        match self.points.get_mut(id) {
+            Some(pt) => {
+                if pt.source != source {
+                    pt.source = source.to_string();
+                }
+            }
+            None => {
+                self.points.insert(
+                    id.to_string(),
+                    Point {
+                        name: id.to_string(),
+                        value: PointValue::String(String::new()),
+                        quality: Quality::Uncertain,
+                        source: source.to_string(),
+                        updated_ms: 0,
+                    },
+                );
+            }
+        }
     }
 
     pub fn id_for_source(&self, source: &str) -> Option<&str> {
@@ -450,5 +472,11 @@ mod tests {
         assert_eq!(store.ensure_id("mqtt", "mqtt/local/y"), "mqtt_10");
         let exported = store.export_bindings();
         assert!(exported.iter().any(|b| b.id == "mqtt_9"));
+        // Bind must surface a snapshot row before any pack upsert.
+        let snap = store.snapshot();
+        assert!(
+            snap.iter().any(|p| p.name == "mqtt_9" && p.quality == Quality::Uncertain),
+            "import_bindings should materialize placeholder points"
+        );
     }
 }

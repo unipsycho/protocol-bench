@@ -5,6 +5,7 @@
 use egui::{Align2, Color32, FontId, Id, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
 use pb_engine::PointSnapshot;
 
+use crate::hubs::{HubModel, HubProto};
 use crate::theme::{font_ui, tint, ThemePalette};
 
 const ROW_H: f32 = 18.0;
@@ -436,6 +437,112 @@ pub fn mqtt_bind_source(conn: &str, topic: &str, path: &str) -> String {
     } else {
         format!("{base}::{path}")
     }
+}
+
+/// Global Points panel rows: live bus + Hub Input bind / aggregator placeholders.
+///
+/// Honest empty only when there are no host points and no Input/agg binds.
+pub fn rows_for_points_panel(
+    hubs: &HubModel,
+    host_points: &[PointSnapshot],
+) -> Vec<PointsTableRow> {
+    let mut rows: Vec<PointsTableRow> = host_points
+        .iter()
+        .map(PointsTableRow::from_snapshot)
+        .collect();
+    let mut seen: std::collections::BTreeSet<String> =
+        rows.iter().map(|r| r.id.clone()).collect();
+
+    for hub in &hubs.hubs {
+        for port in hub.sources.iter().chain(hub.outputs.iter()) {
+            match port.protocol {
+                HubProto::Mqtt => {
+                    let conn = port.mqtt_connection.as_str();
+                    for bind in &port.mqtt_inputs {
+                        let topic = bind.topic.trim();
+                        if topic.is_empty() {
+                            continue;
+                        }
+                        let source = mqtt_bind_source(conn, topic, bind.path.trim());
+                        let id = if bind.point.trim().is_empty() {
+                            "mqtt_N".to_string()
+                        } else {
+                            bind.point.trim().to_string()
+                        };
+                        if seen.contains(&id) {
+                            continue;
+                        }
+                        seen.insert(id.clone());
+                        rows.push(PointsTableRow {
+                            id,
+                            source,
+                            value: "—".into(),
+                            quality: "uncertain".into(),
+                            updated: "—".into(),
+                            updated_ms: 0,
+                            bind_index: None,
+                            topic: bind.topic.clone(),
+                            path: bind.path.clone(),
+                        });
+                    }
+                }
+                HubProto::OpcUa => {
+                    let conn = port.opcua_connection.trim();
+                    for bind in &port.opcua_inputs {
+                        let node = bind.node_id.trim();
+                        if node.is_empty() {
+                            continue;
+                        }
+                        let source = if conn.is_empty() {
+                            format!("opcua/{node}")
+                        } else {
+                            format!("opcua/{conn}/{node}")
+                        };
+                        let id = if bind.point.trim().is_empty() {
+                            "opc_N".to_string()
+                        } else {
+                            bind.point.trim().to_string()
+                        };
+                        if seen.contains(&id) {
+                            continue;
+                        }
+                        seen.insert(id.clone());
+                        rows.push(PointsTableRow {
+                            id,
+                            source,
+                            value: "—".into(),
+                            quality: "uncertain".into(),
+                            updated: "—".into(),
+                            updated_ms: 0,
+                            bind_index: None,
+                            topic: String::new(),
+                            path: String::new(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        for step in &hub.aggregators {
+            let id = format!("agg_{}", step.id);
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.insert(id.clone());
+            rows.push(PointsTableRow {
+                id,
+                source: format!("agg/step/{}", step.id),
+                value: "—".into(),
+                quality: "uncertain".into(),
+                updated: "—".into(),
+                updated_ms: 0,
+                bind_index: None,
+                topic: String::new(),
+                path: String::new(),
+            });
+        }
+    }
+    rows
 }
 
 /// Build table rows for one Input node's binds (live host points + pending placeholders).
