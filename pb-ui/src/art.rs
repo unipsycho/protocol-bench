@@ -105,7 +105,7 @@ pub fn paint_pane_icon(painter: &Painter, rect: Rect, pane: DockPane, ink: Color
         DockPane::OpcUa => icon_opc(painter, rect, stroke),
         DockPane::Files => icon_file(painter, rect, stroke),
         DockPane::Http => icon_http(painter, rect, stroke, ink),
-        DockPane::Las => icon_las(painter, rect, stroke, ink),
+        DockPane::Snmp => icon_snmp(painter, rect, stroke, ink),
     }
 }
 
@@ -127,7 +127,7 @@ pub fn paint_hero(painter: &Painter, pane: DockPane, rect: Rect) {
         DockPane::OpcUa => hero_opc(painter, rect),
         DockPane::Files => hero_files(painter, rect),
         DockPane::Http => hero_http(painter, rect),
-        DockPane::Las => hero_las(painter, rect),
+        DockPane::Snmp => hero_snmp(painter, rect),
     }
 }
 
@@ -367,15 +367,14 @@ fn icon_http(painter: &Painter, r: Rect, stroke: Stroke, ink: Color32) {
     painter.line_segment([n(r, 0.42, 0.22), n(r, 0.58, 0.78)], Stroke::new(stroke.width, ink));
 }
 
-fn icon_las(painter: &Painter, r: Rect, stroke: Stroke, ink: Color32) {
-    // Depth track + curve samples — well-log glyph.
-    let track = nrect(r, 0.22, 0.12, 0.14, 0.76);
-    painter.rect_stroke(track, Rounding::same(1.5), stroke);
-    painter.line_segment([n(r, 0.42, 0.20), n(r, 0.78, 0.28)], stroke);
-    painter.line_segment([n(r, 0.78, 0.28), n(r, 0.52, 0.48)], stroke);
-    painter.line_segment([n(r, 0.52, 0.48), n(r, 0.82, 0.68)], stroke);
-    painter.line_segment([n(r, 0.82, 0.68), n(r, 0.58, 0.84)], stroke);
-    painter.circle_filled(n(r, 0.58, 0.84), r.width() * 0.05, ink);
+fn icon_snmp(painter: &Painter, r: Rect, stroke: Stroke, ink: Color32) {
+    // Agent node + OID spokes.
+    painter.circle_stroke(n(r, 0.50, 0.48), r.width() * 0.18, stroke);
+    painter.circle_filled(n(r, 0.50, 0.48), r.width() * 0.06, ink);
+    for (x, y) in [(0.22, 0.22), (0.78, 0.22), (0.22, 0.78), (0.78, 0.78)] {
+        painter.line_segment([n(r, 0.50, 0.48), n(r, x, y)], stroke);
+        painter.circle_filled(n(r, x, y), r.width() * 0.05, ink);
+    }
 }
 
 fn icon_opc(painter: &Painter, r: Rect, stroke: Stroke) {
@@ -536,27 +535,19 @@ fn hero_http(painter: &Painter, r: Rect) {
     painter.circle_filled(tip, r.height() * 0.05, Proto::HTTP);
 }
 
-fn hero_las(painter: &Painter, r: Rect) {
-    let track = nrect(r, 0.18, 0.12, 0.12, 0.76);
-    painter.rect_filled(track, Rounding::same(2.0), tint(Proto::LAS, 22));
-    painter.rect_stroke(track, Rounding::same(2.0), stroke_of(Proto::LAS, 1.6));
-    let pts = [
-        n(r, 0.42, 0.18),
-        n(r, 0.72, 0.32),
-        n(r, 0.48, 0.48),
-        n(r, 0.78, 0.64),
-        n(r, 0.52, 0.82),
-    ];
-    for w in pts.windows(2) {
-        painter.line_segment([w[0], w[1]], stroke_of(Proto::LAS, 1.6));
-    }
-    for p in pts {
-        painter.circle_filled(p, 2.4, Proto::LAS);
+fn hero_snmp(painter: &Painter, r: Rect) {
+    let c = n(r, 0.42, 0.50);
+    painter.circle_stroke(c, r.height() * 0.14, stroke_of(Proto::SNMP, 1.8));
+    painter.circle_filled(c, r.height() * 0.04, Proto::SNMP);
+    for (x, y) in [(0.18, 0.22), (0.68, 0.20), (0.20, 0.80), (0.70, 0.78)] {
+        let p = n(r, x, y);
+        painter.line_segment([c, p], stroke_of(Proto::SNMP, 1.4));
+        painter.circle_filled(p, 3.0, Proto::SNMP);
     }
     if r.width() > 260.0 {
-        pill(painter, n(r, 0.82, 0.28), "2.0", Proto::LAS);
-        pill(painter, n(r, 0.82, 0.48), "~C", Proto::TEAL);
-        pill(painter, n(r, 0.82, 0.68), "~A", Proto::SAGE);
+        pill(painter, n(r, 0.82, 0.32), "v2c", Proto::SNMP);
+        pill(painter, n(r, 0.82, 0.52), "OID", Proto::TEAL);
+        pill(painter, n(r, 0.82, 0.72), "GET", Proto::SAGE);
     }
 }
 

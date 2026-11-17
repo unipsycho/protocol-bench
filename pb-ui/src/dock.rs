@@ -23,8 +23,8 @@ pub enum DockPane {
     Files,
     /// HTTP / REST JSON clients (Input/Output).
     Http,
-    /// LAS well-log files (follow / write). Pack later — no EngineId yet.
-    Las,
+    /// SNMP agents (Input poll). Pack later — no EngineId yet.
+    Snmp,
 }
 
 impl DockPane {
@@ -41,7 +41,7 @@ impl DockPane {
         DockPane::OpcUa,
         DockPane::Files,
         DockPane::Http,
-        DockPane::Las,
+        DockPane::Snmp,
     ];
 
     pub fn title(self) -> &'static str {
@@ -58,7 +58,7 @@ impl DockPane {
             Self::OpcUa => "OPC UA",
             Self::Files => "File follow",
             Self::Http => "HTTP / REST",
-            Self::Las => "LAS",
+            Self::Snmp => "SNMP",
         }
     }
 
@@ -76,7 +76,7 @@ impl DockPane {
             Self::OpcUa => "opcua",
             Self::Files => "files",
             Self::Http => "http",
-            Self::Las => "las",
+            Self::Snmp => "snmp",
         }
     }
 
@@ -89,8 +89,7 @@ impl DockPane {
             Self::OpcUa => Some(EngineId::OpcUa),
             Self::Files => Some(EngineId::FileFollow),
             Self::Http => Some(EngineId::Http),
-            // LAS pack not shipped yet — pane is UI-only.
-            Self::Las => None,
+            Self::Snmp => None,
             _ => None,
         }
     }
@@ -121,7 +120,7 @@ impl DockPane {
             Self::OpcUa => Proto::OPC,
             Self::Files => Proto::FILES,
             Self::Http => Proto::HTTP,
-            Self::Las => Proto::LAS,
+            Self::Snmp => Proto::SNMP,
         }
     }
 
@@ -143,7 +142,7 @@ impl DockPane {
             Self::OpcUa => Proto::OPC_DEEP,
             Self::Files => Proto::FILES_DEEP,
             Self::Http => Proto::HTTP_DEEP,
-            Self::Las => Proto::LAS_DEEP,
+            Self::Snmp => Proto::SNMP_DEEP,
         }
     }
 }

@@ -9,11 +9,11 @@ use crate::art;
 use crate::dock::DockPane;
 use crate::hubs::HubModel;
 use crate::http_panel::{self, HttpPanelState};
-use crate::las_panel::{self, LasPanelState};
 use crate::mqtt_panel::{self, MqttPanelState};
 use crate::opcua_panel::{self, OpcUaPanelState};
 use crate::point_rows::{self, PointsTableRow, PointsTableState};
 use crate::project::ProjectSettings;
+use crate::snmp_panel::{self, SnmpPanelState};
 use crate::streams_panel::{self, StreamsPanelState};
 use crate::theme::{
     after_field, apply_form_spacing, font_semi, font_ui, form_inset, space, scope, tint,
@@ -49,7 +49,7 @@ pub fn paint(
     opcua: &mut OpcUaPanelState,
     http: &mut HttpPanelState,
     streams: &mut StreamsPanelState,
-    las: &mut LasPanelState,
+    snmp: &mut SnmpPanelState,
     points: &mut PointsPanelState,
     traffic: &mut TrafficPanelState,
     settings: &mut ProjectSettings,
@@ -62,7 +62,7 @@ pub fn paint(
             mqtt.sync_trees_from_host(host);
             opcua.sync_from_host(host);
             let conns = mqtt.connection_choices();
-            crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, http, streams, las, host, engine)
+            crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, http, streams, snmp, host, engine)
         }
         DockPane::Mqtt => {
             mqtt_panel::paint(ui, host, p, engine, mqtt, hubs);
@@ -84,8 +84,8 @@ pub fn paint(
             change.dirty = dirty;
             change
         }
-        DockPane::Las => {
-            let dirty = las_panel::paint(ui, p, las);
+        DockPane::Snmp => {
+            let dirty = snmp_panel::paint(ui, p, snmp);
             let mut change = crate::hubs::HubChange::quiet();
             change.dirty = dirty;
             change
@@ -393,7 +393,7 @@ fn columns(pane: DockPane) -> &'static [(&'static str, f32)] {
         DockPane::OpcUa => &[("NODE", 0.42), ("ACCESS", 0.24), ("POINT", 0.34)],
         DockPane::Files => &[("PATH", 0.48), ("PARSER", 0.24), ("OFFSET", 0.28)],
         DockPane::Http => &[("NAME", 0.28), ("URL", 0.52), ("AUTH", 0.20)],
-        DockPane::Las => &[("NAME", 0.28), ("PATH", 0.48), ("ROLE", 0.24)],
+        DockPane::Snmp => &[("NAME", 0.28), ("HOST", 0.44), ("VER", 0.28)],
         DockPane::Project | DockPane::Hubs | DockPane::Calculations => &[("NAME", 1.0)],
     }
 }
@@ -409,7 +409,7 @@ fn empty_message(pane: DockPane) -> &'static str {
         DockPane::OpcUa => "No nodes yet",
         DockPane::Files => "No files yet",
         DockPane::Http => "No clients yet",
-        DockPane::Las => "No endpoints yet",
+        DockPane::Snmp => "No targets yet",
         DockPane::Project | DockPane::Hubs | DockPane::Calculations => "",
     }
 }

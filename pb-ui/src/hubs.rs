@@ -14,11 +14,11 @@ use std::collections::BTreeMap;
 
 use crate::dock::DockPane;
 use crate::http_panel::{self, HttpPanelState};
-use crate::las_panel::LasPanelState;
 use crate::mqtt_panel::MqttPanelState;
 use crate::opcua_browse::{self, BrowseAction, BrowseMode};
 use crate::opcua_panel::OpcUaPanelState;
 use crate::point_rows;
+use crate::snmp_panel::SnmpPanelState;
 use crate::streams_panel::StreamsPanelState;
 use crate::theme::{
     after_field, apply_form_spacing, blend_scope, divider_bar, font_semi, font_ui, mix, space, tint,
@@ -72,8 +72,8 @@ pub enum HubProto {
     Files,
     /// HTTP / REST — Input/Output only (not hub-capable).
     Http,
-    /// LAS well-log — Input/Output only (not hub-capable).
-    Las,
+    /// SNMP — Input poll (not hub-capable). SET Output later.
+    Snmp,
 }
 
 impl HubProto {
@@ -84,7 +84,7 @@ impl HubProto {
         HubProto::OpcUa,
         HubProto::Files,
         HubProto::Http,
-        HubProto::Las,
+        HubProto::Snmp,
     ];
 
     /// Protocols that can own a hub (server / broker role).
@@ -98,7 +98,7 @@ impl HubProto {
             Self::OpcUa => "OPC UA",
             Self::Files => "Files",
             Self::Http => "HTTP / REST",
-            Self::Las => "LAS",
+            Self::Snmp => "SNMP",
         }
     }
 
@@ -110,7 +110,7 @@ impl HubProto {
             Self::OpcUa => DockPane::OpcUa,
             Self::Files => DockPane::Files,
             Self::Http => DockPane::Http,
-            Self::Las => DockPane::Las,
+            Self::Snmp => DockPane::Snmp,
         }
     }
 
@@ -209,23 +209,15 @@ pub struct HttpOutputBind {
     pub json_path: String,
 }
 
-/// Input node: LAS curve mnemonic → host point (`las_N`).
+/// Input node: SNMP OID → host point (`snmp_N`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct LasInputBind {
-    /// Curve mnemonic from `~C`.
+pub struct SnmpInputBind {
+    /// OID numeric or dotted string.
     #[serde(default)]
-    pub curve: String,
-    /// Empty on new binds — host assigns `las_N`.
+    pub oid: String,
+    /// Empty on new binds — host assigns `snmp_N`.
     #[serde(default)]
     pub point: String,
-}
-
-/// Output node: host point → LAS curve mnemonic.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct LasOutputBind {
-    pub point: String,
-    #[serde(default)]
-    pub curve: String,
 }
 
 /// Input node: OPC UA client + NodeId → host point (PB-81).
@@ -328,16 +320,14 @@ pub struct HubPort {
     pub stream_inputs: Vec<StreamInputBind>,
     #[serde(default)]
     pub stream_outputs: Vec<StreamOutputBind>,
-    /// LAS endpoint id from the LAS panel.
+    /// SNMP target id from the SNMP panel.
     #[serde(default)]
-    pub las_endpoint: String,
-    /// Index kind: `depth` | `time`.
-    #[serde(default = "default_las_index")]
-    pub las_index: String,
+    pub snmp_target: String,
+    /// Poll interval seconds (SNMP Input).
+    #[serde(default = "default_snmp_interval")]
+    pub snmp_interval_secs: f32,
     #[serde(default)]
-    pub las_inputs: Vec<LasInputBind>,
-    #[serde(default)]
-    pub las_outputs: Vec<LasOutputBind>,
+    pub snmp_inputs: Vec<SnmpInputBind>,
     /// Ephemeral inspector drafts — not persisted.
     #[serde(skip)]
     pub draft_mqtt_topic: String,
@@ -374,11 +364,7 @@ pub struct HubPort {
     #[serde(skip)]
     pub draft_stream_out_field: String,
     #[serde(skip)]
-    pub draft_las_curve: String,
-    #[serde(skip)]
-    pub draft_las_out_point: String,
-    #[serde(skip)]
-    pub draft_las_out_curve: String,
+    pub draft_snmp_oid: String,
 }
 
 fn default_http_method() -> String {
@@ -394,7 +380,7 @@ fn default_stream_eol() -> String { "lf".into() }
 fn default_stream_idle() -> f32 { 50.0 }
 fn default_stream_parser() -> String { "whole_line".into() }
 fn default_stream_ts() -> String { "receive".into() }
-fn default_las_index() -> String { "depth".into() }
+fn default_snmp_interval() -> f32 { 10.0 }
 
 impl HubPort {
     pub fn new(id: u64, protocol: HubProto, label: impl Into<String>) -> Self {
@@ -426,10 +412,9 @@ impl HubPort {
             stream_timestamp_custom: String::new(),
             stream_inputs: Vec::new(),
             stream_outputs: Vec::new(),
-            las_endpoint: String::new(),
-            las_index: default_las_index(),
-            las_inputs: Vec::new(),
-            las_outputs: Vec::new(),
+            snmp_target: String::new(),
+            snmp_interval_secs: default_snmp_interval(),
+            snmp_inputs: Vec::new(),
             draft_mqtt_topic: String::new(),
             draft_mqtt_path: String::new(),
             draft_mqtt_out_point: String::new(),
@@ -445,9 +430,7 @@ impl HubPort {
             draft_stream_field: String::new(),
             draft_stream_out_point: String::new(),
             draft_stream_out_field: String::new(),
-            draft_las_curve: String::new(),
-            draft_las_out_point: String::new(),
-            draft_las_out_curve: String::new(),
+            draft_snmp_oid: String::new(),
         }
     }
 }
@@ -2072,13 +2055,13 @@ pub fn paint(
     opcua: &mut OpcUaPanelState,
     http: &HttpPanelState,
     streams: &StreamsPanelState,
-    las: &LasPanelState,
+    snmp: &SnmpPanelState,
     host: &HostSnapshot,
     engine: &crate::engine_api::EngineHandle,
 ) -> HubChange {
     let http_connections = http.connection_choices();
     let stream_connections = streams.connection_choices();
-    let las_connections = las.connection_choices();
+    let snmp_connections = snmp.connection_choices();
     let mut change = HubChange::quiet();
     // Keep Output auto-binds aligned with inbound feed wires (PB-63).
     if model.sync_output_feed_binds(&host.points) {
@@ -2139,7 +2122,7 @@ pub fn paint(
                 mqtt_connections,
                 &http_connections,
                 &stream_connections,
-                &las_connections,
+                &snmp_connections,
                 mqtt,
                 opcua,
                 http,
@@ -2160,7 +2143,7 @@ pub fn paint(
             mqtt_connections,
             &http_connections,
             &stream_connections,
-            &las_connections,
+            &snmp_connections,
             mqtt,
             opcua,
             http,
@@ -3746,7 +3729,7 @@ fn inspector(
     mqtt_connections: &[(String, String)],
     http_connections: &[(String, String)],
     stream_connections: &[(String, String)],
-    las_connections: &[(String, String)],
+    snmp_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     http: &HttpPanelState,
@@ -3783,7 +3766,7 @@ fn inspector(
                 mqtt_connections,
                 http_connections,
                 stream_connections,
-                las_connections,
+                snmp_connections,
                 mqtt,
                 opcua,
                 http,
@@ -3801,7 +3784,7 @@ fn edit_selected(
     mqtt_connections: &[(String, String)],
     http_connections: &[(String, String)],
     stream_connections: &[(String, String)],
-    las_connections: &[(String, String)],
+    snmp_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     http: &HttpPanelState,
@@ -3848,7 +3831,7 @@ fn edit_selected(
             mqtt_connections,
             http_connections,
             stream_connections,
-            las_connections,
+            snmp_connections,
             mqtt,
             opcua,
             http,
@@ -3978,7 +3961,7 @@ fn edit_port(
     mqtt_connections: &[(String, String)],
     _http_connections: &[(String, String)],
     stream_connections: &[(String, String)],
-    las_connections: &[(String, String)],
+    snmp_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     http: &HttpPanelState,
@@ -4113,15 +4096,15 @@ fn edit_port(
             p,
         ));
     }
-    if proto == HubProto::Las {
+    if proto == HubProto::Snmp {
         ui.add_space(space::SECTION - 2.0);
-        change = change.join(edit_las_port_binds(
+        change = change.join(edit_snmp_port_binds(
             ui,
             model,
             hub_id,
             port_id,
             incoming,
-            las_connections,
+            snmp_connections,
             p,
         ));
     }
@@ -5504,165 +5487,124 @@ fn split_csv_like(line: &str, sep: char) -> Vec<String> {
     line.split(sep).map(|s| s.trim().to_string()).collect()
 }
 
-fn edit_las_port_binds(
+fn edit_snmp_port_binds(
     ui: &mut Ui,
     model: &mut HubModel,
     hub_id: u64,
     port_id: u64,
     incoming: bool,
-    las_connections: &[(String, String)],
+    snmp_connections: &[(String, String)],
     p: &ThemePalette,
 ) -> HubChange {
     let mut change = HubChange::quiet();
     apply_form_spacing(ui);
+    if !incoming {
+        ui.label(
+            egui::RichText::new("SNMP SET Output ships later — use Input for GET poll.")
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        return change;
+    }
+
     ui.label(
-        egui::RichText::new("LAS ENDPOINT")
+        egui::RichText::new("SNMP TARGET")
             .font(font_ui(10.5))
             .color(p.muted),
     );
     ui.add_space(space::AFTER_HEADING);
-    let current = port_field(model, hub_id, port_id).las_endpoint.clone();
-    let current_label = las_connections
+    let current = port_field(model, hub_id, port_id).snmp_target.clone();
+    let current_label = snmp_connections
         .iter()
         .find(|(id, _)| id == &current)
         .map(|(_, label)| label.as_str())
         .unwrap_or(if current.is_empty() {
-            "(pick endpoint)"
+            "(pick target)"
         } else {
             current.as_str()
         });
     let mut next = current.clone();
-    egui::ComboBox::from_id_salt(("pb_hub_las_ep", port_id))
+    egui::ComboBox::from_id_salt(("pb_hub_snmp_tgt", port_id))
         .selected_text(current_label)
         .width((ui.available_width()).min(280.0).max(140.0))
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut next, String::new(), "(none)");
-            for (id, label) in las_connections {
+            for (id, label) in snmp_connections {
                 ui.selectable_value(&mut next, id.clone(), label);
             }
         });
     if next != current {
-        port_field(model, hub_id, port_id).las_endpoint = next;
+        port_field(model, hub_id, port_id).snmp_target = next;
         change.dirty = true;
     }
 
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
+        ui.label(
+            egui::RichText::new("Poll (s)")
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        let mut interval = port_field(model, hub_id, port_id).snmp_interval_secs;
+        if ui
+            .add(egui::DragValue::new(&mut interval).speed(0.5).range(0.5..=3600.0))
+            .changed()
+        {
+            port_field(model, hub_id, port_id).snmp_interval_secs = interval;
+            change.dirty = true;
+        }
+    });
+
+    ui.add_space(space::SECTION - 2.0);
+    ui.label(
+        egui::RichText::new("OIDS → snmp_N")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(space::AFTER_HEADING);
+    let mut remove = None;
+    let n = port_field(model, hub_id, port_id).snmp_inputs.len();
+    for i in 0..n {
+        let bind = port_field(model, hub_id, port_id).snmp_inputs[i].clone();
+        let point = if bind.point.is_empty() {
+            "snmp_N".to_string()
+        } else {
+            bind.point.clone()
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = space::ITEM_X;
+            ui.label(
+                egui::RichText::new(format!("{point}  ·  {}", bind.oid))
+                    .font(font_ui(12.0))
+                    .color(p.text),
+            );
+            if text_button(ui, "×", false, p).clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        port_field(model, hub_id, port_id).snmp_inputs.remove(i);
+        change.dirty = true;
+    }
+    let mut add = false;
     {
         let port = port_field(model, hub_id, port_id);
-        change.dirty |= combo_owned(
-            ui,
-            "Index",
-            &mut port.las_index,
-            &[("depth", "Depth"), ("time", "Time")],
-            ("pb_las_index", port_id),
-            p,
-        );
+        inspect_field(ui, "OID", &mut port.draft_snmp_oid, p);
+        if text_button(ui, "Add bind", false, p).clicked() {
+            add = true;
+        }
     }
-
-    if incoming {
-        ui.add_space(space::SECTION - 2.0);
-        ui.label(
-            egui::RichText::new("CURVES → las_N")
-                .font(font_ui(10.5))
-                .color(p.muted),
-        );
-        ui.add_space(space::AFTER_HEADING);
-        ui.label(
-            egui::RichText::new("Curve preview needs pb-las — enter mnemonics from ~C for now.")
-                .font(font_ui(11.0))
-                .color(p.muted),
-        );
-        let mut remove = None;
-        let n = port_field(model, hub_id, port_id).las_inputs.len();
-        for i in 0..n {
-            let bind = port_field(model, hub_id, port_id).las_inputs[i].clone();
-            let point = if bind.point.is_empty() {
-                "las_N".to_string()
-            } else {
-                bind.point.clone()
-            };
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = space::ITEM_X;
-                ui.label(
-                    egui::RichText::new(format!("{point}  ·  {}", bind.curve))
-                        .font(font_ui(12.0))
-                        .color(p.text),
-                );
-                if text_button(ui, "×", false, p).clicked() {
-                    remove = Some(i);
-                }
+    if add {
+        let port = port_field(model, hub_id, port_id);
+        let oid = port.draft_snmp_oid.trim().to_string();
+        if !oid.is_empty() && !port.snmp_inputs.iter().any(|b| b.oid == oid) {
+            port.snmp_inputs.push(SnmpInputBind {
+                oid,
+                point: String::new(),
             });
-        }
-        if let Some(i) = remove {
-            port_field(model, hub_id, port_id).las_inputs.remove(i);
+            port.draft_snmp_oid.clear();
             change.dirty = true;
-        }
-        let mut add = false;
-        {
-            let port = port_field(model, hub_id, port_id);
-            inspect_field(ui, "Curve", &mut port.draft_las_curve, p);
-            if text_button(ui, "Add bind", false, p).clicked() {
-                add = true;
-            }
-        }
-        if add {
-            let port = port_field(model, hub_id, port_id);
-            let curve = port.draft_las_curve.trim().to_string();
-            if !curve.is_empty() && !port.las_inputs.iter().any(|b| b.curve == curve) {
-                port.las_inputs.push(LasInputBind {
-                    curve,
-                    point: String::new(),
-                });
-                port.draft_las_curve.clear();
-                change.dirty = true;
-            }
-        }
-    } else {
-        ui.add_space(space::SECTION - 2.0);
-        ui.label(
-            egui::RichText::new("OUTPUT BINDS — point → curve")
-                .font(font_ui(10.5))
-                .color(p.muted),
-        );
-        ui.add_space(space::AFTER_HEADING);
-        let mut remove = None;
-        let n = port_field(model, hub_id, port_id).las_outputs.len();
-        for i in 0..n {
-            let bind = port_field(model, hub_id, port_id).las_outputs[i].clone();
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = space::ITEM_X;
-                ui.label(
-                    egui::RichText::new(format!("{}  →  {}", bind.point, bind.curve))
-                        .font(font_ui(12.0))
-                        .color(p.text),
-                );
-                if text_button(ui, "×", false, p).clicked() {
-                    remove = Some(i);
-                }
-            });
-        }
-        if let Some(i) = remove {
-            port_field(model, hub_id, port_id).las_outputs.remove(i);
-            change.dirty = true;
-        }
-        let mut add = false;
-        {
-            let port = port_field(model, hub_id, port_id);
-            inspect_field(ui, "Point", &mut port.draft_las_out_point, p);
-            inspect_field(ui, "Curve", &mut port.draft_las_out_curve, p);
-            if text_button(ui, "Add bind", false, p).clicked() {
-                add = true;
-            }
-        }
-        if add {
-            let port = port_field(model, hub_id, port_id);
-            let point = port.draft_las_out_point.trim().to_string();
-            let curve = port.draft_las_out_curve.trim().to_string();
-            if !point.is_empty() && !curve.is_empty() {
-                port.las_outputs.push(LasOutputBind { point, curve });
-                port.draft_las_out_point.clear();
-                port.draft_las_out_curve.clear();
-                change.dirty = true;
-            }
         }
     }
     change
