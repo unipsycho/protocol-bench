@@ -62,14 +62,17 @@ impl EngineId {
         match self {
             Self::Mqtt => Some("mqtt"),
             Self::OpcUa => Some("opcua"),
-            Self::Streams | Self::Modbus | Self::FileFollow => None,
+            Self::Streams => Some("streams"),
+            Self::Modbus | Self::FileFollow => None,
         }
     }
 
     /// What this slot will own once the protocol stack lands. No I/O for idle.
     pub fn note(self) -> &'static str {
         match self {
-            Self::Streams => "Owns serial ports and TCP sockets. No port is open in this build.",
+            Self::Streams => {
+                "Streams / TCP pack — serial + TCP client/listener text framing (scan / emit)."
+            }
             Self::Modbus => "Owns Modbus RTU and TCP sessions. No session is open in this build.",
             Self::Mqtt => {
                 "MQTT client pack (source/output) plus optional embedded rumqttd LAN broker."
@@ -552,36 +555,53 @@ fn host_main(
             }
         }
 
-        // Live Output publish: when MQTT pack is connected, push transformed values.
+        // Live Output publish: push transformed values to connected egress packs.
         let mqtt_connected = engines
             .iter()
             .find(|e| e.id() == EngineId::Mqtt)
             .map(|e| e.snapshot().connected)
             .unwrap_or(false);
-        if mqtt_connected {
+        let streams_connected = engines
+            .iter()
+            .find(|e| e.id() == EngineId::Streams)
+            .map(|e| e.snapshot().connected)
+            .unwrap_or(false);
+        let any_egress = mqtt_connected || streams_connected;
+        if any_egress {
             let force_all = !mqtt_was_connected;
             mqtt_was_connected = true;
-            if let Some(engine) = engines.iter_mut().find(|e| e.id() == EngineId::Mqtt) {
-                let to_pub: Vec<(String, String)> = if force_all {
-                    last_out
-                        .iter()
-                        .map(|(n, v)| (n.clone(), v.clone()))
-                        .collect()
-                } else {
-                    dirty_out
-                };
-                for (name, value) in to_pub {
-                    // Deadband hold: same payload as last publish → skip (no Explorer jitter).
-                    if !force_all && egress_payload.get(&name) == Some(&value) {
-                        continue;
+            let to_pub: Vec<(String, String)> = if force_all {
+                last_out
+                    .iter()
+                    .map(|(n, v)| (n.clone(), v.clone()))
+                    .collect()
+            } else {
+                dirty_out
+            };
+            for (name, value) in to_pub {
+                // Deadband hold: same payload as last publish → skip (no Explorer jitter).
+                if !force_all && egress_payload.get(&name) == Some(&value) {
+                    continue;
+                }
+                let mut ok = false;
+                if mqtt_connected {
+                    if let Some(engine) = engines.iter_mut().find(|e| e.id() == EngineId::Mqtt) {
+                        ok |= engine.handle(EngineCommand::WritePoint {
+                            name: name.clone(),
+                            value: value.clone(),
+                        });
                     }
-                    let ok = engine.handle(EngineCommand::WritePoint {
-                        name: name.clone(),
-                        value: value.clone(),
-                    });
-                    if ok {
-                        egress_payload.insert(name, value);
+                }
+                if streams_connected {
+                    if let Some(engine) = engines.iter_mut().find(|e| e.id() == EngineId::Streams) {
+                        ok |= engine.handle(EngineCommand::WritePoint {
+                            name: name.clone(),
+                            value: value.clone(),
+                        });
                     }
+                }
+                if ok {
+                    egress_payload.insert(name, value);
                 }
             }
         } else {

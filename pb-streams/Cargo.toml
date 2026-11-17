@@ -1,0 +1,20 @@
+[package]
+name = "pb-streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Streams / TCP protocol pack — serial + TCP text framing for Protocol Bench"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "pb_streams"
+
+[dependencies]
+pb-abi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Avoid libudev so packs load on minimal hosts; enumeration stays in the UI.
+serialport = { version = "4", default-features = false }
+regex = "1"

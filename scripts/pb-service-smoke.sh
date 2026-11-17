@@ -3,10 +3,11 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-cargo build -p pb-mqtt -p pb-opcua -p pb-service -q
+cargo build -p pb-mqtt -p pb-opcua -p pb-streams -p pb-service -q
 mkdir -p modules
 cp -f target/debug/libpb_mqtt.so modules/ 2>/dev/null || true
 cp -f target/debug/libpb_opcua.so modules/ 2>/dev/null || true
+cp -f target/debug/libpb_streams.so modules/ 2>/dev/null || true
 
 pkill -x pb-service 2>/dev/null || true
 sleep 0.2
