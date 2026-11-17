@@ -99,6 +99,9 @@ pub struct PutProjectParams {
     pub project: serde_json::Value,
     #[serde(default)]
     pub auto_run_hubs: bool,
+    /// When set, retarget the service project path before writing (Save as).
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

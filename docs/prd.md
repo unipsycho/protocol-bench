@@ -31,7 +31,7 @@ Moving a value between a serial instrument, a Modbus device, a growing CSV, an M
 - Docked panels (drag titles, tab strips, edge splits). Top bar: File, View, Help, theme chip, settings. Side rail of panel icons.
 - Themes. Hub canvas and panel diagrams keep the scope blue mixed with the theme background.
 - Help → About: centered “Protocol Bench” wordmark, slogan **“Your protocol hub for every stream.”**, version, Agile Automation logo at the bottom.
-- File menu: Open project, Save as project, Quit. View menu: panel toggles, Show all panels, Reset layout.
+- File menu: Open project… (native file dialog), Save project, Save project as…, Recent projects (up to 15), Quit. View menu: panel toggles, Show all panels, Reset layout.
 - Status bar: left message + mock **service connection** (connected / disconnected) for the future always-on service — not a pb-engine host readout.
 - Panels: Project, Hubs, Points, Mappings, Traffic, Streams, Modbus, MQTT, OPC UA, File follow.
 
@@ -85,7 +85,7 @@ Rules:
 
 Today: the window, layout, themes, the hub diagram (Input/Output MQTT binds), the engine thread boundary, host point store (`pb-points`), pack loader, headless `pb-service`, and the **MQTT client pack** (connection + hub-node binds → points / publish; TCP / TLS / WS / WSS).
 
-Not yet: other protocol packs, Sparkplug, license signing enforcement, MSI, full UI↔service IPC / MCP. Embedded MQTT broker (rumqttd) Start/Stop is live in the MQTT panel. No file requester in this build. When one is added, it must not block the UI thread (blocking dialogs / vsync stalls on another Hyprland workspace trip “not responding”).
+Not yet: other protocol packs, Sparkplug, license signing enforcement, MSI, full UI↔service IPC / MCP. Embedded MQTT broker (rumqttd) Start/Stop is live in the MQTT panel. Project open/save uses a native file requester (`rfd`) on a worker thread so the egui loop never blocks (Hyprland stalls if the dialog runs on the UI thread).
 
 ## Protocols
 

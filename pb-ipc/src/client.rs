@@ -209,12 +209,14 @@ impl RemoteHandle {
         &self,
         project: serde_json::Value,
         auto_run_hubs: bool,
+        path: Option<String>,
     ) -> Result<(), String> {
         self.call(
             METHOD_PUT_PROJECT,
             serde_json::to_value(PutProjectParams {
                 project,
                 auto_run_hubs,
+                path,
             })
             .map_err(|e| e.to_string())?,
         )

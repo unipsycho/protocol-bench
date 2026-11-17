@@ -80,7 +80,11 @@ impl Runtime {
         &mut self,
         value: serde_json::Value,
         auto_run_hubs: bool,
+        path: Option<PathBuf>,
     ) -> Result<(), String> {
+        if let Some(path) = path {
+            self.project_path = path;
+        }
         self.auto_run_hubs = auto_run_hubs;
         self.apply_project_value(value.clone(), auto_run_hubs)?;
         self.persist(&value)

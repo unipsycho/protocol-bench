@@ -1,6 +1,7 @@
 //! Protocol Bench shell: menu bar, icon rail, docked panes, themes.
 
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
@@ -76,7 +77,8 @@ pub struct ProtocolBenchApp {
     /// Last dock layout written to project.json (PB-95).
     layout_saved: DockLayout,
     last_project_save: Instant,
-    project_dialog: Option<ProjectDialog>,
+    /// Native open/save dialog running off the UI thread (Hyprland-safe).
+    file_pick: Option<PendingFilePick>,
     /// Live host snapshot for Calc/Agg/points — refreshed on poll, not mouse FPS (PB-64).
     live_host: HostSnapshot,
     live_points_fp: u64,
@@ -85,9 +87,15 @@ pub struct ProtocolBenchApp {
     last_service_poll: Instant,
 }
 
-enum ProjectDialog {
-    Open { path: String },
-    SaveAs { path: String },
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilePickKind {
+    Open,
+    SaveAs,
+}
+
+struct PendingFilePick {
+    kind: FilePickKind,
+    rx: Receiver<Option<PathBuf>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -100,7 +108,9 @@ enum BarMenu {
 
 enum MenuAction {
     OpenProject,
+    SaveProject,
     SaveAsProject,
+    OpenRecent(PathBuf),
     ResetLayout,
     Quit,
     About,
@@ -248,7 +258,7 @@ impl ProtocolBenchApp {
             hubs_saved,
             layout_saved,
             last_project_save: Instant::now(),
-            project_dialog: None,
+            file_pick: None,
             live_host,
             live_points_fp,
             last_live_poll: Instant::now(),
@@ -256,6 +266,9 @@ impl ProtocolBenchApp {
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
         };
+        if persist::note_recent_project(&mut app.ui_state, &app.project_path) {
+            app.mark_dirty();
+        }
         if seed_layout {
             let _ = app.save_project_now();
         }
@@ -422,10 +435,14 @@ impl ProtocolBenchApp {
             settings: self.project_settings.clone(),
             layout: Some(layout.clone()),
         };
-        // Service owns project.json — persist only via IPC.
+        // Service owns project.json — persist only via IPC (pass path so Save as retargets).
         let value = serde_json::to_value(&file).map_err(|e| e.to_string())?;
-        self.engine
-            .put_project_json(value, self.ui_state.auto_run_embedded_hubs)?;
+        let path = Some(self.project_path.display().to_string());
+        self.engine.put_project_json(
+            value,
+            self.ui_state.auto_run_embedded_hubs,
+            path,
+        )?;
         self.mqtt_saved = mqtt;
         self.http_saved = http;
         self.streams_saved = streams;
@@ -433,10 +450,18 @@ impl ProtocolBenchApp {
         self.settings_saved = self.project_settings.clone();
         self.layout_saved = layout;
         self.last_project_save = Instant::now();
+        if persist::note_recent_project(&mut self.ui_state, &self.project_path) {
+            self.mark_dirty();
+        }
         Ok(())
     }
 
     fn load_project_from_path(&mut self, path: PathBuf) -> Result<(), String> {
+        if !path.is_file() {
+            let _ = persist::remove_recent_project(&mut self.ui_state, &path);
+            self.mark_dirty();
+            return Err(format!("File not found: {}", path.display()));
+        }
         let auto_run = self.ui_state.auto_run_embedded_hubs;
         self.engine
             .open_project(&path.display().to_string(), auto_run)?;
@@ -482,6 +507,9 @@ impl ProtocolBenchApp {
             &self.ui_state.hubs,
             self.ui_state.auto_run_embedded_hubs,
         );
+        if persist::note_recent_project(&mut self.ui_state, &self.project_path) {
+            self.mark_dirty();
+        }
         self.status = format!("Opened {}", self.project_path.display());
         if seed_layout {
             let _ = self.save_project_now();
@@ -489,92 +517,92 @@ impl ProtocolBenchApp {
         Ok(())
     }
 
-    fn project_dialog_window(&mut self, ctx: &egui::Context, p: &ThemePalette) {
-        let Some(dialog) = self.project_dialog.as_ref() else {
-            return;
-        };
-        let title = match dialog {
-            ProjectDialog::Open { .. } => "Open project",
-            ProjectDialog::SaveAs { .. } => "Save project as",
-        };
-        let is_open = matches!(dialog, ProjectDialog::Open { .. });
-        let mut path_buf = match dialog {
-            ProjectDialog::Open { path } | ProjectDialog::SaveAs { path } => path.clone(),
-        };
-        let mut open = true;
-        let mut commit = false;
-        let mut cancel = false;
-        egui::Window::new(title)
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(520.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "JSON project (MQTT connections, hub Input/Output binds, points). Path entry avoids Hyprland file-dialog stalls.",
-                    )
-                    .font(font_ui(12.0))
-                    .color(p.muted),
-                );
-                ui.add_space(8.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut path_buf)
-                        .desired_width(ui.available_width())
-                        .hint_text("/path/to/project.json"),
-                );
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    let primary = if is_open { "Open" } else { "Save" };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(primary)
-                                    .font(font_ui(12.5))
-                                    .color(Color32::from_rgb(0x12, 0x14, 0x18)),
-                            )
-                            .fill(p.accent),
-                        )
-                        .clicked()
-                    {
-                        commit = true;
-                    }
-                    ui.add_space(10.0);
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-        if let Some(dialog) = self.project_dialog.as_mut() {
-            match dialog {
-                ProjectDialog::Open { path } | ProjectDialog::SaveAs { path } => {
-                    *path = path_buf.clone();
-                }
-            }
+    /// Append `.json` when the save dialog left the extension off.
+    fn ensure_project_ext(path: PathBuf) -> PathBuf {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) if !ext.is_empty() => path,
+            _ => path.with_extension("json"),
         }
-        if !open || cancel {
-            self.project_dialog = None;
+    }
+
+    /// Spawn a portal/GTK file dialog on a worker thread (never block the egui loop).
+    fn begin_file_pick(&mut self, kind: FilePickKind) {
+        if self.file_pick.is_some() {
+            self.status = "A file dialog is already open".into();
             return;
         }
-        if commit {
-            self.project_dialog = None;
-            let path = PathBuf::from(path_buf.trim());
-            if path.as_os_str().is_empty() {
-                self.status = "Project path is empty".into();
-                return;
+        let (tx, rx) = mpsc::channel();
+        let start_dir = self
+            .project_path
+            .parent()
+            .filter(|p| p.as_os_str().len() > 0)
+            .map(|p| p.to_path_buf())
+            .or_else(|| directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()));
+        let default_name = self
+            .project_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project.json")
+            .to_string();
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new()
+                .add_filter("Protocol Bench project", &["json"])
+                .add_filter("All files", &["*"]);
+            if let Some(dir) = start_dir {
+                dlg = dlg.set_directory(dir);
             }
-            if is_open {
-                if let Err(err) = self.load_project_from_path(path) {
-                    self.status = format!("Open failed: {err}");
-                }
-            } else {
-                self.project_path = path;
-                match self.save_project_now() {
-                    Ok(()) => {
-                        self.status = format!("Saved {}", self.project_path.display());
+            let picked = match kind {
+                FilePickKind::Open => dlg.set_title("Open project").pick_file(),
+                FilePickKind::SaveAs => dlg
+                    .set_title("Save project as")
+                    .set_file_name(&default_name)
+                    .save_file(),
+            };
+            let _ = tx.send(picked);
+        });
+        self.file_pick = Some(PendingFilePick { kind, rx });
+        self.status = match kind {
+            FilePickKind::Open => "Choose a project to open…".into(),
+            FilePickKind::SaveAs => "Choose where to save the project…".into(),
+        };
+    }
+
+    fn poll_file_pick(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.file_pick.as_ref() else {
+            return;
+        };
+        // Keep frames alive while the portal dialog is up.
+        ctx.request_repaint_after(Duration::from_millis(100));
+        let kind = pending.kind;
+        match pending.rx.try_recv() {
+            Ok(Some(path)) => {
+                self.file_pick = None;
+                match kind {
+                    FilePickKind::Open => {
+                        if let Err(err) = self.load_project_from_path(path) {
+                            self.status = format!("Open failed: {err}");
+                        }
                     }
-                    Err(err) => self.status = format!("Save failed: {err}"),
+                    FilePickKind::SaveAs => {
+                        self.project_path = Self::ensure_project_ext(path);
+                        match self.save_project_now() {
+                            Ok(()) => {
+                                self.status =
+                                    format!("Saved {}", self.project_path.display());
+                            }
+                            Err(err) => self.status = format!("Save failed: {err}"),
+                        }
+                    }
                 }
+            }
+            Ok(None) => {
+                self.file_pick = None;
+                self.status = "Cancelled".into();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.file_pick = None;
+                self.status = "File dialog failed".into();
             }
         }
     }
@@ -603,15 +631,18 @@ impl ProtocolBenchApp {
         self.menu = None;
         match action {
             MenuAction::Close => {}
-            MenuAction::OpenProject => {
-                self.project_dialog = Some(ProjectDialog::Open {
-                    path: self.project_path.display().to_string(),
-                });
-            }
-            MenuAction::SaveAsProject => {
-                self.project_dialog = Some(ProjectDialog::SaveAs {
-                    path: self.project_path.display().to_string(),
-                });
+            MenuAction::OpenProject => self.begin_file_pick(FilePickKind::Open),
+            MenuAction::SaveProject => match self.save_project_now() {
+                Ok(()) => {
+                    self.status = format!("Saved {}", self.project_path.display());
+                }
+                Err(err) => self.status = format!("Save failed: {err}"),
+            },
+            MenuAction::SaveAsProject => self.begin_file_pick(FilePickKind::SaveAs),
+            MenuAction::OpenRecent(path) => {
+                if let Err(err) = self.load_project_from_path(path) {
+                    self.status = format!("Open failed: {err}");
+                }
             }
             MenuAction::ResetLayout => self.reset_layout(),
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -689,7 +720,7 @@ impl eframe::App for ProtocolBenchApp {
         self.pane_rail(ctx, &p);
         self.settings_drawer(ctx, &p, &host_for_panes);
         self.about_window(ctx, &p);
-        self.project_dialog_window(ctx, &p);
+        self.poll_file_pick(ctx);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -869,12 +900,35 @@ impl ProtocolBenchApp {
         p: &ThemePalette,
         action: &mut Option<MenuAction>,
     ) {
+        let recent = self.ui_state.recent_projects.clone();
         self.popup(ctx, anchor, BarMenu::File, p, action, |ui, action| {
-            if menu_row(ui, "Open project", None, p).clicked() {
+            if menu_row(ui, "Open project…", None, p).clicked() {
                 *action = Some(MenuAction::OpenProject);
             }
-            if menu_row(ui, "Save as project", None, p).clicked() {
+            if menu_row(ui, "Save project", None, p).clicked() {
+                *action = Some(MenuAction::SaveProject);
+            }
+            if menu_row(ui, "Save project as…", None, p).clicked() {
                 *action = Some(MenuAction::SaveAsProject);
+            }
+            menu_sep(ui, p);
+            ui.label(
+                egui::RichText::new("RECENT PROJECTS")
+                    .font(font_ui(10.0))
+                    .color(p.muted),
+            );
+            ui.add_space(2.0);
+            if recent.is_empty() {
+                let _ = menu_row(ui, "(none yet)", None, p);
+            } else {
+                for path in &recent {
+                    let label = persist::recent_project_label(path);
+                    let resp = menu_row(ui, &label, None, p);
+                    resp.clone().on_hover_text(path);
+                    if resp.clicked() {
+                        *action = Some(MenuAction::OpenRecent(PathBuf::from(path)));
+                    }
+                }
             }
             menu_sep(ui, p);
             if menu_row(ui, "Quit", None, p).clicked() {
