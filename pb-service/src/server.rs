@@ -137,7 +137,13 @@ fn dispatch(
                 Ok(p) => p,
                 Err(e) => return Response::err(id, e.to_string()),
             };
-            match rt.put_project(params.project, params.auto_run_hubs) {
+            let path = params
+                .path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            match rt.put_project(params.project, params.auto_run_hubs, path) {
                 Ok(()) => Response::ok(id, serde_json::json!({ "ok": true })),
                 Err(e) => Response::err(id, e),
             }

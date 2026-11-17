@@ -2,12 +2,15 @@
 //! Authoritative dock layout for a project lives in `project.json` (PB-95).
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::dock::DockPane;
 use crate::hubs::HubModel;
 use crate::layout::{LayoutNode, TileEdge};
 use crate::theme::AppTheme;
+
+/// Cap for File → Recent projects (MRU, stored in `ui.toml`).
+pub const MAX_RECENT_PROJECTS: usize = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiState {
@@ -26,6 +29,9 @@ pub struct UiState {
     /// App-level: start MQTT + OPC UA embedded hubs on load when configured (PB-58).
     #[serde(default)]
     pub auto_run_embedded_hubs: bool,
+    /// Most-recently-used project paths (absolute when possible), newest first.
+    #[serde(default)]
+    pub recent_projects: Vec<String>,
 }
 
 fn default_theme() -> String {
@@ -41,7 +47,59 @@ impl Default for UiState {
             hidden_panes: Vec::new(),
             hubs: HubModel::sample(),
             auto_run_embedded_hubs: false,
+            recent_projects: Vec::new(),
         }
+    }
+}
+
+/// Push `path` to the front of recent projects (dedupe, cap at [`MAX_RECENT_PROJECTS`]).
+/// Returns true when the list changed.
+pub fn note_recent_project(state: &mut UiState, path: &Path) -> bool {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let s = path.display().to_string();
+    if s.trim().is_empty() {
+        return false;
+    }
+    let before = state.recent_projects.clone();
+    state.recent_projects.retain(|p| p != &s);
+    state.recent_projects.insert(0, s);
+    if state.recent_projects.len() > MAX_RECENT_PROJECTS {
+        state.recent_projects.truncate(MAX_RECENT_PROJECTS);
+    }
+    state.recent_projects != before
+}
+
+/// Drop a missing / unwanted recent entry.
+pub fn remove_recent_project(state: &mut UiState, path: &Path) -> bool {
+    let s = path.display().to_string();
+    let canon = std::fs::canonicalize(path)
+        .ok()
+        .map(|p| p.display().to_string());
+    let n = state.recent_projects.len();
+    state.recent_projects.retain(|p| {
+        if p == &s {
+            return false;
+        }
+        if let Some(c) = canon.as_ref() {
+            if p == c {
+                return false;
+            }
+        }
+        true
+    });
+    state.recent_projects.len() != n
+}
+
+/// Compact menu label: `name — parent` (full path stays on hover).
+pub fn recent_project_label(path: &str) -> String {
+    let p = Path::new(path);
+    match (
+        p.file_name().and_then(|s| s.to_str()),
+        p.parent().map(|parent| parent.display().to_string()),
+    ) {
+        (Some(name), Some(parent)) if !parent.is_empty() => format!("{name} — {parent}"),
+        (Some(name), _) => name.to_string(),
+        _ => path.to_string(),
     }
 }
 
@@ -158,5 +216,25 @@ mod tests {
         assert!(state.pane_visible(last));
         assert!(!state.toggle_pane_visible(last));
         assert!(state.pane_visible(last));
+    }
+
+    #[test]
+    fn recent_projects_mru_dedupe_and_cap() {
+        let mut state = UiState::default();
+        for i in 0..20 {
+            assert!(note_recent_project(
+                &mut state,
+                Path::new(&format!("/tmp/pb-recent-{i}.json"))
+            ));
+        }
+        assert_eq!(state.recent_projects.len(), MAX_RECENT_PROJECTS);
+        assert!(state.recent_projects[0].ends_with("pb-recent-19.json"));
+        // Re-open an older entry — moves to front, no growth.
+        let older = state.recent_projects[5].clone();
+        assert!(note_recent_project(&mut state, Path::new(&older)));
+        assert_eq!(state.recent_projects[0], older);
+        assert_eq!(state.recent_projects.len(), MAX_RECENT_PROJECTS);
+        assert!(remove_recent_project(&mut state, Path::new(&older)));
+        assert!(!state.recent_projects.iter().any(|p| p == &older));
     }
 }

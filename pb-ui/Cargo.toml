@@ -24,3 +24,5 @@ directories = { workspace = true }
 image = { workspace = true }
 chrono = { workspace = true }
 ureq = { version = "2.12", features = ["json"] }
+# Native open/save; spawned off the UI thread (Hyprland stalls if blocking).
+rfd = "0.15"
