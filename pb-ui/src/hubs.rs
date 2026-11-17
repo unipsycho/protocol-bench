@@ -4749,48 +4749,9 @@ fn edit_streams_port_binds(
             }
         }
 
-        let mut remove = None;
-        {
-            let port = port_field(model, hub_id, port_id);
-            if port.stream_inputs.is_empty() {
-                ui.label(
-                    egui::RichText::new("No binds — add a field below (host assigns stream_N).")
-                        .font(font_ui(11.0))
-                        .color(p.muted),
-                );
-            } else {
-                for (i, bind) in port.stream_inputs.iter().enumerate() {
-                    let id = if bind.point.is_empty() {
-                        "stream_N".to_string()
-                    } else {
-                        bind.point.clone()
-                    };
-                    let field = if bind.field.is_empty() {
-                        "(whole)".to_string()
-                    } else {
-                        bind.field.clone()
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{id}  ·  field {field}"))
-                                .font(font_ui(12.0))
-                                .color(p.text),
-                        );
-                        if text_button(ui, "×", false, p).clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                }
-            }
-        }
-        if let Some(i) = remove {
-            port_field(model, hub_id, port_id).stream_inputs.remove(i);
-            change.dirty = true;
-        }
-
         ui.add_space(space::SECTION - 2.0);
         ui.label(
-            egui::RichText::new("SAMPLE LINE — click a field index to bind")
+            egui::RichText::new("SAMPLE LINE")
                 .font(font_ui(10.5))
                 .color(p.muted),
         );
@@ -4800,41 +4761,64 @@ fn edit_streams_port_binds(
             ui.add(
                 egui::TextEdit::multiline(&mut port.draft_stream_sample)
                     .desired_width(ui.available_width().max(120.0))
-                    .desired_rows(3)
+                    .desired_rows(2)
                     .hint_text("12.5,OK,2024-01-01T00:00:00Z")
                     .margin(egui::Margin::symmetric(6.0, 4.0)),
             );
         }
+
         let sample = port_field(model, hub_id, port_id).draft_stream_sample.clone();
         let parser = port_field(model, hub_id, port_id).stream_parser.clone();
         let widths = port_field(model, hub_id, port_id).stream_fixed_widths.clone();
         let regex = port_field(model, hub_id, port_id).stream_regex.clone();
         let fields = sample_fields(&sample, &parser, &widths, &regex);
+        let bound: Vec<String> = port_field(model, hub_id, port_id)
+            .stream_inputs
+            .iter()
+            .map(|b| b.field.clone())
+            .collect();
+
+        ui.add_space(space::AFTER_FIELD);
+        ui.label(
+            egui::RichText::new(format!(
+                "PREVIEW FIELDS · {}",
+                parser_delimiter_hint(&parser)
+            ))
+            .font(font_ui(10.5))
+            .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        ui.label(
+            egui::RichText::new("Click or drag a field onto Binds — host assigns stream_N.")
+                .font(font_ui(11.0))
+                .color(p.muted),
+        );
+        ui.add_space(4.0);
+
         let mut add_field: Option<String> = None;
-        for (i, val) in fields.iter().enumerate() {
-            let key = i.to_string();
-            let label = format!("[{i}] {val}");
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new(label).font(font_ui(12.0)).color(p.text))
-                        .fill(p.control)
-                        .stroke(Stroke::new(1.0, p.line)),
-                )
-                .clicked()
-            {
-                add_field = Some(key);
-            }
-        }
+        change.dirty |= paint_stream_scan_field_chips(
+            ui,
+            port_id,
+            &fields,
+            &parser,
+            &bound,
+            p,
+            &mut add_field,
+        );
         if let Some(field) = add_field {
-            let port = port_field(model, hub_id, port_id);
-            if !port.stream_inputs.iter().any(|b| b.field == field) {
-                port.stream_inputs.push(StreamInputBind {
-                    field,
-                    point: String::new(),
-                });
+            if add_stream_input_bind(port_field(model, hub_id, port_id), field) {
                 change.dirty = true;
             }
         }
+
+        ui.add_space(space::SECTION - 2.0);
+        ui.label(
+            egui::RichText::new("BINDS → Points")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        change.dirty |= paint_stream_input_binds_dnd(ui, model, hub_id, port_id, &fields, p);
 
         ui.add_space(space::AFTER_FIELD);
         let mut add_manual = false;
@@ -4848,21 +4832,8 @@ fn edit_streams_port_binds(
         if add_manual {
             let port = port_field(model, hub_id, port_id);
             let field = port.draft_stream_field.trim().to_string();
-            if !field.is_empty() && !port.stream_inputs.iter().any(|b| b.field == field) {
-                port.stream_inputs.push(StreamInputBind {
-                    field,
-                    point: String::new(),
-                });
+            if add_stream_input_bind(port, field) {
                 port.draft_stream_field.clear();
-                change.dirty = true;
-            } else if field.is_empty()
-                && parser == "whole_line"
-                && !port.stream_inputs.iter().any(|b| b.field.is_empty())
-            {
-                port.stream_inputs.push(StreamInputBind {
-                    field: String::new(),
-                    point: String::new(),
-                });
                 change.dirty = true;
             }
         }
@@ -5151,6 +5122,270 @@ fn paint_stream_emit_dnd(
         }
     }
     dirty
+}
+
+fn parser_delimiter_hint(parser: &str) -> &'static str {
+    match parser {
+        "csv" => "CSV · comma",
+        "tsv" => "TSV · tab",
+        "whitespace" => "whitespace",
+        "fixed" => "fixed widths",
+        "regex" => "regex groups",
+        _ => "whole line",
+    }
+}
+
+fn stream_field_key(parser: &str, index: usize) -> String {
+    if parser == "whole_line" {
+        String::new()
+    } else {
+        index.to_string()
+    }
+}
+
+fn add_stream_input_bind(port: &mut HubPort, field: String) -> bool {
+    let field = field.trim().to_string();
+    let whole = field.is_empty();
+    if whole {
+        if port.stream_parser != "whole_line" {
+            return false;
+        }
+        if port.stream_inputs.iter().any(|b| b.field.is_empty()) {
+            return false;
+        }
+        port.stream_inputs.push(StreamInputBind {
+            field: String::new(),
+            point: String::new(),
+        });
+        return true;
+    }
+    if port.stream_inputs.iter().any(|b| b.field == field) {
+        return false;
+    }
+    port.stream_inputs.push(StreamInputBind {
+        field,
+        point: String::new(),
+    });
+    true
+}
+
+/// Visual preview chips for parsed sample fields — click or drag onto Binds.
+fn paint_stream_scan_field_chips(
+    ui: &mut Ui,
+    port_id: u64,
+    fields: &[String],
+    parser: &str,
+    bound: &[String],
+    p: &ThemePalette,
+    add_field: &mut Option<String>,
+) -> bool {
+    use crate::point_rows::StreamScanFieldDrag;
+
+    if fields.is_empty() {
+        ui.label(
+            egui::RichText::new("Paste a sample line above to preview fields.")
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        return false;
+    }
+
+    let mut dirty = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+        for (i, val) in fields.iter().enumerate() {
+            let key = stream_field_key(parser, i);
+            let already = bound.iter().any(|b| b == &key);
+            let title = if parser == "whole_line" {
+                format!("whole  {}", truncate_preview(val, 28))
+            } else {
+                format!("[{i}]  {}", truncate_preview(val, 22))
+            };
+            let drag_id = ui.id().with(("pb_stream_scan_chip", port_id, i));
+            let chip = ui.dnd_drag_source(
+                drag_id,
+                StreamScanFieldDrag { field: key.clone() },
+                |ui| {
+                    let fill = if already {
+                        tint(p.accent, 28)
+                    } else {
+                        p.control
+                    };
+                    let stroke = if already {
+                        Stroke::new(1.0, p.accent)
+                    } else {
+                        Stroke::new(1.0, p.line)
+                    };
+                    let resp = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new(title).font(font_ui(12.0)).color(p.text),
+                        )
+                        .fill(fill)
+                        .stroke(stroke)
+                        .rounding(Rounding::same(4.0)),
+                    );
+                    if resp.hovered() && !already {
+                        ui.painter().rect_stroke(
+                            resp.rect.expand(1.0),
+                            Rounding::same(4.0),
+                            Stroke::new(1.5, p.accent),
+                        );
+                    }
+                    if resp.clicked() && !already {
+                        *add_field = Some(key.clone());
+                        dirty = true;
+                    }
+                    let tip = if already {
+                        "Already bound"
+                    } else {
+                        "Click to bind, or drag onto Binds → Points"
+                    };
+                    resp.on_hover_text(format!("{tip}\n{val}"));
+                },
+            );
+            if !already && !ui.ctx().is_being_dragged(drag_id) {
+                chip.response.on_hover_cursor(CursorIcon::Grab);
+            }
+        }
+    });
+    dirty
+}
+
+/// Tight bind list + drop zone for preview field chips.
+fn paint_stream_input_binds_dnd(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    hub_id: u64,
+    port_id: u64,
+    fields: &[String],
+    p: &ThemePalette,
+) -> bool {
+    use crate::point_rows::StreamScanFieldDrag;
+
+    const ROW_H: f32 = 18.0;
+    const REMOVE_W: f32 = 18.0;
+
+    let mut dirty = false;
+    let mut remove = None;
+
+    let frame = egui::Frame::none()
+        .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+        .rounding(Rounding::same(4.0))
+        .stroke(Stroke::new(1.0, p.line));
+
+    let (_zone, dropped) = ui.dnd_drop_zone::<StreamScanFieldDrag, _>(frame, |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let n = port_field(model, hub_id, port_id).stream_inputs.len();
+        if n == 0 {
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width().max(1.0), ROW_H), Sense::hover());
+            ui.painter().text(
+                Pos2::new(rect.min.x + 4.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                "Drop a preview field here (or click a chip).",
+                font_ui(12.0),
+                p.muted,
+            );
+        }
+        for i in 0..n {
+            let bind = port_field(model, hub_id, port_id).stream_inputs[i].clone();
+            let point = if bind.point.is_empty() {
+                "stream_N".to_string()
+            } else {
+                bind.point.clone()
+            };
+            let field_label = if bind.field.is_empty() {
+                "whole".to_string()
+            } else {
+                format!("field {}", bind.field)
+            };
+            let preview = bind
+                .field
+                .parse::<usize>()
+                .ok()
+                .and_then(|idx| fields.get(idx))
+                .cloned()
+                .or_else(|| {
+                    if bind.field.is_empty() {
+                        fields.first().cloned()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            let row_w = ui.available_width().max(1.0);
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(row_w, ROW_H), Sense::hover());
+            let hot = ui.rect_contains_pointer(rect);
+            if hot {
+                ui.painter()
+                    .rect_filled(rect, Rounding::same(4.0), tint(p.accent, 18));
+            }
+            let rm = Rect::from_min_max(
+                Pos2::new(rect.max.x - REMOVE_W, rect.min.y),
+                rect.max,
+            );
+            let label = Rect::from_min_max(rect.min, Pos2::new(rm.min.x - 2.0, rect.max.y));
+            let text = if preview.is_empty() {
+                format!("{point}  ·  {field_label}")
+            } else {
+                format!(
+                    "{point}  ·  {field_label}  ·  {}",
+                    truncate_preview(&preview, 24)
+                )
+            };
+            ui.painter().text(
+                Pos2::new(label.min.x + 4.0, label.center().y),
+                Align2::LEFT_CENTER,
+                text,
+                font_ui(12.0),
+                p.text,
+            );
+            let rm_click =
+                ui.interact(rm, ui.id().with(("stream_in_rm", port_id, i)), Sense::click());
+            if rm_click.hovered() {
+                ui.painter()
+                    .rect_filled(rm, Rounding::same(4.0), tint(p.accent, 20));
+            }
+            ui.painter().text(
+                rm.center(),
+                Align2::CENTER_CENTER,
+                "×",
+                font_ui(13.0),
+                if rm_click.hovered() { p.accent } else { p.muted },
+            );
+            if rm_click.clicked() {
+                remove = Some(i);
+            }
+            rm_click.on_hover_cursor(CursorIcon::PointingHand);
+        }
+    });
+
+    if let Some(payload) = dropped {
+        if add_stream_input_bind(
+            port_field(model, hub_id, port_id),
+            payload.field.clone(),
+        ) {
+            dirty = true;
+        }
+    }
+    if let Some(i) = remove {
+        let binds = &mut port_field(model, hub_id, port_id).stream_inputs;
+        if i < binds.len() {
+            binds.remove(i);
+            dirty = true;
+        }
+    }
+    dirty
+}
+
+fn truncate_preview(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let taken: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{taken}…")
+    } else {
+        taken
+    }
 }
 
 /// Split a sample line for clickable field picks (UI authoring only).

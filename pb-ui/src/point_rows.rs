@@ -17,6 +17,13 @@ pub enum PointEmitDrag {
     ReorderEmit(usize),
 }
 
+/// Drag payload: Streams Input preview field chip → bind list (`stream_N`).
+#[derive(Clone, Debug)]
+pub struct StreamScanFieldDrag {
+    /// Field index string (`"0"`, `"1"`, …) or empty for whole-line.
+    pub field: String,
+}
+
 /// Skip placeholder template ids (`mqtt_N`, `stream_N`, …).
 pub fn is_draggable_point_id(id: &str) -> bool {
     let id = id.trim();
