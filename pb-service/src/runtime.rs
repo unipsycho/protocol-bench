@@ -251,6 +251,22 @@ fn materialize_hub_binds_json(value: &serde_json::Value, store: &mut PointStore)
                         }
                     }
                 }
+                let stream_endpoint = port
+                    .get("stream_endpoint")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(binds) = port.get("stream_inputs").and_then(|v| v.as_array()) {
+                    for bind in binds {
+                        let field = bind.get("field").and_then(|v| v.as_str()).unwrap_or("");
+                        let source = stream_bind_source(stream_endpoint, field);
+                        let point = bind.get("point").and_then(|v| v.as_str()).unwrap_or("");
+                        if point.is_empty() {
+                            let _ = store.ensure_id("stream", &source);
+                        } else {
+                            store.bind(point, &source);
+                        }
+                    }
+                }
             }
         }
         if let Some(aggs) = hub.get("aggregators").and_then(|v| v.as_array()) {
@@ -296,6 +312,21 @@ fn http_bind_source(conn: &str, url_path: &str, json_path: &str) -> String {
         base
     } else {
         format!("{base}::{json_path}")
+    }
+}
+
+fn stream_bind_source(endpoint: &str, field: &str) -> String {
+    let endpoint = endpoint.trim();
+    let field = field.trim();
+    let base = if endpoint.is_empty() {
+        "stream".to_string()
+    } else {
+        format!("stream/{endpoint}")
+    };
+    if field.is_empty() {
+        base
+    } else {
+        format!("{base}::{field}")
     }
 }
 

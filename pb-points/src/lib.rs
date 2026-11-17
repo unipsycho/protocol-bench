@@ -1,7 +1,7 @@
 //! Host-owned typed points. Protocol packs never own this store — they upsert
 //! only through the pack ABI host callbacks that the service wires here.
 //!
-//! Point **identity** is a short id `XXXX_n` (3–4 char protocol code + `_` +
+//! Point **identity** is a short id `XXXX_n` (3–6 char protocol code + `_` +
 //! sequential decimal, e.g. `mqtt_1`). Numbers are never reused within a
 //! project. The long wire address (broker/topic/field) lives in `source`.
 
@@ -325,13 +325,13 @@ impl PointStore {
     }
 }
 
-/// `mqtt_1`-style short ids (3–4 char proto + `_` + decimal sequence).
+/// `mqtt_1` / `stream_1`-style short ids (3–6 char proto + `_` + decimal sequence).
 pub fn is_short_point_id(name: &str) -> bool {
     let Some((proto, suffix)) = name.split_once('_') else {
         return false;
     };
     let plen = proto.len();
-    if !(3..=4).contains(&plen) || !proto.chars().all(|c| c.is_ascii_alphanumeric()) {
+    if !(3..=6).contains(&plen) || !proto.chars().all(|c| c.is_ascii_alphanumeric()) {
         return false;
     }
     !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
@@ -348,7 +348,7 @@ fn protocol_code(source: &str) -> Option<&str> {
     if s.is_empty() || is_address_path(s) {
         return None;
     }
-    if (3..=4).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric()) {
+    if (3..=6).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric()) {
         Some(s)
     } else {
         None
@@ -359,13 +359,13 @@ fn protocol_from_address(address: &str) -> &str {
     address
         .split_once('/')
         .map(|(p, _)| p)
-        .filter(|p| (3..=4).contains(&p.len()))
+        .filter(|p| (3..=6).contains(&p.len()))
         .unwrap_or("mqtt")
 }
 
 fn normalize_proto(proto: &str) -> String {
     let p = proto.trim().to_ascii_lowercase();
-    if (3..=4).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphanumeric()) {
+    if (3..=6).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphanumeric()) {
         p
     } else {
         "mqtt".into()

@@ -462,6 +462,22 @@ pub fn http_bind_source(conn: &str, url_path: &str, json_path: &str) -> String {
     }
 }
 
+/// Streams wire address: `stream/<endpoint>[::<field>]`.
+pub fn stream_bind_source(endpoint: &str, field: &str) -> String {
+    let endpoint = endpoint.trim();
+    let field = field.trim();
+    let base = if endpoint.is_empty() {
+        "stream".to_string()
+    } else {
+        format!("stream/{endpoint}")
+    };
+    if field.is_empty() {
+        base
+    } else {
+        format!("{base}::{field}")
+    }
+}
+
 /// Global Points panel rows: live bus + Hub Input bind / aggregator placeholders.
 ///
 /// Honest empty only when there are no host points and no Input/agg binds.
@@ -574,6 +590,33 @@ pub fn rows_for_points_panel(
                         });
                     }
                 }
+                HubProto::Streams => {
+                    let endpoint = port.stream_endpoint.as_str();
+                    for bind in &port.stream_inputs {
+                        // Whole-line binds may leave field empty — still list them.
+                        let source = stream_bind_source(endpoint, bind.field.trim());
+                        let id = if bind.point.trim().is_empty() {
+                            "stream_N".to_string()
+                        } else {
+                            bind.point.trim().to_string()
+                        };
+                        if seen.contains(&id) {
+                            continue;
+                        }
+                        seen.insert(id.clone());
+                        rows.push(PointsTableRow {
+                            id,
+                            source,
+                            value: "—".into(),
+                            quality: "uncertain".into(),
+                            updated: "—".into(),
+                            updated_ms: 0,
+                            bind_index: None,
+                            topic: String::new(),
+                            path: bind.field.clone(),
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -662,7 +705,7 @@ fn is_short_point_id(name: &str) -> bool {
         return false;
     };
     let plen = proto.len();
-    (3..=4).contains(&plen) && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+    (3..=6).contains(&plen) && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
 }
 
 pub fn paint_quality_dot(
