@@ -20,8 +20,8 @@ use crate::opcua_panel::OpcUaPanelState;
 use crate::point_rows;
 use crate::streams_panel::StreamsPanelState;
 use crate::theme::{
-    after_field, apply_form_spacing, blend_scope, divider_bar, font_semi, font_ui, mix, space, tint,
-    ThemePalette, SEP,
+    after_field, apply_form_spacing, blend_scope, divider_bar, font_mono, font_semi, font_ui, mix,
+    space, tint, ThemePalette, SEP,
 };
 use crate::topic_tree::{self, TopicTree, TreeMode};
 
@@ -4052,6 +4052,7 @@ fn edit_port(
             port_id,
             incoming,
             stream_connections,
+            host,
             p,
         ));
     }
@@ -4600,6 +4601,7 @@ fn edit_streams_port_binds(
     port_id: u64,
     incoming: bool,
     stream_connections: &[(String, String)],
+    host: &HostSnapshot,
     p: &ThemePalette,
 ) -> HubChange {
     let mut change = HubChange::quiet();
@@ -4891,7 +4893,7 @@ fn edit_streams_port_binds(
         );
         ui.add_space(4.0);
 
-        change.dirty |= paint_stream_emit_dnd(ui, model, hub_id, port_id, p);
+        change.dirty |= paint_stream_emit_dnd(ui, model, hub_id, port_id, &host.points, p);
 
         let mut add_out = false;
         {
@@ -4917,6 +4919,11 @@ fn edit_streams_port_binds(
                 change.dirty = true;
             }
         }
+
+        // LIVE EMIT — same join/trailer as pb-streams emit_output (UI-side preview).
+        ui.add_space(space::SECTION - 2.0);
+        paint_stream_live_emit(ui, model, hub_id, port_id, &host.points, p);
+
         ui.add_space(space::AFTER_FIELD);
         ui.label(
             egui::RichText::new("TCP listeners broadcast each emit to all connected peers.")
@@ -4931,6 +4938,210 @@ fn edit_streams_port_binds(
 fn renumber_stream_emit_fields(binds: &mut [StreamOutputBind]) {
     for (i, bind) in binds.iter_mut().enumerate() {
         bind.field = i.to_string();
+    }
+}
+
+/// Assembled outbound line preview (mirrors `pb-streams` `emit_output` + `join_fields`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamEmitPreview {
+    /// Wire body without trailer.
+    body: String,
+    /// Escaped trailer for display (`\r\n`, …).
+    trailer_visible: String,
+    /// Emit point ids with no live value yet.
+    missing: Vec<String>,
+}
+
+/// Build field slots by bind field index, then join + trailer (pack-compatible).
+fn assemble_stream_emit_preview(
+    binds: &[StreamOutputBind],
+    layout: &str,
+    eol: &str,
+    eol_custom: &str,
+    host_points: &[PointSnapshot],
+) -> Option<StreamEmitPreview> {
+    if binds.is_empty() {
+        return None;
+    }
+    let mut slots: Vec<(usize, String, String)> = binds
+        .iter()
+        .map(|b| {
+            let idx = b.field.parse::<usize>().unwrap_or(0);
+            let live = host_points.iter().find(|p| p.name == b.point);
+            let val = live.map(|p| p.value.clone()).unwrap_or_default();
+            (idx, b.point.clone(), val)
+        })
+        .collect();
+    slots.sort_by_key(|(i, _, _)| *i);
+    let max = slots.last().map(|(i, _, _)| *i).unwrap_or(0);
+    let mut values = vec![String::new(); max + 1];
+    let mut missing = Vec::new();
+    for (i, point, v) in slots {
+        if v.trim().is_empty() {
+            if !missing.iter().any(|m| m == &point) {
+                missing.push(point);
+            }
+        }
+        if i < values.len() {
+            values[i] = v;
+        }
+    }
+    Some(StreamEmitPreview {
+        body: join_stream_emit_fields(layout, &values),
+        trailer_visible: stream_emit_trailer_visible(eol, eol_custom),
+        missing,
+    })
+}
+
+/// Join emit field values — keep in sync with `pb-streams::parse::join_fields`.
+fn join_stream_emit_fields(layout: &str, values: &[String]) -> String {
+    match layout {
+        "tsv" => values.join("\t"),
+        "whitespace" => values
+            .iter()
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" "),
+        "whole_line" => values.first().cloned().unwrap_or_default(),
+        "fixed" => values
+            .iter()
+            .map(|v| format!("{:<8}", truncate_fixed_emit(v, 8)))
+            .collect(),
+        _ => values.join(","), // csv
+    }
+}
+
+fn truncate_fixed_emit(value: &str, max: usize) -> String {
+    let mut chars = value.chars();
+    let taken: String = chars.by_ref().take(max).collect();
+    if taken.chars().count() >= max {
+        taken
+    } else {
+        format!("{taken:<width$}", width = max)
+    }
+}
+
+fn stream_emit_trailer_visible(eol: &str, custom: &str) -> String {
+    match eol {
+        "crlf" => "\\r\\n".into(),
+        "cr" => "\\r".into(),
+        "none" => String::new(),
+        "custom" => escape_control_chars(custom),
+        _ => "\\n".into(), // lf default
+    }
+}
+
+fn escape_control_chars(s: &str) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        match ch {
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn live_point_value<'a>(host_points: &'a [PointSnapshot], name: &str) -> Option<&'a str> {
+    host_points
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.value.as_str())
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// LIVE EMIT section under the emit map — updates as binds / layout / values change.
+fn paint_stream_live_emit(
+    ui: &mut Ui,
+    model: &HubModel,
+    hub_id: u64,
+    port_id: u64,
+    host_points: &[PointSnapshot],
+    p: &ThemePalette,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(
+            egui::RichText::new("LIVE EMIT")
+                .font(font_ui(10.5))
+                .color(p.live),
+        );
+        ui.label(
+            egui::RichText::new("outgoing line")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+    });
+    ui.add_space(space::AFTER_HEADING);
+
+    let Some(port) = model
+        .hub(hub_id)
+        .and_then(|h| {
+            h.outputs
+                .iter()
+                .chain(h.sources.iter())
+                .find(|p| p.id == port_id)
+        })
+    else {
+        return;
+    };
+    let Some(preview) = assemble_stream_emit_preview(
+        &port.stream_outputs,
+        &port.stream_parser,
+        &port.stream_eol,
+        &port.stream_eol_custom,
+        host_points,
+    ) else {
+        ui.label(
+            egui::RichText::new("Add emit points to preview the outgoing line.")
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        return;
+    };
+
+    let display = if preview.trailer_visible.is_empty() {
+        preview.body.clone()
+    } else {
+        format!("{}{}", preview.body, preview.trailer_visible)
+    };
+    let show = if display.is_empty() {
+        "(empty line)".to_string()
+    } else {
+        // Keep one visual line in the inspector; tabs stay visible as ⇥.
+        display.replace('\t', "⇥")
+    };
+
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width().max(1.0), 28.0),
+        Sense::hover(),
+    );
+    ui.painter()
+        .rect_filled(rect, Rounding::same(4.0), tint(p.accent, 14));
+    ui.painter().text(
+        Pos2::new(rect.min.x + 8.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        truncate_preview(&show, 96),
+        font_mono(12.5),
+        if display.is_empty() { p.muted } else { p.text },
+    );
+    ui.interact(rect, ui.id().with(("pb_stream_live_emit", port_id)), Sense::hover())
+        .on_hover_text(&show);
+
+    if !preview.missing.is_empty() {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "Waiting on: {}",
+                preview.missing.join(", ")
+            ))
+            .font(font_ui(11.0))
+            .color(p.warn),
+        );
     }
 }
 
@@ -4986,6 +5197,7 @@ fn paint_stream_emit_dnd(
     model: &mut HubModel,
     hub_id: u64,
     port_id: u64,
+    host_points: &[PointSnapshot],
     p: &ThemePalette,
 ) -> bool {
     use crate::point_rows::PointEmitDrag;
@@ -5067,10 +5279,13 @@ fn paint_stream_emit_dnd(
                     grip,
                     if hot { p.accent } else { p.muted },
                 );
+                let live = live_point_value(host_points, &bind.point)
+                    .map(|v| truncate_preview(v, 18))
+                    .unwrap_or_else(|| "—".into());
                 ui.painter().text(
                     Pos2::new(label.min.x, label.center().y),
                     Align2::LEFT_CENTER,
-                    format!("{}  →  field {}", bind.point, bind.field),
+                    format!("{}  →  field {}  ·  {}", bind.point, bind.field, live),
                     font_ui(12.0),
                     p.text,
                 );
@@ -7027,5 +7242,51 @@ mod tests {
         assert_eq!(binds[0].field, "0");
         assert_eq!(binds[1].point, "mqtt_1");
         assert_eq!(binds[1].field, "1");
+    }
+
+    #[test]
+    fn stream_live_emit_assembles_csv_with_trailer() {
+        let binds = vec![
+            StreamOutputBind {
+                point: "mqtt_1".into(),
+                field: "0".into(),
+            },
+            StreamOutputBind {
+                point: "mqtt_12".into(),
+                field: "1".into(),
+            },
+        ];
+        let points = vec![
+            PointSnapshot {
+                name: "mqtt_1".into(),
+                value: "12.5".into(),
+                quality: "good".into(),
+                source: "mqtt/local/t".into(),
+                updated_ms: 1,
+            },
+            PointSnapshot {
+                name: "mqtt_12".into(),
+                value: "97.7".into(),
+                quality: "good".into(),
+                source: "mqtt/local/t".into(),
+                updated_ms: 1,
+            },
+        ];
+        let preview =
+            assemble_stream_emit_preview(&binds, "csv", "crlf", "", &points).expect("preview");
+        assert_eq!(preview.body, "12.5,97.7");
+        assert_eq!(preview.trailer_visible, "\\r\\n");
+        assert!(preview.missing.is_empty());
+    }
+
+    #[test]
+    fn stream_live_emit_notes_missing_values() {
+        let binds = vec![StreamOutputBind {
+            point: "mqtt_1".into(),
+            field: "0".into(),
+        }];
+        let preview = assemble_stream_emit_preview(&binds, "csv", "lf", "", &[]).expect("preview");
+        assert_eq!(preview.body, "");
+        assert_eq!(preview.missing, vec!["mqtt_1".to_string()]);
     }
 }
