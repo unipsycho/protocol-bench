@@ -36,15 +36,17 @@ pub enum EngineId {
     Mqtt,
     OpcUa,
     FileFollow,
+    Http,
 }
 
 impl EngineId {
-    pub const ALL: [EngineId; 5] = [
+    pub const ALL: [EngineId; 6] = [
         EngineId::Streams,
         EngineId::Modbus,
         EngineId::Mqtt,
         EngineId::OpcUa,
         EngineId::FileFollow,
+        EngineId::Http,
     ];
 
     pub fn title(self) -> &'static str {
@@ -54,6 +56,7 @@ impl EngineId {
             Self::Mqtt => "MQTT",
             Self::OpcUa => "OPC UA",
             Self::FileFollow => "File follow",
+            Self::Http => "HTTP / REST",
         }
     }
 
@@ -62,14 +65,18 @@ impl EngineId {
         match self {
             Self::Mqtt => Some("mqtt"),
             Self::OpcUa => Some("opcua"),
-            Self::Streams | Self::Modbus | Self::FileFollow => None,
+            Self::Streams => Some("streams"),
+            Self::Http => Some("http"),
+            Self::Modbus | Self::FileFollow => None,
         }
     }
 
     /// What this slot will own once the protocol stack lands. No I/O for idle.
     pub fn note(self) -> &'static str {
         match self {
-            Self::Streams => "Owns serial ports and TCP sockets. No port is open in this build.",
+            Self::Streams => {
+                "Streams / TCP pack — serial + TCP client/listener text framing (scan / emit)."
+            }
             Self::Modbus => "Owns Modbus RTU and TCP sessions. No session is open in this build.",
             Self::Mqtt => {
                 "MQTT client pack (source/output) plus optional embedded rumqttd LAN broker."
@@ -80,6 +87,7 @@ impl EngineId {
             Self::FileFollow => {
                 "Owns file tails and CSV / JSON-lines parsers. No file is open in this build."
             }
+            Self::Http => "HTTP / REST pack — outbound client poll (Input) and JSON body push (Output).",
         }
     }
 
@@ -552,36 +560,59 @@ fn host_main(
             }
         }
 
-        // Live Output publish: when MQTT pack is connected, push transformed values.
+        // Live Output publish: push transformed values to connected egress packs.
         let mqtt_connected = engines
             .iter()
             .find(|e| e.id() == EngineId::Mqtt)
             .map(|e| e.snapshot().connected)
             .unwrap_or(false);
-        if mqtt_connected {
+        let streams_connected = engines
+            .iter()
+            .find(|e| e.id() == EngineId::Streams)
+            .map(|e| e.snapshot().connected)
+            .unwrap_or(false);
+        let http_connected = engines
+            .iter()
+            .find(|e| e.id() == EngineId::Http)
+            .map(|e| e.snapshot().connected)
+            .unwrap_or(false);
+        let any_egress = mqtt_connected || streams_connected || http_connected;
+        if any_egress {
             let force_all = !mqtt_was_connected;
             mqtt_was_connected = true;
-            if let Some(engine) = engines.iter_mut().find(|e| e.id() == EngineId::Mqtt) {
-                let to_pub: Vec<(String, String)> = if force_all {
-                    last_out
-                        .iter()
-                        .map(|(n, v)| (n.clone(), v.clone()))
-                        .collect()
-                } else {
-                    dirty_out
-                };
-                for (name, value) in to_pub {
-                    // Deadband hold: same payload as last publish → skip (no Explorer jitter).
-                    if !force_all && egress_payload.get(&name) == Some(&value) {
+            let to_pub: Vec<(String, String)> = if force_all {
+                last_out
+                    .iter()
+                    .map(|(n, v)| (n.clone(), v.clone()))
+                    .collect()
+            } else {
+                dirty_out
+            };
+            for (name, value) in to_pub {
+                // Deadband hold: same payload as last publish → skip (no Explorer jitter).
+                if !force_all && egress_payload.get(&name) == Some(&value) {
+                    continue;
+                }
+                let mut ok = false;
+                for id in [EngineId::Mqtt, EngineId::Streams, EngineId::Http] {
+                    let connected = match id {
+                        EngineId::Mqtt => mqtt_connected,
+                        EngineId::Streams => streams_connected,
+                        EngineId::Http => http_connected,
+                        _ => false,
+                    };
+                    if !connected {
                         continue;
                     }
-                    let ok = engine.handle(EngineCommand::WritePoint {
-                        name: name.clone(),
-                        value: value.clone(),
-                    });
-                    if ok {
-                        egress_payload.insert(name, value);
+                    if let Some(engine) = engines.iter_mut().find(|e| e.id() == id) {
+                        ok |= engine.handle(EngineCommand::WritePoint {
+                            name: name.clone(),
+                            value: value.clone(),
+                        });
                     }
+                }
+                if ok {
+                    egress_payload.insert(name, value);
                 }
             }
         } else {

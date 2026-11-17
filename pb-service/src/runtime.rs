@@ -149,6 +149,24 @@ impl Runtime {
                 pb_engine::EngineCommand::Configure { json },
             );
         }
+        // Streams / TCP pack — endpoints + hub Input/Output framing maps.
+        if let Some(streams) = value.get("streams") {
+            let hubs = value.get("hubs");
+            let json = build_streams_configure(streams, hubs, auto_run_hubs);
+            self.engine.submit(
+                EngineId::Streams,
+                pb_engine::EngineCommand::Configure { json },
+            );
+        }
+        // HTTP / REST pack — clients + hub poll/push binds.
+        if let Some(http) = value.get("http") {
+            let hubs = value.get("hubs");
+            let json = build_http_configure(http, hubs);
+            self.engine.submit(
+                EngineId::Http,
+                pb_engine::EngineCommand::Configure { json },
+            );
+        }
         self.last_error.clear();
         Ok(())
     }
@@ -485,4 +503,339 @@ fn build_opcua_configure(opcua: &serde_json::Value, auto_run_hubs: bool) -> Stri
         }
     }
     out.to_string()
+}
+
+/// Build Streams pack configure JSON from `streams` panel + hub port maps.
+fn build_streams_configure(
+    streams: &serde_json::Value,
+    hubs: Option<&serde_json::Value>,
+    auto_run_hubs: bool,
+) -> String {
+    let mut endpoints = Vec::new();
+    if let Some(arr) = streams.get("endpoints").and_then(|v| v.as_array()) {
+        for ep in arr {
+            let id = ep
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let mut obj = ep.clone();
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("auto_connect".into(), serde_json::json!(auto_run_hubs));
+            }
+            endpoints.push(obj);
+        }
+    }
+
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    if let Some(hubs) = hubs {
+        let hub_list = hubs
+            .get("hubs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for hub in hub_list {
+            collect_stream_port_maps(&hub, "sources", true, &mut inputs, &mut outputs);
+            collect_stream_port_maps(&hub, "outputs", false, &mut inputs, &mut outputs);
+        }
+    }
+
+    serde_json::json!({
+        "endpoints": endpoints,
+        "inputs": inputs,
+        "outputs": outputs,
+    })
+    .to_string()
+}
+
+fn collect_stream_port_maps(
+    hub: &serde_json::Value,
+    key: &str,
+    incoming: bool,
+    inputs: &mut Vec<serde_json::Value>,
+    outputs: &mut Vec<serde_json::Value>,
+) {
+    let Some(ports) = hub.get(key).and_then(|v| v.as_array()) else {
+        return;
+    };
+    for port in ports {
+        let proto = port
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !proto.eq_ignore_ascii_case("streams") {
+            continue;
+        }
+        let endpoint = port
+            .get("stream_endpoint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if endpoint.is_empty() {
+            continue;
+        }
+        let frame = port
+            .get("stream_frame")
+            .and_then(|v| v.as_str())
+            .unwrap_or("delimited")
+            .to_string();
+        let eol = port
+            .get("stream_eol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("lf")
+            .to_string();
+        let eol_custom = port
+            .get("stream_eol_custom")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let idle_ms = port
+            .get("stream_idle_ms")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(50.0) as u64;
+        let parser = port
+            .get("stream_parser")
+            .and_then(|v| v.as_str())
+            .unwrap_or("csv")
+            .to_string();
+        let fixed_widths = port
+            .get("stream_fixed_widths")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let regex = port
+            .get("stream_regex")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if incoming {
+            let mut binds = Vec::new();
+            if let Some(arr) = port.get("stream_inputs").and_then(|v| v.as_array()) {
+                for bind in arr {
+                    let field = bind
+                        .get("field")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let point = bind
+                        .get("point")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let source = stream_bind_source(&endpoint, &field);
+                    binds.push(serde_json::json!({
+                        "field": field,
+                        "point": point,
+                        "source": source,
+                    }));
+                }
+            }
+            if !binds.is_empty() {
+                inputs.push(serde_json::json!({
+                    "endpoint": endpoint,
+                    "frame": frame,
+                    "eol": eol,
+                    "eol_custom": eol_custom,
+                    "idle_ms": idle_ms,
+                    "parser": parser,
+                    "fixed_widths": fixed_widths,
+                    "regex": regex,
+                    "binds": binds,
+                }));
+            }
+        } else {
+            let mut binds = Vec::new();
+            if let Some(arr) = port.get("stream_outputs").and_then(|v| v.as_array()) {
+                for bind in arr {
+                    let field = bind
+                        .get("field")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let point = bind
+                        .get("point")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if point.is_empty() {
+                        continue;
+                    }
+                    binds.push(serde_json::json!({
+                        "field": field,
+                        "point": point,
+                        "source": "",
+                    }));
+                }
+            }
+            if !binds.is_empty() {
+                outputs.push(serde_json::json!({
+                    "endpoint": endpoint,
+                    "layout": parser,
+                    "eol": eol,
+                    "eol_custom": eol_custom,
+                    "binds": binds,
+                    "interval_ms": 0,
+                }));
+            }
+        }
+    }
+}
+
+fn build_http_configure(http: &serde_json::Value, hubs: Option<&serde_json::Value>) -> String {
+    let mut clients = Vec::new();
+    if let Some(arr) = http.get("clients").and_then(|v| v.as_array()) {
+        for c in arr {
+            let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            let mut headers = Vec::new();
+            if let Some(hs) = c.get("headers").and_then(|v| v.as_array()) {
+                for h in hs {
+                    headers.push(serde_json::json!({
+                        "name": h.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        "value": h.get("value").and_then(|v| v.as_str()).unwrap_or(""),
+                    }));
+                }
+            }
+            clients.push(serde_json::json!({
+                "id": id,
+                "label": c.get("label").and_then(|v| v.as_str()).unwrap_or(""),
+                "base_url": c.get("base_url").and_then(|v| v.as_str()).unwrap_or(""),
+                "auth": c.get("auth").and_then(|v| v.as_str()).unwrap_or("none"),
+                "token": c.get("token").and_then(|v| v.as_str()).unwrap_or(""),
+                "username": c.get("username").and_then(|v| v.as_str()).unwrap_or(""),
+                "password": c.get("password").and_then(|v| v.as_str()).unwrap_or(""),
+                "timeout_secs": c.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(10),
+                "headers": headers,
+            }));
+        }
+    }
+
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    if let Some(hubs) = hubs {
+        let hub_list = hubs
+            .get("hubs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for hub in hub_list {
+            for key in ["sources", "outputs"] {
+                let incoming = key == "sources";
+                let Some(ports) = hub.get(key).and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for port in ports {
+                    let proto = port.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
+                    if !proto.eq_ignore_ascii_case("http") {
+                        continue;
+                    }
+                    let client = port
+                        .get("http_connection")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if client.is_empty() {
+                        continue;
+                    }
+                    let method = port
+                        .get("http_method")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(if incoming { "GET" } else { "POST" })
+                        .to_string();
+                    let path = port
+                        .get("http_url_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let interval = port
+                        .get("http_interval_secs")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(5.0);
+                    if incoming {
+                        let mut binds = Vec::new();
+                        if let Some(arr) = port.get("http_inputs").and_then(|v| v.as_array()) {
+                            for bind in arr {
+                                let json_path = bind
+                                    .get("json_path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let point = bind
+                                    .get("point")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let url_path = bind
+                                    .get("path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(path.as_str())
+                                    .to_string();
+                                let source = http_bind_source(&client, &url_path, &json_path);
+                                binds.push(serde_json::json!({
+                                    "json_path": json_path,
+                                    "point": point,
+                                    "source": source,
+                                }));
+                            }
+                        }
+                        if !binds.is_empty() {
+                            inputs.push(serde_json::json!({
+                                "client": client,
+                                "method": method,
+                                "path": path,
+                                "interval_secs": interval,
+                                "binds": binds,
+                            }));
+                        }
+                    } else {
+                        let mut binds = Vec::new();
+                        if let Some(arr) = port.get("http_outputs").and_then(|v| v.as_array()) {
+                            for bind in arr {
+                                let json_path = bind
+                                    .get("json_path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let point = bind
+                                    .get("point")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if point.is_empty() || json_path.is_empty() {
+                                    continue;
+                                }
+                                binds.push(serde_json::json!({
+                                    "json_path": json_path,
+                                    "point": point,
+                                    "source": "",
+                                }));
+                            }
+                        }
+                        if !binds.is_empty() {
+                            outputs.push(serde_json::json!({
+                                "client": client,
+                                "method": method,
+                                "path": path,
+                                "binds": binds,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    serde_json::json!({
+        "clients": clients,
+        "inputs": inputs,
+        "outputs": outputs,
+    })
+    .to_string()
 }

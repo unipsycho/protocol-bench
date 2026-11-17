@@ -7,6 +7,8 @@ members = [
     "pb-ipc",
     "pb-mqtt",
     "pb-opcua",
+    "pb-streams",
+    "pb-http",
     "pb-service",
     "pb-ui",
 ]
@@ -26,6 +28,12 @@ pb-engine = { path = "pb-engine" }
 pb-ipc = { path = "pb-ipc" }
 pb-mqtt = { path = "pb-mqtt" }
 pb-opcua = { path = "pb-opcua" }
+pb-streams = { path = "pb-streams" }
+pb-http = { path = "pb-http" }
+serialport = { version = "4", default-features = false }
+regex = "1"
+ureq = { version = "2.12", features = ["json"] }
+base64 = "0.22"
 eframe = { version = "0.29", default-features = true }
 egui = "0.29"
 serde = { version = "1", features = ["derive"] }
