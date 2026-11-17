@@ -21,6 +21,7 @@ mod panels;
 mod persist;
 mod point_rows;
 mod project;
+mod streams_panel;
 mod theme;
 mod topic_tree;
 mod traffic_panel;

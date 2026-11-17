@@ -52,6 +52,9 @@ pub struct ProjectFile {
     /// HTTP / REST outbound clients. Absent on older files → defaults.
     #[serde(default)]
     pub http: HttpProject,
+    /// Streams / TCP endpoints (serial + TCP client/listener). Absent → defaults.
+    #[serde(default)]
+    pub streams: StreamsProject,
     /// Hub diagram + Input/Output MQTT binds. Absent on older files → keep ui.toml hubs.
     #[serde(default)]
     pub hubs: Option<HubModel>,
@@ -120,6 +123,7 @@ impl Default for ProjectFile {
             mqtt: MqttProject::default(),
             opcua: OpcUaProject::default(),
             http: HttpProject::default(),
+            streams: StreamsProject::default(),
             hubs: None,
             settings: ProjectSettings::default(),
             layout: None,
@@ -280,6 +284,149 @@ impl HttpProject {
                 .iter()
                 .position(|c| c.id == self.selected_id)
         };
+    }
+}
+
+
+/// Streams / TCP endpoints (text serial + TCP).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamsProject {
+    #[serde(default)]
+    pub endpoints: Vec<StreamEndpointSerde>,
+    #[serde(default)]
+    pub selected_id: String,
+}
+
+impl Default for StreamsProject {
+    fn default() -> Self {
+        let ep = StreamEndpointSerde::default_serial();
+        Self {
+            selected_id: ep.id.clone(),
+            endpoints: vec![ep],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamEndpointSerde {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default = "default_stream_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub serial_port: String,
+    #[serde(default = "default_baud")]
+    pub baud: u32,
+    #[serde(default = "default_data_bits")]
+    pub data_bits: u8,
+    #[serde(default = "default_parity")]
+    pub parity: String,
+    #[serde(default = "default_stop_bits")]
+    pub stop_bits: u8,
+    #[serde(default = "default_flow")]
+    pub flow: String,
+    #[serde(default = "default_stream_host")]
+    pub host: String,
+    #[serde(default = "default_tcp_port")]
+    pub tcp_port: u16,
+    #[serde(default = "default_true_stream")]
+    pub reconnect: bool,
+    #[serde(default = "default_bind")]
+    pub bind: String,
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+}
+
+fn default_stream_kind() -> String { "serial".into() }
+fn default_baud() -> u32 { 9600 }
+fn default_data_bits() -> u8 { 8 }
+fn default_parity() -> String { "none".into() }
+fn default_stop_bits() -> u8 { 1 }
+fn default_flow() -> String { "none".into() }
+fn default_stream_host() -> String { "127.0.0.1".into() }
+fn default_tcp_port() -> u16 { 4001 }
+fn default_true_stream() -> bool { true }
+fn default_bind() -> String { "0.0.0.0".into() }
+fn default_listen_port() -> u16 { 5001 }
+
+impl StreamEndpointSerde {
+    fn default_serial() -> Self {
+        Self {
+            id: "com1".into(),
+            label: "Serial".into(),
+            kind: default_stream_kind(),
+            serial_port: if cfg!(windows) { "COM1".into() } else { "/dev/ttyUSB0".into() },
+            baud: default_baud(),
+            data_bits: default_data_bits(),
+            parity: default_parity(),
+            stop_bits: default_stop_bits(),
+            flow: default_flow(),
+            host: default_stream_host(),
+            tcp_port: default_tcp_port(),
+            reconnect: true,
+            bind: default_bind(),
+            listen_port: default_listen_port(),
+        }
+    }
+
+    fn from_endpoint(e: &crate::streams_panel::StreamEndpoint) -> Self {
+        Self {
+            id: e.id.clone(),
+            label: e.label.clone(),
+            kind: e.kind.as_str().into(),
+            serial_port: e.serial_port.clone(),
+            baud: e.baud.parse().unwrap_or(9600),
+            data_bits: e.data_bits.parse().unwrap_or(8),
+            parity: e.parity.clone(),
+            stop_bits: e.stop_bits.parse().unwrap_or(1),
+            flow: e.flow.clone(),
+            host: e.host.clone(),
+            tcp_port: e.tcp_port.parse().unwrap_or(4001),
+            reconnect: e.reconnect,
+            bind: e.bind.clone(),
+            listen_port: e.listen_port.parse().unwrap_or(5001),
+        }
+    }
+
+    fn to_endpoint(&self) -> crate::streams_panel::StreamEndpoint {
+        crate::streams_panel::StreamEndpoint {
+            id: self.id.clone(),
+            label: if self.label.is_empty() { self.id.clone() } else { self.label.clone() },
+            kind: crate::streams_panel::StreamKind::from_str(&self.kind),
+            serial_port: self.serial_port.clone(),
+            baud: self.baud.to_string(),
+            data_bits: self.data_bits.to_string(),
+            parity: self.parity.clone(),
+            stop_bits: self.stop_bits.to_string(),
+            flow: self.flow.clone(),
+            host: self.host.clone(),
+            tcp_port: self.tcp_port.to_string(),
+            reconnect: self.reconnect,
+            bind: self.bind.clone(),
+            listen_port: self.listen_port.to_string(),
+        }
+    }
+}
+
+impl StreamsProject {
+    pub fn from_panel(state: &crate::streams_panel::StreamsPanelState) -> Self {
+        let endpoints = state.endpoints.iter().map(StreamEndpointSerde::from_endpoint).collect();
+        let selected_id = state.selected().map(|e| e.id.clone()).unwrap_or_default();
+        Self { endpoints, selected_id }
+    }
+
+    pub fn apply_to_panel(&self, state: &mut crate::streams_panel::StreamsPanelState) {
+        state.endpoints = self.endpoints.iter().map(|e| e.to_endpoint()).collect();
+        if state.endpoints.is_empty() {
+            state.endpoints.push(crate::streams_panel::StreamEndpoint::default_serial());
+        }
+        state.selected = if self.selected_id.is_empty() {
+            None
+        } else {
+            state.endpoints.iter().position(|e| e.id == self.selected_id)
+        };
+        state.refresh_serial_ports();
     }
 }
 
@@ -838,6 +985,7 @@ pub fn load(path: &Path) -> Result<ProjectFile, String> {
             },
             opcua: OpcUaProject::default(),
             http: HttpProject::default(),
+            streams: StreamsProject::default(),
             hubs: None,
             settings: ProjectSettings::default(),
             layout: None,
@@ -925,6 +1073,7 @@ mod tests {
             mqtt: MqttProject::from_panel(&panel),
             opcua: OpcUaProject::default(),
             http: HttpProject::default(),
+            streams: StreamsProject::default(),
             hubs: None,
             settings: ProjectSettings {
                 name: "Plant".into(),

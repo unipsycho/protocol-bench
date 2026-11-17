@@ -13,6 +13,7 @@ use crate::mqtt_panel::{self, MqttPanelState};
 use crate::opcua_panel::{self, OpcUaPanelState};
 use crate::point_rows::{self, PointsTableRow, PointsTableState};
 use crate::project::ProjectSettings;
+use crate::streams_panel::{self, StreamsPanelState};
 use crate::theme::{
     after_field, apply_form_spacing, font_semi, font_ui, form_inset, space, scope, tint,
     ThemePalette,
@@ -46,6 +47,7 @@ pub fn paint(
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
     http: &mut HttpPanelState,
+    streams: &mut StreamsPanelState,
     points: &mut PointsPanelState,
     traffic: &mut TrafficPanelState,
     settings: &mut ProjectSettings,
@@ -58,7 +60,7 @@ pub fn paint(
             mqtt.sync_trees_from_host(host);
             opcua.sync_from_host(host);
             let conns = mqtt.connection_choices();
-            crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, http, host, engine)
+            crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, http, streams, host, engine)
         }
         DockPane::Mqtt => {
             mqtt_panel::paint(ui, host, p, engine, mqtt, hubs);
@@ -70,6 +72,12 @@ pub fn paint(
         }
         DockPane::Http => {
             let dirty = http_panel::paint(ui, p, http);
+            let mut change = crate::hubs::HubChange::quiet();
+            change.dirty = dirty;
+            change
+        }
+        DockPane::Streams => {
+            let dirty = streams_panel::paint(ui, p, streams);
             let mut change = crate::hubs::HubChange::quiet();
             change.dirty = dirty;
             change
