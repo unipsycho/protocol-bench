@@ -36,15 +36,17 @@ pub enum EngineId {
     Mqtt,
     OpcUa,
     FileFollow,
+    Http,
 }
 
 impl EngineId {
-    pub const ALL: [EngineId; 5] = [
+    pub const ALL: [EngineId; 6] = [
         EngineId::Streams,
         EngineId::Modbus,
         EngineId::Mqtt,
         EngineId::OpcUa,
         EngineId::FileFollow,
+        EngineId::Http,
     ];
 
     pub fn title(self) -> &'static str {
@@ -54,6 +56,7 @@ impl EngineId {
             Self::Mqtt => "MQTT",
             Self::OpcUa => "OPC UA",
             Self::FileFollow => "File follow",
+            Self::Http => "HTTP / REST",
         }
     }
 
@@ -63,6 +66,7 @@ impl EngineId {
             Self::Mqtt => Some("mqtt"),
             Self::OpcUa => Some("opcua"),
             Self::Streams => Some("streams"),
+            Self::Http => Some("http"),
             Self::Modbus | Self::FileFollow => None,
         }
     }
@@ -83,6 +87,7 @@ impl EngineId {
             Self::FileFollow => {
                 "Owns file tails and CSV / JSON-lines parsers. No file is open in this build."
             }
+            Self::Http => "HTTP / REST pack — outbound client poll (Input) and JSON body push (Output).",
         }
     }
 
@@ -566,7 +571,12 @@ fn host_main(
             .find(|e| e.id() == EngineId::Streams)
             .map(|e| e.snapshot().connected)
             .unwrap_or(false);
-        let any_egress = mqtt_connected || streams_connected;
+        let http_connected = engines
+            .iter()
+            .find(|e| e.id() == EngineId::Http)
+            .map(|e| e.snapshot().connected)
+            .unwrap_or(false);
+        let any_egress = mqtt_connected || streams_connected || http_connected;
         if any_egress {
             let force_all = !mqtt_was_connected;
             mqtt_was_connected = true;
@@ -584,16 +594,17 @@ fn host_main(
                     continue;
                 }
                 let mut ok = false;
-                if mqtt_connected {
-                    if let Some(engine) = engines.iter_mut().find(|e| e.id() == EngineId::Mqtt) {
-                        ok |= engine.handle(EngineCommand::WritePoint {
-                            name: name.clone(),
-                            value: value.clone(),
-                        });
+                for id in [EngineId::Mqtt, EngineId::Streams, EngineId::Http] {
+                    let connected = match id {
+                        EngineId::Mqtt => mqtt_connected,
+                        EngineId::Streams => streams_connected,
+                        EngineId::Http => http_connected,
+                        _ => false,
+                    };
+                    if !connected {
+                        continue;
                     }
-                }
-                if streams_connected {
-                    if let Some(engine) = engines.iter_mut().find(|e| e.id() == EngineId::Streams) {
+                    if let Some(engine) = engines.iter_mut().find(|e| e.id() == id) {
                         ok |= engine.handle(EngineCommand::WritePoint {
                             name: name.clone(),
                             value: value.clone(),

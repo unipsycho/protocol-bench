@@ -83,7 +83,7 @@ impl DockPane {
             Self::Mqtt => Some(EngineId::Mqtt),
             Self::OpcUa => Some(EngineId::OpcUa),
             Self::Files => Some(EngineId::FileFollow),
-            Self::Http => None,
+            Self::Http => Some(EngineId::Http),
             _ => None,
         }
     }
@@ -95,6 +95,7 @@ impl DockPane {
             EngineId::Mqtt => Self::Mqtt,
             EngineId::OpcUa => Self::OpcUa,
             EngineId::FileFollow => Self::Files,
+            EngineId::Http => Self::Http,
         }
     }
 
