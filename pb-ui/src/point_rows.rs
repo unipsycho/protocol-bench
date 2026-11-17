@@ -240,7 +240,16 @@ pub fn paint_points_table_ex(
             let inner = ui.dnd_drag_source(
                 drag_id,
                 PointEmitDrag::FromPoints(point_id),
-                |ui| paint_full_row(ui, cols, PointRowRef::from_table_row(row), p, row.bind_index),
+                |ui| {
+                    paint_full_row(
+                        ui,
+                        cols,
+                        PointRowRef::from_table_row(row),
+                        p,
+                        row.bind_index,
+                        true,
+                    )
+                },
             );
             if !ui.ctx().is_being_dragged(drag_id) {
                 inner
@@ -250,7 +259,14 @@ pub fn paint_points_table_ex(
             }
             inner.inner
         } else {
-            paint_full_row(ui, cols, PointRowRef::from_table_row(row), p, row.bind_index)
+            paint_full_row(
+                ui,
+                cols,
+                PointRowRef::from_table_row(row),
+                p,
+                row.bind_index,
+                false,
+            )
         };
         if action.remove_clicked {
             out.remove = row.bind_index;
@@ -394,12 +410,16 @@ fn header_label(
 }
 
 /// Full Points table data row (quality · id · value · source · updated [· ×]).
+///
+/// When `select_on_hover` is true (Points bus drag sources), wash the whole row
+/// under the pointer so the grab target is obvious.
 pub fn paint_full_row(
     ui: &mut egui::Ui,
     cols: PointsCols,
     row: PointRowRef<'_>,
     p: &ThemePalette,
     bind_index: Option<usize>,
+    select_on_hover: bool,
 ) -> PointRowAction {
     // Reserve space first; bind-row click is registered last so it wins cell hovers.
     let (rect, _) = ui.allocate_exact_size(Vec2::new(cols.row_w, ROW_H), Sense::hover());
@@ -409,10 +429,16 @@ pub fn paint_full_row(
         (Some(_), None) => rect,
         _ => Rect::NOTHING,
     };
-    // Wash under text when the bind row is hot.
-    if bind_index.is_some() && ui.rect_contains_pointer(click_rect) {
+    // Wash under text when the bind row is hot, or when this row is a drag source.
+    let hot = if select_on_hover {
+        ui.rect_contains_pointer(rect)
+    } else {
+        bind_index.is_some() && ui.rect_contains_pointer(click_rect)
+    };
+    if hot {
+        let wash = if select_on_hover { rect } else { click_rect };
         ui.painter()
-            .rect_filled(click_rect, Rounding::same(4.0), tint(p.accent, 12));
+            .rect_filled(wash, Rounding::same(4.0), tint(p.accent, 18));
     }
 
     if let Some(quality) = row.quality {
