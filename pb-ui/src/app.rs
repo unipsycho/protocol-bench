@@ -18,6 +18,7 @@ use crate::dnd::{self, DropCommit, PaneHit};
 use crate::dock::DockPane;
 use crate::layout::{LayoutNode, SplitDir, TabGroup};
 use crate::http_panel::HttpPanelState;
+use crate::las_panel::LasPanelState;
 use crate::mqtt_panel::{self, MqttPanelState};
 use crate::opcua_panel::{self, OpcUaPanelState};
 use crate::panels::PointsPanelState;
@@ -25,7 +26,10 @@ use crate::streams_panel::StreamsPanelState;
 use crate::traffic_panel::TrafficPanelState;
 use crate::panels;
 use crate::persist::{self, UiState};
-use crate::project::{self, DockLayout, HttpProject, MqttProject, ProjectFile, ProjectSettings, StreamsProject};
+use crate::project::{
+    self, DockLayout, HttpProject, LasProject, MqttProject, ProjectFile, ProjectSettings,
+    StreamsProject,
+};
 use pb_ipc::PointBindingWire;
 use crate::theme::{
     self, apply_form_spacing, divider_bar, font_semi, font_ui, space, tint, AppTheme, ThemePalette,
@@ -58,6 +62,7 @@ pub struct ProtocolBenchApp {
     opcua: OpcUaPanelState,
     http: HttpPanelState,
     streams: StreamsPanelState,
+    las: LasPanelState,
     points: PointsPanelState,
     traffic: TrafficPanelState,
     /// Project-level options (Project panel / project.json).
@@ -72,6 +77,8 @@ pub struct ProtocolBenchApp {
     http_saved: HttpProject,
     /// Last Streams / TCP endpoints snapshot written to the project file.
     streams_saved: StreamsProject,
+    /// Last LAS endpoints snapshot written to the project file.
+    las_saved: LasProject,
     /// Last hubs snapshot written to the project file.
     hubs_saved: crate::hubs::HubModel,
     /// Last dock layout written to project.json (PB-95).
@@ -140,9 +147,11 @@ impl ProtocolBenchApp {
         let mut opcua = OpcUaPanelState::default();
         let mut http = HttpPanelState::default();
         let mut streams = StreamsPanelState::default();
+        let mut las = LasPanelState::default();
         let mut mqtt_saved = MqttProject::default();
         let mut http_saved = HttpProject::default();
         let mut streams_saved = StreamsProject::default();
+        let mut las_saved = LasProject::default();
         let mut project_settings = ProjectSettings::default();
         // Quiet offline: chip shows disconnected; left status stays calm (PB-101).
         let mut status = "Ready".into();
@@ -173,6 +182,7 @@ impl ProtocolBenchApp {
                         file.opcua.apply_to_panel(&mut opcua);
                         file.http.apply_to_panel(&mut http);
                         file.streams.apply_to_panel(&mut streams);
+                        file.las.apply_to_panel(&mut las);
                         project_settings = file.settings.clone();
                         // PB-58: legacy project auto-run → app setting (ui.toml).
                         if file.settings.auto_run_embedded_broker && !ui_state.auto_run_embedded_hubs
@@ -202,6 +212,7 @@ impl ProtocolBenchApp {
                         mqtt_saved = MqttProject::from_panel(&mqtt);
                         http_saved = HttpProject::from_panel(&http);
                         streams_saved = StreamsProject::from_panel(&streams);
+                        las_saved = LasProject::from_panel(&las);
                         mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &ui_state.hubs);
                         mqtt_panel::maybe_auto_start_embedded(
                             &engine,
@@ -247,6 +258,7 @@ impl ProtocolBenchApp {
             opcua,
             http,
             streams,
+            las,
             points: PointsPanelState::default(),
             traffic: TrafficPanelState::default(),
             project_settings,
@@ -255,6 +267,7 @@ impl ProtocolBenchApp {
             mqtt_saved,
             http_saved,
             streams_saved,
+            las_saved,
             hubs_saved,
             layout_saved,
             last_project_save: Instant::now(),
@@ -363,11 +376,19 @@ impl ProtocolBenchApp {
         let mqtt_dirty = current != self.mqtt_saved;
         let http_dirty = HttpProject::from_panel(&self.http) != self.http_saved;
         let streams_dirty = StreamsProject::from_panel(&self.streams) != self.streams_saved;
+        let las_dirty = LasProject::from_panel(&self.las) != self.las_saved;
         let hubs_dirty = self.ui_state.hubs != self.hubs_saved;
         let settings_dirty = self.project_settings != self.settings_saved;
         let layout_dirty = DockLayout::from_ui(&self.ui_state) != self.layout_saved;
         // Save only when something actually changed — no timer flush when clean.
-        if !(mqtt_dirty || http_dirty || streams_dirty || hubs_dirty || settings_dirty || layout_dirty) {
+        if !(mqtt_dirty
+            || http_dirty
+            || streams_dirty
+            || las_dirty
+            || hubs_dirty
+            || settings_dirty
+            || layout_dirty)
+        {
             return;
         }
         if self.last_project_save.elapsed() < Duration::from_millis(500) {
@@ -423,6 +444,7 @@ impl ProtocolBenchApp {
             .unwrap_or_else(|_| (Vec::new(), 1));
         let http = HttpProject::from_panel(&self.http);
         let streams = StreamsProject::from_panel(&self.streams);
+        let las = LasProject::from_panel(&self.las);
         let file = ProjectFile {
             version: project::PROJECT_VERSION,
             points,
@@ -431,6 +453,7 @@ impl ProtocolBenchApp {
             opcua: project::OpcUaProject::from_panel(&self.opcua),
             http: http.clone(),
             streams: streams.clone(),
+            las: las.clone(),
             hubs: Some(self.ui_state.hubs.clone()),
             settings: self.project_settings.clone(),
             layout: Some(layout.clone()),
@@ -446,6 +469,7 @@ impl ProtocolBenchApp {
         self.mqtt_saved = mqtt;
         self.http_saved = http;
         self.streams_saved = streams;
+        self.las_saved = las;
         self.hubs_saved = self.ui_state.hubs.clone();
         self.settings_saved = self.project_settings.clone();
         self.layout_saved = layout;
@@ -471,6 +495,7 @@ impl ProtocolBenchApp {
         file.opcua.apply_to_panel(&mut self.opcua);
         file.http.apply_to_panel(&mut self.http);
         file.streams.apply_to_panel(&mut self.streams);
+        file.las.apply_to_panel(&mut self.las);
         self.project_settings = file.settings.clone();
         if file.settings.auto_run_embedded_broker && !self.ui_state.auto_run_embedded_hubs {
             self.ui_state.auto_run_embedded_hubs = true;
@@ -490,6 +515,7 @@ impl ProtocolBenchApp {
         self.mqtt_saved = MqttProject::from_panel(&self.mqtt);
         self.http_saved = HttpProject::from_panel(&self.http);
         self.streams_saved = StreamsProject::from_panel(&self.streams);
+        self.las_saved = LasProject::from_panel(&self.las);
         self.hubs_saved = self.ui_state.hubs.clone();
         self.settings_saved = self.project_settings.clone();
         self.layout_saved = DockLayout::from_ui(&self.ui_state);
@@ -1340,6 +1366,7 @@ impl ProtocolBenchApp {
                         ("MQTT", DockPane::Mqtt),
                         ("OPC UA", DockPane::OpcUa),
                         ("HTTP / REST", DockPane::Http),
+                        ("LAS", DockPane::Las),
                         ("File follow", DockPane::Files),
                         ("Points", DockPane::Points),
                     ] {
@@ -1626,6 +1653,7 @@ impl ProtocolBenchApp {
                 &mut self.opcua,
                 &mut self.http,
                 &mut self.streams,
+                &mut self.las,
                 &mut self.points,
                 &mut self.traffic,
                 &mut self.project_settings,

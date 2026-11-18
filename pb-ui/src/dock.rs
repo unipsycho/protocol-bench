@@ -21,13 +21,15 @@ pub enum DockPane {
     Mqtt,
     OpcUa,
     Files,
-    /// HTTP / REST JSON clients (Input/Output; no engine slot until pb-http).
+    /// HTTP / REST JSON clients (Input/Output).
     Http,
+    /// LAS well-log files (follow / write). Pack later — no EngineId yet.
+    Las,
 }
 
 impl DockPane {
     /// Rail order: bench views, then protocol links.
-    pub const ALL: [DockPane; 11] = [
+    pub const ALL: [DockPane; 12] = [
         DockPane::Project,
         DockPane::Hubs,
         DockPane::Points,
@@ -39,6 +41,7 @@ impl DockPane {
         DockPane::OpcUa,
         DockPane::Files,
         DockPane::Http,
+        DockPane::Las,
     ];
 
     pub fn title(self) -> &'static str {
@@ -55,6 +58,7 @@ impl DockPane {
             Self::OpcUa => "OPC UA",
             Self::Files => "File follow",
             Self::Http => "HTTP / REST",
+            Self::Las => "LAS",
         }
     }
 
@@ -72,6 +76,7 @@ impl DockPane {
             Self::OpcUa => "opcua",
             Self::Files => "files",
             Self::Http => "http",
+            Self::Las => "las",
         }
     }
 
@@ -84,6 +89,8 @@ impl DockPane {
             Self::OpcUa => Some(EngineId::OpcUa),
             Self::Files => Some(EngineId::FileFollow),
             Self::Http => Some(EngineId::Http),
+            // LAS pack not shipped yet — pane is UI-only.
+            Self::Las => None,
             _ => None,
         }
     }
@@ -114,6 +121,7 @@ impl DockPane {
             Self::OpcUa => Proto::OPC,
             Self::Files => Proto::FILES,
             Self::Http => Proto::HTTP,
+            Self::Las => Proto::LAS,
         }
     }
 
@@ -135,6 +143,7 @@ impl DockPane {
             Self::OpcUa => Proto::OPC_DEEP,
             Self::Files => Proto::FILES_DEEP,
             Self::Http => Proto::HTTP_DEEP,
+            Self::Las => Proto::LAS_DEEP,
         }
     }
 }

@@ -13,6 +13,7 @@ mod dock;
 mod engine_api;
 mod hubs;
 mod http_panel;
+mod las_panel;
 mod layout;
 mod mqtt_panel;
 mod opcua_browse;
