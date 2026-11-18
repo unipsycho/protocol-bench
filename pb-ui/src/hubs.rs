@@ -9,7 +9,7 @@ use egui::{
 };
 use serde::Deserialize;
 
-use pb_engine::{HostSnapshot, PointSnapshot};
+use pb_engine::{EngineId, HostSnapshot, PointSnapshot, SlotSnapshot};
 use std::collections::BTreeMap;
 
 use crate::dock::DockPane;
@@ -4216,6 +4216,7 @@ fn edit_port(
             incoming,
             stream_connections,
             host,
+<<<<<<< HEAD
             p,
         ));
     }
@@ -4240,6 +4241,8 @@ fn edit_port(
             port_id,
             incoming,
             snmp_connections,
+=======
+>>>>>>> 5d58d2a (feat(hubs): LIVE EMIT preview on Streams TCP Output)
             p,
         ));
     }
@@ -4938,7 +4941,49 @@ fn edit_streams_port_binds(
             }
         }
 
+        // LIVE SCAN line (pack last_frame → reconstruct from stream_N → SAMPLE).
+        let endpoint = port_field(model, hub_id, port_id).stream_endpoint.clone();
+        let parser = port_field(model, hub_id, port_id).stream_parser.clone();
+        let widths = port_field(model, hub_id, port_id).stream_fixed_widths.clone();
+        let regex = port_field(model, hub_id, port_id).stream_regex.clone();
+        let binds_snap: Vec<StreamInputBind> =
+            port_field(model, hub_id, port_id).stream_inputs.clone();
+        let sample = port_field(model, hub_id, port_id).draft_stream_sample.clone();
+        let scan = resolve_stream_scan_line(
+            &endpoint,
+            &binds_snap,
+            &parser,
+            &sample,
+            host,
+        );
+
         ui.add_space(space::SECTION - 2.0);
+        paint_stream_live_scan_header(ui, &scan, p);
+        ui.add_space(space::AFTER_HEADING);
+        if matches!(scan.source, StreamScanSource::LiveFrame | StreamScanSource::LivePoints) {
+            let (rect, _) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width().max(1.0), 28.0),
+                Sense::hover(),
+            );
+            ui.painter()
+                .rect_filled(rect, Rounding::same(4.0), tint(p.accent, 14));
+            let show = if scan.line.is_empty() {
+                "(empty line)".to_string()
+            } else {
+                scan.line.replace('\t', "⇥")
+            };
+            ui.painter().text(
+                Pos2::new(rect.min.x + 8.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                truncate_preview(&show, 96),
+                font_mono(12.5),
+                if scan.line.is_empty() { p.muted } else { p.text },
+            );
+            ui.interact(rect, ui.id().with(("pb_stream_live_scan", port_id)), Sense::hover())
+                .on_hover_text(&show);
+            ui.add_space(space::AFTER_FIELD);
+        }
+
         ui.label(
             egui::RichText::new("SAMPLE LINE")
                 .font(font_ui(10.5))
@@ -4955,27 +5000,53 @@ fn edit_streams_port_binds(
                     .margin(egui::Margin::symmetric(6.0, 4.0)),
             );
         }
+        if matches!(scan.source, StreamScanSource::LiveFrame | StreamScanSource::LivePoints) {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("SAMPLE is for offline authoring — chips use LIVE while traffic flows.")
+                    .font(font_ui(11.0))
+                    .color(p.muted),
+            );
+        }
 
-        let sample = port_field(model, hub_id, port_id).draft_stream_sample.clone();
-        let parser = port_field(model, hub_id, port_id).stream_parser.clone();
-        let widths = port_field(model, hub_id, port_id).stream_fixed_widths.clone();
-        let regex = port_field(model, hub_id, port_id).stream_regex.clone();
-        let fields = sample_fields(&sample, &parser, &widths, &regex);
-        let bound: Vec<String> = port_field(model, hub_id, port_id)
-            .stream_inputs
-            .iter()
-            .map(|b| b.field.clone())
-            .collect();
+        let preview_line = if scan.line.trim().is_empty() {
+            sample.clone()
+        } else {
+            scan.line.clone()
+        };
+        let fields = sample_fields(&preview_line, &parser, &widths, &regex);
+        let bound: Vec<String> = binds_snap.iter().map(|b| b.field.clone()).collect();
+        let chip_source = if !scan.line.trim().is_empty()
+            && matches!(
+                scan.source,
+                StreamScanSource::LiveFrame | StreamScanSource::LivePoints
+            ) {
+            "LIVE"
+        } else {
+            "SAMPLE"
+        };
 
         ui.add_space(space::AFTER_FIELD);
-        ui.label(
-            egui::RichText::new(format!(
-                "PREVIEW FIELDS · {}",
-                parser_delimiter_hint(&parser)
-            ))
-            .font(font_ui(10.5))
-            .color(p.muted),
-        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(
+                egui::RichText::new(format!(
+                    "PREVIEW FIELDS · {}",
+                    parser_delimiter_hint(&parser)
+                ))
+                .font(font_ui(10.5))
+                .color(p.muted),
+            );
+            ui.label(
+                egui::RichText::new(chip_source)
+                    .font(font_ui(10.5))
+                    .color(if chip_source == "LIVE" {
+                        p.live
+                    } else {
+                        p.muted
+                    }),
+            );
+        });
         ui.add_space(space::AFTER_HEADING);
         ui.label(
             egui::RichText::new("Click or drag a field onto Binds — host assigns stream_N.")
@@ -4991,6 +5062,7 @@ fn edit_streams_port_binds(
             &fields,
             &parser,
             &bound,
+            chip_source == "LIVE",
             p,
             &mut add_field,
         );
@@ -5007,7 +5079,15 @@ fn edit_streams_port_binds(
                 .color(p.muted),
         );
         ui.add_space(space::AFTER_HEADING);
-        change.dirty |= paint_stream_input_binds_dnd(ui, model, hub_id, port_id, &fields, p);
+        change.dirty |= paint_stream_input_binds_dnd(
+            ui,
+            model,
+            hub_id,
+            port_id,
+            &fields,
+            &host.points,
+            p,
+        );
 
         ui.add_space(space::AFTER_FIELD);
         let mut add_manual = false;
@@ -5571,13 +5651,155 @@ fn add_stream_input_bind(port: &mut HubPort, field: String) -> bool {
     true
 }
 
-/// Visual preview chips for parsed sample fields — click or drag onto Binds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamScanSource {
+    /// Pack `detail_json` last_frame for the bound endpoint.
+    LiveFrame,
+    /// Rebuilt from live `stream_N` bind values (quiet pack / no frame yet).
+    LivePoints,
+    /// Operator-pasted SAMPLE LINE.
+    Sample,
+    /// Nothing to show yet.
+    Empty,
+}
+
+#[derive(Debug, Clone)]
+struct StreamScanLine {
+    line: String,
+    source: StreamScanSource,
+}
+
+/// Prefer pack last_frame → reconstruct from live binds → SAMPLE paste.
+fn resolve_stream_scan_line(
+    endpoint_id: &str,
+    binds: &[StreamInputBind],
+    parser: &str,
+    sample: &str,
+    host: &HostSnapshot,
+) -> StreamScanLine {
+    if let Some(frame) = streams_endpoint_last_frame(host, endpoint_id) {
+        return StreamScanLine {
+            line: frame,
+            source: StreamScanSource::LiveFrame,
+        };
+    }
+    if let Some(line) = reconstruct_scan_line_from_binds(binds, parser, &host.points) {
+        return StreamScanLine {
+            line,
+            source: StreamScanSource::LivePoints,
+        };
+    }
+    let sample = sample.to_string();
+    if sample.trim().is_empty() {
+        StreamScanLine {
+            line: String::new(),
+            source: StreamScanSource::Empty,
+        }
+    } else {
+        StreamScanLine {
+            line: sample,
+            source: StreamScanSource::Sample,
+        }
+    }
+}
+
+/// Read `last_frame` for one Streams endpoint from pack detail JSON.
+fn streams_endpoint_last_frame(host: &HostSnapshot, endpoint_id: &str) -> Option<String> {
+    let endpoint_id = endpoint_id.trim();
+    if endpoint_id.is_empty() {
+        return None;
+    }
+    let slot = host.slots.iter().find(|s| s.id == EngineId::Streams)?;
+    if slot.detail_json.trim().is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&slot.detail_json).ok()?;
+    let eps = v.get("endpoints")?.as_array()?;
+    for ep in eps {
+        if ep.get("id").and_then(|x| x.as_str()) != Some(endpoint_id) {
+            continue;
+        }
+        let frame = ep.get("last_frame").and_then(|x| x.as_str()).unwrap_or("");
+        let frame = frame.trim_end_matches('\r').trim();
+        if frame.is_empty() {
+            return None;
+        }
+        return Some(frame.to_string());
+    }
+    None
+}
+
+/// Rebuild a preview line from live `stream_N` values (field-index slots).
+fn reconstruct_scan_line_from_binds(
+    binds: &[StreamInputBind],
+    parser: &str,
+    host_points: &[PointSnapshot],
+) -> Option<String> {
+    if binds.is_empty() {
+        return None;
+    }
+    let mut slots: Vec<(usize, String)> = Vec::new();
+    let mut any_live = false;
+    for b in binds {
+        let idx = if b.field.trim().is_empty() {
+            0
+        } else {
+            b.field.parse::<usize>().unwrap_or(0)
+        };
+        let val = if b.point.trim().is_empty() {
+            String::new()
+        } else {
+            live_point_value(host_points, &b.point)
+                .unwrap_or("")
+                .to_string()
+        };
+        if !val.trim().is_empty() {
+            any_live = true;
+        }
+        slots.push((idx, val));
+    }
+    if !any_live {
+        return None;
+    }
+    slots.sort_by_key(|(i, _)| *i);
+    let max = slots.last().map(|(i, _)| *i).unwrap_or(0);
+    let mut values = vec![String::new(); max + 1];
+    for (i, v) in slots {
+        if i < values.len() {
+            values[i] = v;
+        }
+    }
+    Some(join_stream_emit_fields(parser, &values))
+}
+
+fn paint_stream_live_scan_header(ui: &mut Ui, scan: &StreamScanLine, p: &ThemePalette) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (badge, color) = match scan.source {
+            StreamScanSource::LiveFrame => ("LIVE SCAN", p.live),
+            StreamScanSource::LivePoints => ("LIVE SCAN", p.live),
+            StreamScanSource::Sample => ("SAMPLE SCAN", p.muted),
+            StreamScanSource::Empty => ("SCAN", p.muted),
+        };
+        ui.label(egui::RichText::new(badge).font(font_ui(10.5)).color(color));
+        let note = match scan.source {
+            StreamScanSource::LiveFrame => "last framed line from endpoint",
+            StreamScanSource::LivePoints => "rebuilt from live stream_N values",
+            StreamScanSource::Sample => "paste a line to preview fields",
+            StreamScanSource::Empty => "waiting for traffic or a sample line",
+        };
+        ui.label(egui::RichText::new(note).font(font_ui(10.5)).color(p.muted));
+    });
+}
+
+/// Visual preview chips for parsed sample/live fields — click or drag onto Binds.
 fn paint_stream_scan_field_chips(
     ui: &mut Ui,
     port_id: u64,
     fields: &[String],
     parser: &str,
     bound: &[String],
+    from_live: bool,
     p: &ThemePalette,
     add_field: &mut Option<String>,
 ) -> bool {
@@ -5585,9 +5807,13 @@ fn paint_stream_scan_field_chips(
 
     if fields.is_empty() {
         ui.label(
-            egui::RichText::new("Paste a sample line above to preview fields.")
-                .font(font_ui(12.0))
-                .color(p.muted),
+            egui::RichText::new(if from_live {
+                "LIVE line has no fields for this parser yet."
+            } else {
+                "Paste a sample line above — or wait for LIVE traffic — to preview fields."
+            })
+            .font(font_ui(12.0))
+            .color(p.muted),
         );
         return false;
     }
@@ -5610,11 +5836,15 @@ fn paint_stream_scan_field_chips(
                 |ui| {
                     let fill = if already {
                         tint(p.accent, 28)
+                    } else if from_live {
+                        tint(p.live, 22)
                     } else {
                         p.control
                     };
                     let stroke = if already {
                         Stroke::new(1.0, p.accent)
+                    } else if from_live {
+                        Stroke::new(1.0, p.live)
                     } else {
                         Stroke::new(1.0, p.line)
                     };
@@ -5660,6 +5890,7 @@ fn paint_stream_input_binds_dnd(
     hub_id: u64,
     port_id: u64,
     fields: &[String],
+    host_points: &[PointSnapshot],
     p: &ThemePalette,
 ) -> bool {
     use crate::point_rows::StreamScanFieldDrag;
@@ -5701,20 +5932,27 @@ fn paint_stream_input_binds_dnd(
             } else {
                 format!("field {}", bind.field)
             };
-            let preview = bind
-                .field
-                .parse::<usize>()
-                .ok()
-                .and_then(|idx| fields.get(idx))
-                .cloned()
-                .or_else(|| {
-                    if bind.field.is_empty() {
-                        fields.first().cloned()
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
+            // Prefer live host value; fall back to parsed preview field text.
+            let live = if bind.point.trim().is_empty() {
+                None
+            } else {
+                live_point_value(host_points, &bind.point).map(|v| v.to_string())
+            };
+            let preview = live.or_else(|| {
+                bind.field
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|idx| fields.get(idx))
+                    .cloned()
+                    .or_else(|| {
+                        if bind.field.is_empty() {
+                            fields.first().cloned()
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .unwrap_or_default();
             let row_w = ui.available_width().max(1.0);
             let (rect, _) = ui.allocate_exact_size(Vec2::new(row_w, ROW_H), Sense::hover());
             let hot = ui.rect_contains_pointer(rect);
@@ -7786,5 +8024,87 @@ mod tests {
         let preview = assemble_stream_emit_preview(&binds, "csv", "lf", "", &[]).expect("preview");
         assert_eq!(preview.body, "");
         assert_eq!(preview.missing, vec!["mqtt_1".to_string()]);
+    }
+
+    #[test]
+    fn stream_live_scan_reconstructs_from_bind_values() {
+        let binds = vec![
+            StreamInputBind {
+                field: "0".into(),
+                point: "stream_11".into(),
+            },
+            StreamInputBind {
+                field: "1".into(),
+                point: "stream_3".into(),
+            },
+        ];
+        let points = vec![
+            PointSnapshot {
+                name: "stream_11".into(),
+                value: "12.5".into(),
+                quality: "good".into(),
+                source: "stream/tcp_in::0".into(),
+                updated_ms: 1,
+            },
+            PointSnapshot {
+                name: "stream_3".into(),
+                value: "OK".into(),
+                quality: "good".into(),
+                source: "stream/tcp_in::1".into(),
+                updated_ms: 1,
+            },
+        ];
+        let line = reconstruct_scan_line_from_binds(&binds, "csv", &points).expect("line");
+        assert_eq!(line, "12.5,OK");
+    }
+
+    #[test]
+    fn stream_live_scan_prefers_pack_frame_over_sample() {
+        let host = HostSnapshot {
+            thread_name: "t".into(),
+            alive: true,
+            ticks: 0,
+            uptime_ms: 0,
+            slots: vec![SlotSnapshot {
+                id: EngineId::Streams,
+                title: "Streams".into(),
+                state: "ok".into(),
+                note: String::new(),
+                ticks: 0,
+                commands_handled: 0,
+                connected: true,
+                last_error: String::new(),
+                topics: Vec::new(),
+                detail_json: r#"{"endpoints":[{"id":"tcp_in","last_frame":"1.2,3.4,OK"}]}"#.into(),
+                pack_loaded: true,
+            }],
+            modules_dir: String::new(),
+            packs_loaded: vec!["streams".into()],
+            point_count: 0,
+            points: Vec::new(),
+        };
+        let scan = resolve_stream_scan_line("tcp_in", &[], "csv", "sample,only", &host);
+        assert_eq!(scan.source, StreamScanSource::LiveFrame);
+        assert_eq!(scan.line, "1.2,3.4,OK");
+        // Quiet pack → SAMPLE paste wins.
+        let quiet = HostSnapshot {
+            slots: vec![SlotSnapshot {
+                id: EngineId::Streams,
+                title: "Streams".into(),
+                state: "idle".into(),
+                note: String::new(),
+                ticks: 0,
+                commands_handled: 0,
+                connected: false,
+                last_error: String::new(),
+                topics: Vec::new(),
+                detail_json: r#"{"endpoints":[{"id":"tcp_in","last_frame":""}]}"#.into(),
+                pack_loaded: true,
+            }],
+            ..host.clone()
+        };
+        let sample = resolve_stream_scan_line("tcp_in", &[], "csv", "sample,only", &quiet);
+        assert_eq!(sample.source, StreamScanSource::Sample);
+        assert_eq!(sample.line, "sample,only");
     }
 }
