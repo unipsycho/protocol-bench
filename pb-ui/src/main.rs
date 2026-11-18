@@ -16,6 +16,7 @@ mod http_panel;
 mod las_panel;
 mod layout;
 mod mqtt_panel;
+mod snmp_panel;
 mod opcua_browse;
 mod opcua_panel;
 mod panels;

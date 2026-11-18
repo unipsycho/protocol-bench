@@ -53,9 +53,9 @@ impl Proto {
     pub const OPC_DEEP: Color32 = Color32::from_rgb(0x5b, 0x3d, 0x9e);
     pub const FILES: Color32 = Color32::from_rgb(0xe4, 0xc0, 0x7a);
     pub const FILES_DEEP: Color32 = Color32::from_rgb(0x8a, 0x5a, 0x20);
-    /// LAS well-log (sage-olive, distinct from Files sand).
-    pub const LAS: Color32 = Color32::from_rgb(0xa8, 0xc4, 0x6a);
-    pub const LAS_DEEP: Color32 = Color32::from_rgb(0x4a, 0x6a, 0x1c);
+    /// SNMP monitoring (steel blue-green, distinct from Streams/MQTT).
+    pub const SNMP: Color32 = Color32::from_rgb(0x5c, 0xb8, 0xa8);
+    pub const SNMP_DEEP: Color32 = Color32::from_rgb(0x1e, 0x6e, 0x62);
 }
 
 /// Dark instrument face used by the hero graphics on every theme.

@@ -565,19 +565,19 @@ pub fn stream_bind_source(endpoint: &str, field: &str) -> String {
     }
 }
 
-/// Wire address for a LAS Input curve bind (`las/<endpoint>::<curve>`).
-pub fn las_bind_source(endpoint: &str, curve: &str) -> String {
-    let endpoint = endpoint.trim();
-    let curve = curve.trim();
-    let base = if endpoint.is_empty() {
-        "las".to_string()
+/// Wire address for an SNMP Input OID bind (`snmp/<target>::<oid>`).
+pub fn snmp_bind_source(target: &str, oid: &str) -> String {
+    let target = target.trim();
+    let oid = oid.trim();
+    let base = if target.is_empty() {
+        "snmp".to_string()
     } else {
-        format!("las/{endpoint}")
+        format!("snmp/{target}")
     };
-    if curve.is_empty() {
+    if oid.is_empty() {
         base
     } else {
-        format!("{base}::{curve}")
+        format!("{base}::{oid}")
     }
 }
 
@@ -720,16 +720,16 @@ pub fn rows_for_points_panel(
                         });
                     }
                 }
-                HubProto::Las => {
-                    let endpoint = port.las_endpoint.as_str();
-                    for bind in &port.las_inputs {
-                        let curve = bind.curve.trim();
-                        if curve.is_empty() {
+                HubProto::Snmp => {
+                    let target = port.snmp_target.as_str();
+                    for bind in &port.snmp_inputs {
+                        let oid = bind.oid.trim();
+                        if oid.is_empty() {
                             continue;
                         }
-                        let source = las_bind_source(endpoint, curve);
+                        let source = snmp_bind_source(target, oid);
                         let id = if bind.point.trim().is_empty() {
-                            "las_N".to_string()
+                            "snmp_N".to_string()
                         } else {
                             bind.point.trim().to_string()
                         };
@@ -746,7 +746,7 @@ pub fn rows_for_points_panel(
                             updated_ms: 0,
                             bind_index: None,
                             topic: String::new(),
-                            path: bind.curve.clone(),
+                            path: bind.oid.clone(),
                         });
                     }
                 }
