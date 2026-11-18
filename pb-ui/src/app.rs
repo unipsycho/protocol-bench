@@ -211,20 +211,27 @@ impl ProtocolBenchApp {
                             project::migrate_panel_point_refs(&mut mqtt, &mut store);
                         }
                         project::migrate_client_binds_to_hubs(&mut mqtt, &mut ui_state.hubs);
-                        // IPC: local PointStore is a mirror — promote hub binds and push to service.
-                        Self::push_hub_binds_to_service(&engine, &mut ui_state.hubs);
                         // Persist rebuilt points[] when file was empty after IPC wipe.
                         seed_layout = seed_layout || file.points.is_empty();
                         mqtt_saved = MqttProject::from_panel(&mqtt);
                         http_saved = HttpProject::from_panel(&http);
                         streams_saved = StreamsProject::from_panel(&streams);
+<<<<<<< HEAD
                         las_saved = LasProject::from_panel(&las);
                         snmp_saved = SnmpProject::from_panel(&snmp);
                         mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &ui_state.hubs);
+=======
+                        // Repair orphan hub mqtt_connection ids before materializing points.
+                        if mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &mut ui_state.hubs) {
+                            seed_layout = true;
+                        }
+                        // IPC: local PointStore is a mirror — promote hub binds and push to service.
+                        Self::push_hub_binds_to_service(&engine, &mut ui_state.hubs);
+>>>>>>> 679ba3d (fix(mqtt): remap orphan hub connections so external brokers stream)
                         mqtt_panel::maybe_auto_start_embedded(
                             &engine,
                             &mut mqtt,
-                            &ui_state.hubs,
+                            &mut ui_state.hubs,
                             auto_run,
                         );
                         opcua_panel::apply_opcua_session(&engine, &mut opcua, &ui_state.hubs);
@@ -542,11 +549,14 @@ impl ProtocolBenchApp {
             &mut self.opcua,
             self.ui_state.auto_run_embedded_hubs,
         );
-        mqtt_panel::apply_mqtt_session(&self.engine, &mut self.mqtt, &self.ui_state.hubs);
+        if mqtt_panel::apply_mqtt_session(&self.engine, &mut self.mqtt, &mut self.ui_state.hubs) {
+            self.mark_dirty();
+            Self::push_hub_binds_to_service(&self.engine, &mut self.ui_state.hubs);
+        }
         mqtt_panel::maybe_auto_start_embedded(
             &self.engine,
             &mut self.mqtt,
-            &self.ui_state.hubs,
+            &mut self.ui_state.hubs,
             self.ui_state.auto_run_embedded_hubs,
         );
         if persist::note_recent_project(&mut self.ui_state, &self.project_path) {
@@ -1241,7 +1251,7 @@ impl ProtocolBenchApp {
                         mqtt_panel::maybe_auto_start_embedded(
                             &self.engine,
                             &mut self.mqtt,
-                            &self.ui_state.hubs,
+                            &mut self.ui_state.hubs,
                             true,
                         );
                         opcua_panel::maybe_auto_start_embedded(
@@ -1682,10 +1692,10 @@ impl ProtocolBenchApp {
                 // Allocate / refresh point ids for new Input binds, then push to service.
                 Self::push_hub_binds_to_service(&self.engine, &mut self.ui_state.hubs);
                 // Hub Input/Output MQTT binds feed the pack session.
-                mqtt_panel::apply_mqtt_session(
+                let _ = mqtt_panel::apply_mqtt_session(
                     &self.engine,
                     &mut self.mqtt,
-                    &self.ui_state.hubs,
+                    &mut self.ui_state.hubs,
                 );
                 opcua_panel::apply_opcua_session(
                     &self.engine,

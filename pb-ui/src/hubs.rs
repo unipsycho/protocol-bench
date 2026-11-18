@@ -1544,6 +1544,70 @@ impl HubModel {
         changed || self.feeds.len() != feeds_before
     }
 
+    /// Remap hub MQTT ports whose connection id no longer exists in the panel.
+    /// Prefer case-insensitive label match, then the sole *external* client
+    /// (`hub_id` is excluded from that sole-client fallback — choices always include the embedded broker).
+    /// Returns human-readable repair notes (empty when nothing changed).
+    pub fn repair_mqtt_connection_refs(
+        &mut self,
+        known: &[(String, String)],
+        hub_id: Option<&str>,
+    ) -> Vec<String> {
+        let mut notes = Vec::new();
+        if known.is_empty() {
+            return notes;
+        }
+        // Embedded hub is always in `known`; sole-external avoids remapping orphans onto it.
+        let externals: Vec<&(String, String)> = known
+            .iter()
+            .filter(|(id, _)| hub_id.map(|h| id.as_str() != h).unwrap_or(true))
+            .collect();
+        let sole = if externals.len() == 1 {
+            Some(externals[0].0.clone())
+        } else {
+            None
+        };
+        for hub in &mut self.hubs {
+            for port in hub.sources.iter_mut().chain(hub.outputs.iter_mut()) {
+                if port.protocol != HubProto::Mqtt {
+                    continue;
+                }
+                let cur = port.mqtt_connection.trim();
+                if cur.is_empty() {
+                    continue;
+                }
+                if known.iter().any(|(id, _)| id == cur) {
+                    continue;
+                }
+                let cur_lower = cur.to_ascii_lowercase();
+                let by_label = known
+                    .iter()
+                    .find(|(_, label)| label.trim().eq_ignore_ascii_case(cur))
+                    .or_else(|| {
+                        known.iter().find(|(id, label)| {
+                            id.eq_ignore_ascii_case(&cur_lower)
+                                || label.to_ascii_lowercase().contains(&cur_lower)
+                        })
+                    })
+                    .map(|(id, _)| id.clone());
+                let next = by_label.or_else(|| sole.clone());
+                let Some(next) = next else {
+                    notes.push(format!(
+                        "Hub “{}” / {} still points at missing MQTT connection “{cur}” — pick a connection on the Input.",
+                        hub.name, port.label
+                    ));
+                    continue;
+                };
+                notes.push(format!(
+                    "Remapped hub “{}” / {} MQTT connection “{cur}” → “{next}”.",
+                    hub.name, port.label
+                ));
+                port.mqtt_connection = next;
+            }
+        }
+        notes
+    }
+
     /// Collect Input/Output MQTT binds for one connection id.
     /// Many nodes may share the connection; each node's binds are included (overlap OK).
     pub fn mqtt_binds_for_connection(
@@ -6744,6 +6808,30 @@ fn navigation_help_chip(ui: &mut Ui, p: &ThemePalette) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_mqtt_orphans_prefer_sole_external_not_hub() {
+        let mut model = HubModel::default();
+        model.add_hub();
+        let hub_id = model.hubs[0].id;
+        let port = model.hubs[0].sources[0].id;
+        {
+            let p = &mut model.hub_mut(hub_id).unwrap().sources[0];
+            p.protocol = HubProto::Mqtt;
+            p.mqtt_connection = "Mosquitto".into();
+        }
+        let known = vec![
+            ("hub".into(), "Hub broker (embedded)".into()),
+            ("local".into(), "Local broker".into()),
+        ];
+        let notes = model.repair_mqtt_connection_refs(&known, Some("hub"));
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            model.hub(hub_id).unwrap().sources[0].mqtt_connection,
+            "local"
+        );
+        assert_eq!(port, model.hubs[0].sources[0].id);
+    }
 
     #[test]
     fn deleting_output_keeps_connected_calc_and_drops_feeds() {

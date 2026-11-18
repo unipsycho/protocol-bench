@@ -26,7 +26,8 @@ fn default_broker_bind() -> String {
 }
 
 fn default_broker_listen_port() -> u16 {
-    1883
+    // Avoid clashing with a system Mosquitto (often 1883/1884 on Omarchy/dev boxes).
+    1885
 }
 
 fn default_broker_id() -> String {
@@ -218,6 +219,8 @@ pub struct MqttPanelState {
     /// Live rumqttd listen state (session UI; not persisted).
     pub broker_running: bool,
     pub broker_status: String,
+    /// Last Apply / repair note (session UI; not persisted).
+    pub session_note: String,
     /// Pending list-row delete confirm: (index, display name). Session UI only.
     pub pending_delete: Option<(usize, String)>,
 }
@@ -231,6 +234,7 @@ impl Default for MqttPanelState {
             embedded: EmbeddedBrokerConfig::default(),
             broker_running: false,
             broker_status: String::new(),
+            session_note: String::new(),
             pending_delete: None,
         }
     }
@@ -356,9 +360,21 @@ pub fn fresh_mqtt_client_id(conn_id: &str) -> String {
 /// Push multi-client document to the MQTT pack.
 /// Hub Input/Output nodes supply parse/output binds; panel subscriptions are optional wide filters.
 /// Embedded hub broker appears as a synthetic client so Outputs can publish to it.
-pub fn apply_mqtt_session(engine: &EngineHandle, state: &mut MqttPanelState, hubs: &HubModel) {
+/// Returns true when hub diagram fields were repaired (caller should dirty-save).
+pub fn apply_mqtt_session(
+    engine: &EngineHandle,
+    state: &mut MqttPanelState,
+    hubs: &mut HubModel,
+) -> bool {
     state.ensure_unique_mqtt_client_ids();
+    // Hub Input/Output pickers store a connection id — repair orphans before merge.
     let hub_id = state.embedded.connection_id().to_string();
+    let known = state.connection_choices();
+    let repairs = hubs.repair_mqtt_connection_refs(&known, Some(hub_id.as_str()));
+    let dirty = !repairs.is_empty();
+    if dirty {
+        state.session_note = repairs.join(" ");
+    }
     let mut clients: Vec<serde_json::Value> = state
         .clients
         .iter()
@@ -369,6 +385,19 @@ pub fn apply_mqtt_session(engine: &EngineHandle, state: &mut MqttPanelState, hub
     clients.insert(0, embedded_configure_json(state, hubs));
     let json = serde_json::json!({ "clients": clients }).to_string();
     engine.submit(EngineId::Mqtt, EngineCommand::Configure { json });
+    // Surface when a connected client still has no hub Input topics (common misconfig).
+    if state.session_note.is_empty() {
+        if let Some(c) = state.selected() {
+            let (ins, _, _) = hubs.mqtt_binds_for_connection(&c.id);
+            if c.auto_connect && ins.is_empty() && c.subscriptions.iter().all(|s| s == "pb/#") {
+                state.session_note = format!(
+                    "Connected “{}”, but no hub Input uses this connection and wide subscribe is only pb/# — pick this connection on a hub Input (or add TopicBench topics).",
+                    c.id
+                );
+            }
+        }
+    }
+    dirty
 }
 
 fn client_configure_json(c: &MqttClient, hubs: &HubModel) -> serde_json::Value {
@@ -491,22 +520,27 @@ pub fn paint(
     p: &ThemePalette,
     engine: &EngineHandle,
     state: &mut MqttPanelState,
-    hubs: &HubModel,
-) {
+    hubs: &mut HubModel,
+) -> bool {
     state.ensure_clients();
+    sync_broker_running_from_host(host, state);
     state.sync_trees_from_host(host);
     // Claim the full pane body with an explicit rect — nested horizontal rows
     // collapse available_height and clip the config editor.
     let full = ui.available_rect_before_wrap();
     let inner = form_inset(full);
+    let mut dirty = false;
     ui.allocate_new_ui(
         UiBuilder::new()
             .max_rect(inner)
             .layout(Layout::top_down(egui::Align::Min)),
-        |ui| paint_body(ui, host, p, engine, state, hubs),
+        |ui| {
+            dirty = paint_body(ui, host, p, engine, state, hubs);
+        },
     );
     // Consume the outer rect so the dock body does not layout underneath.
     ui.allocate_rect(full, Sense::hover());
+    dirty
 }
 
 fn paint_body(
@@ -515,10 +549,11 @@ fn paint_body(
     p: &ThemePalette,
     engine: &EngineHandle,
     state: &mut MqttPanelState,
-    hubs: &HubModel,
-) {
+    hubs: &mut HubModel,
+) -> bool {
     // Dock splitters zero spacing — restore form rhythm (PB-88).
     apply_form_spacing(ui);
+    let mut dirty = false;
     let slot = host.slot(EngineId::Mqtt);
     let pack_loaded = slot.map(|s| s.pack_loaded).unwrap_or(false);
     if !pack_loaded {
@@ -530,11 +565,11 @@ fn paint_body(
         ui.add_space(space::AFTER_BLURB);
     }
 
-    edit_embedded_broker(ui, state, engine, hubs, p);
+    dirty |= edit_embedded_broker(ui, state, engine, hubs, p);
     ui.add_space(space::SECTION + 2.0);
     // Title + Add on one row (PB-105).
     if connection_list::heading_with_add(ui, "External brokers", "+ Add", p.live, p) {
-        add_mqtt_client(state, engine, hubs);
+        dirty |= add_mqtt_client(state, engine, hubs);
     }
     ui.add_space(space::AFTER_HEADING);
     ui.label(
@@ -548,7 +583,7 @@ fn paint_body(
 
     clients_list(ui, state, engine, hubs, p);
     if let Some(i) = connection_list::confirm_delete(ui.ctx(), &mut state.pending_delete, p) {
-        remove_mqtt_client(state, engine, hubs, i);
+        dirty |= remove_mqtt_client(state, engine, hubs, i);
     }
     ui.add_space(space::AFTER_FIELD + 2.0);
 
@@ -558,7 +593,7 @@ fn paint_body(
                 .font(font_ui(12.5))
                 .color(p.muted),
         );
-        return;
+        return dirty;
     }
 
     let rem = ui.available_rect_before_wrap();
@@ -587,7 +622,7 @@ fn paint_body(
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_min_width((left_w - 4.0).max(1.0));
-                        selected_client_editor(ui, state, engine, hubs, p);
+                        dirty |= selected_client_editor(ui, state, engine, hubs, p);
                     });
             },
         );
@@ -612,19 +647,20 @@ fn paint_body(
                         ui.set_min_width((rem_size.x - 4.0).max(1.0));
                         topic_tree_preview(ui, state, p, false, 220.0);
                         ui.add_space(12.0);
-                        selected_client_editor(ui, state, engine, hubs, p);
+                        dirty |= selected_client_editor(ui, state, engine, hubs, p);
                     });
             },
         );
         ui.allocate_rect(rem, Sense::hover());
     }
+    dirty
 }
 
 fn clients_list(
     ui: &mut egui::Ui,
     state: &mut MqttPanelState,
     engine: &EngineHandle,
-    hubs: &HubModel,
+    hubs: &mut HubModel,
     p: &ThemePalette,
 ) {
     let mut select = None;
@@ -655,7 +691,7 @@ fn clients_list(
     }
 }
 
-fn add_mqtt_client(state: &mut MqttPanelState, engine: &EngineHandle, hubs: &HubModel) {
+fn add_mqtt_client(state: &mut MqttPanelState, engine: &EngineHandle, hubs: &mut HubModel) -> bool {
     let id = state.unique_id("broker");
     let mut c = MqttClient::default_local();
     c.id = id.clone();
@@ -663,17 +699,17 @@ fn add_mqtt_client(state: &mut MqttPanelState, engine: &EngineHandle, hubs: &Hub
     c.client_id = fresh_mqtt_client_id(&id);
     state.clients.push(c);
     state.selected = Some(state.clients.len() - 1);
-    apply_mqtt_session(engine, state, hubs);
+    apply_mqtt_session(engine, state, hubs)
 }
 
 fn remove_mqtt_client(
     state: &mut MqttPanelState,
     engine: &EngineHandle,
-    hubs: &HubModel,
+    hubs: &mut HubModel,
     i: usize,
-) {
+) -> bool {
     if i >= state.clients.len() {
-        return;
+        return false;
     }
     let was = state.selected;
     state.clients.remove(i);
@@ -683,18 +719,19 @@ fn remove_mqtt_client(
         other => other,
     };
     state.ensure_clients();
-    apply_mqtt_session(engine, state, hubs);
+    apply_mqtt_session(engine, state, hubs)
 }
 
 fn selected_client_editor(
     ui: &mut egui::Ui,
     state: &mut MqttPanelState,
     engine: &EngineHandle,
-    hubs: &HubModel,
+    hubs: &mut HubModel,
     p: &ThemePalette,
-) {
+) -> bool {
+    let mut dirty = false;
     let Some(_) = state.selected() else {
-        return;
+        return false;
     };
     section(ui, "BROKER / CLIENT", p);
     {
@@ -714,16 +751,26 @@ fn selected_client_editor(
             if let Some(c) = state.selected_mut() {
                 c.auto_connect = true;
             }
-            apply_mqtt_session(engine, state, hubs);
+            state.session_note.clear();
+            dirty |= apply_mqtt_session(engine, state, hubs);
         }
         ui.add_space(12.0);
         if text_btn(ui, "Disconnect", false, p).clicked() {
             if let Some(c) = state.selected_mut() {
                 c.auto_connect = false;
             }
-            apply_mqtt_session(engine, state, hubs);
+            state.session_note.clear();
+            dirty |= apply_mqtt_session(engine, state, hubs);
         }
     });
+    if !state.session_note.is_empty() {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(&state.session_note)
+                .font(font_ui(12.0))
+                .color(p.warn),
+        );
+    }
     ui.add_space(4.0);
     ui.label(
         egui::RichText::new("Password stored in the project JSON (no keyring yet).")
@@ -732,16 +779,17 @@ fn selected_client_editor(
     );
 
     ui.add_space(14.0);
-    wide_subscribe_section(ui, state, engine, hubs, p);
+    dirty |= wide_subscribe_section(ui, state, engine, hubs, p);
+    dirty
 }
 
 fn wide_subscribe_section(
     ui: &mut egui::Ui,
     state: &mut MqttPanelState,
     engine: &EngineHandle,
-    hubs: &HubModel,
+    hubs: &mut HubModel,
     p: &ThemePalette,
-) {
+) -> bool {
     section(ui, "WIDE SUBSCRIBE — traffic / bring-up", p);
     ui.label(
         egui::RichText::new(
@@ -789,8 +837,9 @@ fn wide_subscribe_section(
         }
     }
     if dirty {
-        apply_mqtt_session(engine, state, hubs);
+        return apply_mqtt_session(engine, state, hubs);
     }
+    false
 }
 
 fn topic_tree_preview(
@@ -838,9 +887,10 @@ fn edit_embedded_broker(
     ui: &mut egui::Ui,
     state: &mut MqttPanelState,
     engine: &EngineHandle,
-    hubs: &HubModel,
+    hubs: &mut HubModel,
     p: &ThemePalette,
-) {
+) -> bool {
+    let mut dirty = false;
     panel_heading(ui, "Embedded hub broker", p.accent, p);
     ui.add_space(4.0);
     ui.label(
@@ -903,7 +953,8 @@ fn edit_embedded_broker(
         ui.add_space(6.0);
     }
     let (start, stop) = {
-        let can_start = state.embedded.enabled && !state.broker_running;
+        // Start is always available when not running — it also turns Enabled on.
+        let can_start = !state.broker_running;
         let running = state.broker_running;
         let start_label = if running { "Running" } else { "Start broker" };
         ui.horizontal(|ui| {
@@ -916,17 +967,24 @@ fn edit_embedded_broker(
         .inner
     };
     if start {
-        start_embedded_broker(engine, state, hubs);
+        dirty |= start_embedded_broker(engine, state, hubs);
     }
     if stop {
-        stop_embedded_broker(engine, state, hubs);
+        dirty |= stop_embedded_broker(engine, state, hubs);
     }
+    dirty
 }
 
-fn start_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState, hubs: &HubModel) {
+fn start_embedded_broker(
+    engine: &EngineHandle,
+    state: &mut MqttPanelState,
+    hubs: &mut HubModel,
+) -> bool {
+    // Start implies intent to run — keep Enabled in sync for auto-run / project save.
+    state.embedded.enabled = true;
     if !state.embedded.anonymous && state.embedded.username.trim().is_empty() {
         state.broker_status = "Username required when Anonymous login is off".into();
-        return;
+        return false;
     }
     let users: Vec<serde_json::Value> = state
         .embedded
@@ -943,47 +1001,91 @@ fn start_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState, hubs
     .to_string();
     engine.submit(EngineId::Mqtt, EngineCommand::Configure { json });
     let addr = format!("{}:{}", state.embedded.bind, state.embedded.port);
-    // Engine applies configure asynchronously; probe loopback after a short wait.
     let port = state.embedded.port;
-    let probe = std::thread::spawn(move || {
-        for _ in 0..20 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let sock = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            if std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(100))
-                .is_ok()
+    // Wait for the pack to own the listener — not merely "something" on the port
+    // (system Mosquitto on 1883 used to false-positive the TCP probe).
+    let mut ok = false;
+    let mut pack_err = String::new();
+    for _ in 0..25 {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let snap = engine.snapshot();
+        if let Some(slot) = snap.slot(EngineId::Mqtt) {
+            if !slot.last_error.is_empty() {
+                pack_err = slot.last_error.clone();
+            }
+            if slot.state == "broker"
+                || slot.detail_json.contains("\"state\":\"listening\"")
             {
-                return true;
+                ok = true;
+                break;
             }
         }
-        false
-    });
-    // Block briefly so the status line is honest before the next frame.
-    let ok = probe.join().unwrap_or(false);
+    }
     if ok {
         state.broker_running = true;
         state.broker_status = format!("Listening on {addr}");
         // Connect Output/Input binds that target the hub broker.
-        apply_mqtt_session(engine, state, hubs);
+        apply_mqtt_session(engine, state, hubs)
     } else {
         state.broker_running = false;
-        state.broker_status = format!("Could not confirm listen on {addr}");
+        if pack_err.is_empty() {
+            // Hint when another process already owns the port (common: Mosquitto @ 1883).
+            let busy = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                std::time::Duration::from_millis(80),
+            )
+            .is_ok();
+            state.broker_status = if busy {
+                format!(
+                    "Could not start hub broker on {addr} — port is already in use \
+                     (e.g. system Mosquitto). Change Port or stop the other broker."
+                )
+            } else {
+                format!("Could not start hub broker on {addr}")
+            };
+        } else {
+            state.broker_status = pack_err;
+        }
+        false
     }
 }
 
-fn stop_embedded_broker(engine: &EngineHandle, state: &mut MqttPanelState, hubs: &HubModel) {
+/// Mirror pack hub-broker state into the panel so Stop/Start stay honest after reload.
+fn sync_broker_running_from_host(host: &HostSnapshot, state: &mut MqttPanelState) {
+    let Some(slot) = host.slot(EngineId::Mqtt) else {
+        return;
+    };
+    let running = slot.state == "broker"
+        || slot.detail_json.contains("\"state\":\"listening\"");
+    if running != state.broker_running {
+        state.broker_running = running;
+        if running && state.broker_status.is_empty() {
+            state.broker_status = format!(
+                "Listening on {}:{}",
+                state.embedded.bind, state.embedded.port
+            );
+        }
+    }
+}
+
+fn stop_embedded_broker(
+    engine: &EngineHandle,
+    state: &mut MqttPanelState,
+    hubs: &mut HubModel,
+) -> bool {
     let json = serde_json::json!({ "op": "broker_stop" }).to_string();
     engine.submit(EngineId::Mqtt, EngineCommand::Configure { json });
     state.broker_running = false;
     state.broker_status = "Stopped".into();
     // Drop auto_connect on the synthetic hub client.
-    apply_mqtt_session(engine, state, hubs);
+    apply_mqtt_session(engine, state, hubs)
 }
 
 /// Start the embedded hub broker when project settings ask for it and config is enabled.
 pub fn maybe_auto_start_embedded(
     engine: &EngineHandle,
     state: &mut MqttPanelState,
-    hubs: &HubModel,
+    hubs: &mut HubModel,
     auto_run: bool,
 ) {
     if !auto_run || !state.embedded.enabled || state.broker_running {
