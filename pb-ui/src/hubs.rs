@@ -4216,7 +4216,6 @@ fn edit_port(
             incoming,
             stream_connections,
             host,
-<<<<<<< HEAD
             p,
         ));
     }
@@ -4241,8 +4240,6 @@ fn edit_port(
             port_id,
             incoming,
             snmp_connections,
-=======
->>>>>>> 5d58d2a (feat(hubs): LIVE EMIT preview on Streams TCP Output)
             p,
         ));
     }

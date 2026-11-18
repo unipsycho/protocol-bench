@@ -216,18 +216,14 @@ impl ProtocolBenchApp {
                         mqtt_saved = MqttProject::from_panel(&mqtt);
                         http_saved = HttpProject::from_panel(&http);
                         streams_saved = StreamsProject::from_panel(&streams);
-<<<<<<< HEAD
                         las_saved = LasProject::from_panel(&las);
                         snmp_saved = SnmpProject::from_panel(&snmp);
-                        mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &ui_state.hubs);
-=======
                         // Repair orphan hub mqtt_connection ids before materializing points.
                         if mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &mut ui_state.hubs) {
                             seed_layout = true;
                         }
                         // IPC: local PointStore is a mirror — promote hub binds and push to service.
                         Self::push_hub_binds_to_service(&engine, &mut ui_state.hubs);
->>>>>>> 679ba3d (fix(mqtt): remap orphan hub connections so external brokers stream)
                         mqtt_panel::maybe_auto_start_embedded(
                             &engine,
                             &mut mqtt,
