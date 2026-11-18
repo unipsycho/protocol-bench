@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 
 use crate::dock::DockPane;
 use crate::http_panel::{self, HttpPanelState};
+use crate::las_panel::LasPanelState;
 use crate::mqtt_panel::MqttPanelState;
 use crate::opcua_browse::{self, BrowseAction, BrowseMode};
 use crate::opcua_panel::OpcUaPanelState;
@@ -72,18 +73,21 @@ pub enum HubProto {
     Files,
     /// HTTP / REST — Input/Output only (not hub-capable).
     Http,
+    /// LAS well-log — Input/Output only (not hub-capable).
+    Las,
     /// SNMP — Input poll (not hub-capable). SET Output later.
     Snmp,
 }
 
 impl HubProto {
-    pub const ALL: [HubProto; 7] = [
+    pub const ALL: [HubProto; 8] = [
         HubProto::Streams,
         HubProto::Modbus,
         HubProto::Mqtt,
         HubProto::OpcUa,
         HubProto::Files,
         HubProto::Http,
+        HubProto::Las,
         HubProto::Snmp,
     ];
 
@@ -98,6 +102,7 @@ impl HubProto {
             Self::OpcUa => "OPC UA",
             Self::Files => "Files",
             Self::Http => "HTTP / REST",
+            Self::Las => "LAS",
             Self::Snmp => "SNMP",
         }
     }
@@ -110,6 +115,7 @@ impl HubProto {
             Self::OpcUa => DockPane::OpcUa,
             Self::Files => DockPane::Files,
             Self::Http => DockPane::Http,
+            Self::Las => DockPane::Las,
             Self::Snmp => DockPane::Snmp,
         }
     }
@@ -207,6 +213,25 @@ pub struct HttpOutputBind {
     /// JSON field path in the request body.
     #[serde(default)]
     pub json_path: String,
+}
+
+/// Input node: LAS curve mnemonic → host point (`las_N`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LasInputBind {
+    /// Curve mnemonic from `~C`.
+    #[serde(default)]
+    pub curve: String,
+    /// Empty on new binds — host assigns `las_N`.
+    #[serde(default)]
+    pub point: String,
+}
+
+/// Output node: host point → LAS curve mnemonic.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LasOutputBind {
+    pub point: String,
+    #[serde(default)]
+    pub curve: String,
 }
 
 /// Input node: SNMP OID → host point (`snmp_N`).
@@ -320,6 +345,16 @@ pub struct HubPort {
     pub stream_inputs: Vec<StreamInputBind>,
     #[serde(default)]
     pub stream_outputs: Vec<StreamOutputBind>,
+    /// LAS endpoint id from the LAS panel.
+    #[serde(default)]
+    pub las_endpoint: String,
+    /// Index kind: `depth` | `time`.
+    #[serde(default = "default_las_index")]
+    pub las_index: String,
+    #[serde(default)]
+    pub las_inputs: Vec<LasInputBind>,
+    #[serde(default)]
+    pub las_outputs: Vec<LasOutputBind>,
     /// SNMP target id from the SNMP panel.
     #[serde(default)]
     pub snmp_target: String,
@@ -364,6 +399,12 @@ pub struct HubPort {
     #[serde(skip)]
     pub draft_stream_out_field: String,
     #[serde(skip)]
+    pub draft_las_curve: String,
+    #[serde(skip)]
+    pub draft_las_out_point: String,
+    #[serde(skip)]
+    pub draft_las_out_curve: String,
+    #[serde(skip)]
     pub draft_snmp_oid: String,
 }
 
@@ -381,6 +422,7 @@ fn default_stream_idle() -> f32 { 50.0 }
 fn default_stream_parser() -> String { "whole_line".into() }
 fn default_stream_ts() -> String { "receive".into() }
 fn default_snmp_interval() -> f32 { 10.0 }
+fn default_las_index() -> String { "depth".into() }
 
 impl HubPort {
     pub fn new(id: u64, protocol: HubProto, label: impl Into<String>) -> Self {
@@ -412,6 +454,10 @@ impl HubPort {
             stream_timestamp_custom: String::new(),
             stream_inputs: Vec::new(),
             stream_outputs: Vec::new(),
+            las_endpoint: String::new(),
+            las_index: default_las_index(),
+            las_inputs: Vec::new(),
+            las_outputs: Vec::new(),
             snmp_target: String::new(),
             snmp_interval_secs: default_snmp_interval(),
             snmp_inputs: Vec::new(),
@@ -430,6 +476,9 @@ impl HubPort {
             draft_stream_field: String::new(),
             draft_stream_out_point: String::new(),
             draft_stream_out_field: String::new(),
+            draft_las_curve: String::new(),
+            draft_las_out_point: String::new(),
+            draft_las_out_curve: String::new(),
             draft_snmp_oid: String::new(),
         }
     }
@@ -2055,12 +2104,14 @@ pub fn paint(
     opcua: &mut OpcUaPanelState,
     http: &HttpPanelState,
     streams: &StreamsPanelState,
+    las: &LasPanelState,
     snmp: &SnmpPanelState,
     host: &HostSnapshot,
     engine: &crate::engine_api::EngineHandle,
 ) -> HubChange {
     let http_connections = http.connection_choices();
     let stream_connections = streams.connection_choices();
+    let las_connections = las.connection_choices();
     let snmp_connections = snmp.connection_choices();
     let mut change = HubChange::quiet();
     // Keep Output auto-binds aligned with inbound feed wires (PB-63).
@@ -2122,6 +2173,7 @@ pub fn paint(
                 mqtt_connections,
                 &http_connections,
                 &stream_connections,
+                &las_connections,
                 &snmp_connections,
                 mqtt,
                 opcua,
@@ -2143,6 +2195,7 @@ pub fn paint(
             mqtt_connections,
             &http_connections,
             &stream_connections,
+            &las_connections,
             &snmp_connections,
             mqtt,
             opcua,
@@ -3729,6 +3782,7 @@ fn inspector(
     mqtt_connections: &[(String, String)],
     http_connections: &[(String, String)],
     stream_connections: &[(String, String)],
+    las_connections: &[(String, String)],
     snmp_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
@@ -3766,6 +3820,7 @@ fn inspector(
                 mqtt_connections,
                 http_connections,
                 stream_connections,
+                las_connections,
                 snmp_connections,
                 mqtt,
                 opcua,
@@ -3784,6 +3839,7 @@ fn edit_selected(
     mqtt_connections: &[(String, String)],
     http_connections: &[(String, String)],
     stream_connections: &[(String, String)],
+    las_connections: &[(String, String)],
     snmp_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
@@ -3831,6 +3887,7 @@ fn edit_selected(
             mqtt_connections,
             http_connections,
             stream_connections,
+            las_connections,
             snmp_connections,
             mqtt,
             opcua,
@@ -3961,6 +4018,7 @@ fn edit_port(
     mqtt_connections: &[(String, String)],
     _http_connections: &[(String, String)],
     stream_connections: &[(String, String)],
+    las_connections: &[(String, String)],
     snmp_connections: &[(String, String)],
     mqtt: &mut MqttPanelState,
     opcua: &mut OpcUaPanelState,
@@ -4093,6 +4151,18 @@ fn edit_port(
             port_id,
             incoming,
             stream_connections,
+            p,
+        ));
+    }
+    if proto == HubProto::Las {
+        ui.add_space(space::SECTION - 2.0);
+        change = change.join(edit_las_port_binds(
+            ui,
+            model,
+            hub_id,
+            port_id,
+            incoming,
+            las_connections,
             p,
         ));
     }
@@ -5485,6 +5555,170 @@ fn sample_fields(sample: &str, parser: &str, widths: &str, regex: &str) -> Vec<S
 
 fn split_csv_like(line: &str, sep: char) -> Vec<String> {
     line.split(sep).map(|s| s.trim().to_string()).collect()
+}
+
+fn edit_las_port_binds(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    hub_id: u64,
+    port_id: u64,
+    incoming: bool,
+    las_connections: &[(String, String)],
+    p: &ThemePalette,
+) -> HubChange {
+    let mut change = HubChange::quiet();
+    apply_form_spacing(ui);
+    ui.label(
+        egui::RichText::new("LAS ENDPOINT")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(space::AFTER_HEADING);
+    let current = port_field(model, hub_id, port_id).las_endpoint.clone();
+    let current_label = las_connections
+        .iter()
+        .find(|(id, _)| id == &current)
+        .map(|(_, label)| label.as_str())
+        .unwrap_or(if current.is_empty() {
+            "(pick endpoint)"
+        } else {
+            current.as_str()
+        });
+    let mut next = current.clone();
+    egui::ComboBox::from_id_salt(("pb_hub_las_ep", port_id))
+        .selected_text(current_label)
+        .width((ui.available_width()).min(280.0).max(140.0))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut next, String::new(), "(none)");
+            for (id, label) in las_connections {
+                ui.selectable_value(&mut next, id.clone(), label);
+            }
+        });
+    if next != current {
+        port_field(model, hub_id, port_id).las_endpoint = next;
+        change.dirty = true;
+    }
+
+    {
+        let port = port_field(model, hub_id, port_id);
+        change.dirty |= combo_owned(
+            ui,
+            "Index",
+            &mut port.las_index,
+            &[("depth", "Depth"), ("time", "Time")],
+            ("pb_las_index", port_id),
+            p,
+        );
+    }
+
+    if incoming {
+        ui.add_space(space::SECTION - 2.0);
+        ui.label(
+            egui::RichText::new("CURVES → las_N")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        ui.label(
+            egui::RichText::new("Curve preview needs pb-las — enter mnemonics from ~C for now.")
+                .font(font_ui(11.0))
+                .color(p.muted),
+        );
+        let mut remove = None;
+        let n = port_field(model, hub_id, port_id).las_inputs.len();
+        for i in 0..n {
+            let bind = port_field(model, hub_id, port_id).las_inputs[i].clone();
+            let point = if bind.point.is_empty() {
+                "las_N".to_string()
+            } else {
+                bind.point.clone()
+            };
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::ITEM_X;
+                ui.label(
+                    egui::RichText::new(format!("{point}  ·  {}", bind.curve))
+                        .font(font_ui(12.0))
+                        .color(p.text),
+                );
+                if text_button(ui, "×", false, p).clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            port_field(model, hub_id, port_id).las_inputs.remove(i);
+            change.dirty = true;
+        }
+        let mut add = false;
+        {
+            let port = port_field(model, hub_id, port_id);
+            inspect_field(ui, "Curve", &mut port.draft_las_curve, p);
+            if text_button(ui, "Add bind", false, p).clicked() {
+                add = true;
+            }
+        }
+        if add {
+            let port = port_field(model, hub_id, port_id);
+            let curve = port.draft_las_curve.trim().to_string();
+            if !curve.is_empty() && !port.las_inputs.iter().any(|b| b.curve == curve) {
+                port.las_inputs.push(LasInputBind {
+                    curve,
+                    point: String::new(),
+                });
+                port.draft_las_curve.clear();
+                change.dirty = true;
+            }
+        }
+    } else {
+        ui.add_space(space::SECTION - 2.0);
+        ui.label(
+            egui::RichText::new("OUTPUT BINDS — point → curve")
+                .font(font_ui(10.5))
+                .color(p.muted),
+        );
+        ui.add_space(space::AFTER_HEADING);
+        let mut remove = None;
+        let n = port_field(model, hub_id, port_id).las_outputs.len();
+        for i in 0..n {
+            let bind = port_field(model, hub_id, port_id).las_outputs[i].clone();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::ITEM_X;
+                ui.label(
+                    egui::RichText::new(format!("{}  →  {}", bind.point, bind.curve))
+                        .font(font_ui(12.0))
+                        .color(p.text),
+                );
+                if text_button(ui, "×", false, p).clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            port_field(model, hub_id, port_id).las_outputs.remove(i);
+            change.dirty = true;
+        }
+        let mut add = false;
+        {
+            let port = port_field(model, hub_id, port_id);
+            inspect_field(ui, "Point", &mut port.draft_las_out_point, p);
+            inspect_field(ui, "Curve", &mut port.draft_las_out_curve, p);
+            if text_button(ui, "Add bind", false, p).clicked() {
+                add = true;
+            }
+        }
+        if add {
+            let port = port_field(model, hub_id, port_id);
+            let point = port.draft_las_out_point.trim().to_string();
+            let curve = port.draft_las_out_curve.trim().to_string();
+            if !point.is_empty() && !curve.is_empty() {
+                port.las_outputs.push(LasOutputBind { point, curve });
+                port.draft_las_out_point.clear();
+                port.draft_las_out_curve.clear();
+                change.dirty = true;
+            }
+        }
+    }
+    change
 }
 
 fn edit_snmp_port_binds(

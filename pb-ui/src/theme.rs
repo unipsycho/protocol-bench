@@ -48,6 +48,8 @@ impl Proto {
     pub const MQTT_DEEP: Color32 = Color32::from_rgb(0x0e, 0x75, 0x6c);
     /// HTTP / REST (amber-teal distinct from MQTT).
     pub const HTTP: Color32 = Color32::from_rgb(0xe0, 0x8a, 0x3c);
+    pub const LAS: Color32 = Color32::from_rgb(0xa8, 0xc4, 0x6a);
+    pub const LAS_DEEP: Color32 = Color32::from_rgb(0x4a, 0x6a, 0x1c);
     pub const HTTP_DEEP: Color32 = Color32::from_rgb(0x9a, 0x52, 0x12);
     pub const OPC: Color32 = Color32::from_rgb(0xc4, 0xb5, 0xfd);
     pub const OPC_DEEP: Color32 = Color32::from_rgb(0x5b, 0x3d, 0x9e);

@@ -56,6 +56,9 @@ pub struct ProjectFile {
     /// Streams / TCP endpoints (serial + TCP client/listener). Absent → defaults.
     #[serde(default)]
     pub streams: StreamsProject,
+    /// LAS well-log endpoints. Absent on older files → defaults.
+    #[serde(default)]
+    pub las: LasProject,
     /// SNMP agent targets. Absent on older files → defaults.
     #[serde(default)]
     pub snmp: SnmpProject,
@@ -128,11 +131,135 @@ impl Default for ProjectFile {
             opcua: OpcUaProject::default(),
             http: HttpProject::default(),
             streams: StreamsProject::default(),
+            las: LasProject::default(),
             snmp: SnmpProject::default(),
             hubs: None,
             settings: ProjectSettings::default(),
             layout: None,
         }
+    }
+}
+
+/// LAS well-log file endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LasProject {
+    #[serde(default)]
+    pub endpoints: Vec<LasEndpointSerde>,
+    #[serde(default)]
+    pub selected_id: String,
+}
+
+impl Default for LasProject {
+    fn default() -> Self {
+        let ep = LasEndpointSerde::default_incoming();
+        Self {
+            selected_id: ep.id.clone(),
+            endpoints: vec![ep],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LasEndpointSerde {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default = "default_las_role")]
+    pub role: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default = "default_las_version")]
+    pub version: String,
+    #[serde(default = "default_las_follow")]
+    pub follow: bool,
+}
+
+fn default_las_role() -> String {
+    "incoming".into()
+}
+fn default_las_version() -> String {
+    "2.0".into()
+}
+fn default_las_follow() -> bool {
+    true
+}
+
+impl LasEndpointSerde {
+    fn default_incoming() -> Self {
+        Self {
+            id: "well-a".into(),
+            label: "Well A".into(),
+            role: default_las_role(),
+            path: String::new(),
+            version: default_las_version(),
+            follow: true,
+        }
+    }
+
+    fn from_endpoint(e: &crate::las_panel::LasEndpoint) -> Self {
+        Self {
+            id: e.id.clone(),
+            label: e.label.clone(),
+            role: e.role.as_str().into(),
+            path: e.path.clone(),
+            version: e.version.clone(),
+            follow: e.follow,
+        }
+    }
+
+    fn to_endpoint(&self) -> crate::las_panel::LasEndpoint {
+        crate::las_panel::LasEndpoint {
+            id: self.id.clone(),
+            label: if self.label.is_empty() {
+                self.id.clone()
+            } else {
+                self.label.clone()
+            },
+            role: crate::las_panel::LasRole::from_str(&self.role),
+            path: self.path.clone(),
+            version: if self.version.is_empty() {
+                default_las_version()
+            } else {
+                self.version.clone()
+            },
+            follow: self.follow,
+        }
+    }
+}
+
+impl LasProject {
+    pub fn from_panel(state: &crate::las_panel::LasPanelState) -> Self {
+        let endpoints = state
+            .endpoints
+            .iter()
+            .map(LasEndpointSerde::from_endpoint)
+            .collect();
+        let selected_id = state
+            .selected()
+            .map(|e| e.id.clone())
+            .unwrap_or_default();
+        Self {
+            endpoints,
+            selected_id,
+        }
+    }
+
+    pub fn apply_to_panel(&self, state: &mut crate::las_panel::LasPanelState) {
+        state.endpoints = self.endpoints.iter().map(|e| e.to_endpoint()).collect();
+        if state.endpoints.is_empty() {
+            state
+                .endpoints
+                .push(crate::las_panel::LasEndpoint::default_incoming());
+        }
+        state.selected = if self.selected_id.is_empty() {
+            None
+        } else {
+            state
+                .endpoints
+                .iter()
+                .position(|e| e.id == self.selected_id)
+        };
+        state.pending_delete = None;
     }
 }
 
@@ -253,7 +380,6 @@ impl SnmpProject {
         state.pending_delete = None;
     }
 }
-
 /// HTTP / REST clients (outbound JSON).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HttpProject {
@@ -1109,6 +1235,7 @@ pub fn load(path: &Path) -> Result<ProjectFile, String> {
             opcua: OpcUaProject::default(),
             http: HttpProject::default(),
             streams: StreamsProject::default(),
+            las: LasProject::default(),
             snmp: SnmpProject::default(),
             hubs: None,
             settings: ProjectSettings::default(),
@@ -1174,7 +1301,7 @@ pub fn import_bindings_to_store(
 /// Promote Hub Input (and aggregator) binds into the point bus.
 ///
 /// New Input binds leave `point` empty — this allocates `mqtt_N` / `opc_N` /
-/// `http_N` / `stream_N` / `snmp_N` and writes the id back onto the bind. Existing short
+/// `http_N` / `stream_N` / `las_N` / `snmp_N` and writes the id back onto the bind. Existing short
 /// ids are re-bound to their wire address so `project.points` and the live
 /// store stay aligned after IPC.
 /// Returns true when any hub bind field changed (caller should dirty-save).
@@ -1258,7 +1385,24 @@ pub fn materialize_hub_point_binds(hubs: &mut HubModel, store: &mut PointStore) 
                         }
                     }
                 }
-                HubProto::Snmp => {
+                HubProto::Las => {
+                    let endpoint = port.las_endpoint.clone();
+                    for bind in &mut port.las_inputs {
+                        let curve = bind.curve.trim();
+                        if curve.is_empty() {
+                            continue;
+                        }
+                        let source = point_rows::las_bind_source(&endpoint, curve);
+                        if bind.point.trim().is_empty() {
+                            let id = store.ensure_id("las", &source);
+                            bind.point = id;
+                            dirty = true;
+                        } else {
+                            store.bind(bind.point.trim(), &source);
+                        }
+                    }
+                }
+HubProto::Snmp => {
                     let target = port.snmp_target.clone();
                     for bind in &mut port.snmp_inputs {
                         let oid = bind.oid.trim();
@@ -1399,6 +1543,7 @@ mod tests {
             opcua: OpcUaProject::default(),
             http: HttpProject::default(),
             streams: StreamsProject::default(),
+            las: LasProject::default(),
             snmp: SnmpProject::default(),
             hubs: None,
             settings: ProjectSettings {
