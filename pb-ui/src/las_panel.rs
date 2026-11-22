@@ -2,10 +2,71 @@
 
 use egui::{Layout, RichText, Sense, UiBuilder};
 
-use crate::connection_list::{self, RowAction};
+use crate::connection_list::{self, text_btn, Dot, RowAction};
+use pb_engine::{EngineId, HostSnapshot};
 use crate::theme::{apply_form_spacing, font_ui, form_inset, space, ThemePalette};
 
 const LABEL_W: f32 = 110.0;
+
+/// One endpoint as the LAS pack reports it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LiveEp {
+    pub id: String,
+    pub role: String,
+    pub state: String,
+    pub connected: bool,
+    pub error: String,
+    pub rows: u64,
+    pub bad_rows: u64,
+    pub offset: u64,
+    /// Curve mnemonics of the file (incoming), for the curve picker.
+    pub curves: Vec<String>,
+}
+
+pub fn parse_live(detail_json: &str) -> Vec<LiveEp> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(detail_json) else { return Vec::new() };
+    let st = |c: &serde_json::Value, k: &str| c.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let n = |c: &serde_json::Value, k: &str| c.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    v.get("endpoints")
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+        .map(|c| LiveEp {
+            id: st(c, "id"),
+            role: st(c, "role"),
+            state: st(c, "state"),
+            connected: c.get("connected").and_then(|x| x.as_bool()).unwrap_or(false),
+            error: st(c, "error"),
+            rows: n(c, "rows"),
+            bad_rows: n(c, "bad_rows"),
+            offset: n(c, "offset"),
+            curves: c.get("curves").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Live endpoints from the host snapshot, plus whether the LAS pack is loaded.
+pub fn live_from_host(host: &HostSnapshot) -> (Vec<LiveEp>, bool) {
+    match host.slot(EngineId::Las) {
+        Some(slot) => (parse_live(&slot.detail_json), slot.pack_loaded),
+        None => (Vec::new(), false),
+    }
+}
+
+/// Dot + text for an endpoint (also used by the hub LAS Input / Output inspector).
+pub fn show_status(ui: &mut egui::Ui, p: &ThemePalette, live: Option<&LiveEp>, pack_loaded: bool) {
+    let (dot, text, err) = if !pack_loaded {
+        (Dot::Warn, "LAS pack not loaded — copy libpb_las into the service modules/ folder".to_string(), String::new())
+    } else {
+        match live {
+            None => (Dot::Idle, "Idle — no hub LAS node binds a curve from this endpoint".to_string(), String::new()),
+            Some(l) if l.connected => (Dot::Ok, l.state.clone(), l.error.clone()),
+            Some(l) if l.state == "error" => (Dot::Err, "Error".to_string(), l.error.clone()),
+            Some(l) => (Dot::Warn, l.state.clone(), l.error.clone()),
+        }
+    };
+    connection_list::status_line(ui, p, dot, &text, &err);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LasRole {
@@ -134,17 +195,11 @@ impl LasPanelState {
     }
 
     fn unique_id(&self, base: &str) -> String {
-        let mut id = base.to_string();
-        let mut n = 2;
-        while self.endpoints.iter().any(|e| e.id == id) {
-            id = format!("{base}-{n}");
-            n += 1;
-        }
-        id
+        connection_list::unique_id(base, |id| self.endpoints.iter().any(|e| e.id == id))
     }
 }
 
-pub fn paint(ui: &mut egui::Ui, p: &ThemePalette, state: &mut LasPanelState) -> bool {
+pub fn paint(ui: &mut egui::Ui, p: &ThemePalette, state: &mut LasPanelState, host: &HostSnapshot) -> bool {
     state.ensure_endpoints();
     let mut dirty = false;
     let full = ui.available_rect_before_wrap();
@@ -154,15 +209,16 @@ pub fn paint(ui: &mut egui::Ui, p: &ThemePalette, state: &mut LasPanelState) -> 
             .max_rect(inner)
             .layout(Layout::top_down(egui::Align::Min)),
         |ui| {
-            dirty = paint_body(ui, p, state);
+            dirty = paint_body(ui, p, state, host);
         },
     );
     ui.allocate_rect(full, Sense::hover());
     dirty
 }
 
-fn paint_body(ui: &mut egui::Ui, p: &ThemePalette, state: &mut LasPanelState) -> bool {
+fn paint_body(ui: &mut egui::Ui, p: &ThemePalette, state: &mut LasPanelState, host: &HostSnapshot) -> bool {
     apply_form_spacing(ui);
+    let (live, pack_loaded) = live_from_host(host);
     let mut dirty = false;
     ui.label(
         RichText::new(
@@ -198,7 +254,13 @@ fn paint_body(ui: &mut egui::Ui, p: &ThemePalette, state: &mut LasPanelState) ->
         } else {
             ep.label.clone()
         };
-        match connection_list::selectable_row(ui, &label, &ep.summary(), selected, show_delete, p) {
+        let status = match live.iter().find(|l| l.id == ep.id) {
+            Some(l) => l.state.clone(),
+            None if !pack_loaded => "pack not loaded".to_string(),
+            None => "idle".to_string(),
+        };
+        let subtitle = format!("{}  ·  {status}", ep.summary());
+        match connection_list::selectable_row(ui, &label, &subtitle, selected, show_delete, p) {
             Some(RowAction::Select) => select = Some(i),
             Some(RowAction::Delete) => {
                 state.pending_delete = Some((i, label));
@@ -238,13 +300,34 @@ fn paint_body(ui: &mut egui::Ui, p: &ThemePalette, state: &mut LasPanelState) ->
         return dirty;
     }
 
-    dirty |= edit_endpoint(ui, state, p);
+    dirty |= edit_endpoint(ui, state, p, &live, pack_loaded);
     dirty
 }
 
-fn edit_endpoint(ui: &mut egui::Ui, state: &mut LasPanelState, p: &ThemePalette) -> bool {
+fn edit_endpoint(ui: &mut egui::Ui, state: &mut LasPanelState, p: &ThemePalette, live: &[LiveEp], pack_loaded: bool) -> bool {
     let mut dirty = false;
     let mut browse = false;
+    {
+        let id = state.selected().map(|e| e.id.clone()).unwrap_or_default();
+        ui.label(RichText::new("STATUS").font(font_ui(10.5)).color(p.muted));
+        ui.add_space(space::AFTER_HEADING);
+        let mine = live.iter().find(|l| l.id == id);
+        show_status(ui, p, mine, pack_loaded);
+        if let Some(l) = mine {
+            let mut bits = vec![format!("{} rows", l.rows)];
+            if l.role != "outgoing" {
+                bits.push(format!("offset {} B", l.offset));
+            }
+            if l.bad_rows > 0 {
+                bits.push(format!("{} bad", l.bad_rows));
+            }
+            if !l.curves.is_empty() {
+                bits.push(format!("curves: {}", l.curves.join(", ")));
+            }
+            ui.label(RichText::new(bits.join("  ·  ")).font(font_ui(11.0)).color(p.muted));
+        }
+        ui.add_space(space::SECTION);
+    }
     {
         let e = state.selected_mut().unwrap();
         dirty |= field(ui, "Id", &mut e.id, p);
@@ -369,17 +452,17 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) -
     dirty
 }
 
-fn text_btn(ui: &mut egui::Ui, label: &str, selected: bool, p: &ThemePalette) -> egui::Response {
-    let fill = if selected { p.accent } else { p.control };
-    let text = if selected {
-        egui::Color32::from_rgb(0x12, 0x14, 0x18)
-    } else {
-        p.text
-    };
-    ui.add(
-        egui::Button::new(RichText::new(label).font(font_ui(12.0)).color(text))
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, p.line))
-            .sense(Sense::click()),
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_endpoints_parse_with_curves() {
+        let j = r#"{"endpoints":[{"id":"w","path":"/a.las","role":"incoming","state":"following","connected":true,"error":"","rows":9,"bad_rows":0,"offset":120,"curves":["DEPT","GR"]}]}"#;
+        let l = parse_live(j);
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].curves, vec!["DEPT", "GR"]);
+        assert_eq!((l[0].rows, l[0].offset), (9, 120));
+        assert!(parse_live("nope").is_empty());
+    }
 }

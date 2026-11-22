@@ -8,6 +8,8 @@ Date: 2026-11-13. Status: **settled — Option A (plugin ABI)**; **MQTT client p
 
 Entitlements are license-driven: **no fixed free protocol list** — the license defines which protocols/packs the customer gets. Offline grace ~**7 days** (phone-home to the license server; not a strict check on every operation).
 
+> **Writing a pack?** Packs no longer hand-write the C entry points — they implement `pb_abi::Pack` and call `pb_abi::export_pack!`. See [pack-development.md](pack-development.md).
+
 ## MQTT client pack (first implementation)
 
 **Client-first + optional embed.** `pb-mqtt` is a `cdylib` (+ `rlib` for unit tests) that speaks MQTT via **rumqttc 0.24** (`websocket` + `use-rustls`) for source/output clients, and can start an optional **rumqttd 0.20** LAN listener from `mqtt.embedded` (Start/Stop in the MQTT panel).

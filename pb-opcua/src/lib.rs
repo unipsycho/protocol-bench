@@ -6,17 +6,13 @@
 mod server;
 mod session;
 
-use pb_abi::{
-    write_cstr, PbHostApi, PbPackApi, PB_ABI_VERSION, PB_LOG_ERROR, PB_LOG_INFO, PB_QUALITY_BAD,
-    PB_QUALITY_GOOD, PB_VALUE_STRING,
-};
+use pb_abi::{HostRef, Pack, PB_LOG_ERROR, PB_LOG_INFO, PB_QUALITY_BAD, PB_QUALITY_GOOD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use server::{EmbeddedServer, EmbeddedServerConfig, PointSnap};
 use session::{BrowseNode, OpcUaSession, SessionEvent};
 use std::collections::BTreeMap;
-use std::ffi::CStr;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::c_int;
 use std::sync::mpsc::TryRecvError;
 
 const PACK_ID: &[u8] = b"opcua\0";
@@ -132,7 +128,7 @@ impl ClientRuntime {
 }
 
 struct PackState {
-    host: PbHostApi,
+    host: HostRef,
     clients: BTreeMap<String, ClientRuntime>,
     embedded: Option<EmbeddedServer>,
     embedded_error: String,
@@ -140,7 +136,7 @@ struct PackState {
 }
 
 impl PackState {
-    fn new(host: PbHostApi) -> Self {
+    fn new(host: HostRef) -> Self {
         Self {
             host,
             clients: BTreeMap::new(),
@@ -151,39 +147,12 @@ impl PackState {
     }
 
     fn log(&self, level: i32, msg: &str) {
-        if let Some(log) = self.host.log_message {
-            if let Ok(c) = std::ffi::CString::new(msg) {
-                unsafe { log(self.host.ctx, level, c.as_ptr()) };
-            }
-        }
+        self.host.log(level, msg);
     }
 
     fn upsert_string(&self, name: &str, source: &str, value: &str, good: bool) {
-        let Some(upsert) = self.host.upsert_point else {
-            return;
-        };
-        let Ok(c_name) = std::ffi::CString::new(name) else {
-            return;
-        };
-        let Ok(c_src) = std::ffi::CString::new(source) else {
-            return;
-        };
-        let bytes = value.as_bytes();
-        unsafe {
-            upsert(
-                self.host.ctx,
-                c_name.as_ptr(),
-                PB_VALUE_STRING,
-                bytes.as_ptr() as *const c_void,
-                bytes.len(),
-                if good {
-                    PB_QUALITY_GOOD
-                } else {
-                    PB_QUALITY_BAD
-                },
-                c_src.as_ptr(),
-            );
-        }
+        let quality = if good { PB_QUALITY_GOOD } else { PB_QUALITY_BAD };
+        self.host.upsert_text(name, source, value, quality);
     }
 
     fn stop_client(rt: &mut ClientRuntime) {
@@ -699,217 +668,103 @@ fn connectivity_checklist(detail: &str) -> String {
     steps.join("\n")
 }
 
-// —— C ABI ——
+impl Pack for PackState {
+    const ID: &'static [u8] = PACK_ID;
+    const TITLE: &'static [u8] = PACK_TITLE;
+    const SUBSCRIBE: bool = true;
 
-#[no_mangle]
-pub unsafe extern "C" fn pb_pack_abi_version() -> u32 {
-    PB_ABI_VERSION
-}
+    fn new(host: HostRef) -> Self {
+        PackState::new(host)
+    }
 
-#[no_mangle]
-pub unsafe extern "C" fn pb_pack_register(out: *mut PbPackApi) -> c_int {
-    if out.is_null() {
-        return -1;
+    fn configure(&mut self, json: &str) -> Result<(), String> {
+        self.configure_json(json)
     }
-    *out = PbPackApi {
-        abi_version: PB_ABI_VERSION,
-        id: PACK_ID.as_ptr() as *const c_char,
-        title: PACK_TITLE.as_ptr() as *const c_char,
-        create: Some(pack_create),
-        destroy: Some(pack_destroy),
-        configure: Some(pack_configure),
-        connect: Some(pack_connect),
-        disconnect: Some(pack_disconnect),
-        subscribe: Some(pack_subscribe),
-        publish: None,
-        write_point: Some(pack_write_point),
-        poll: Some(pack_poll),
-        state_label: Some(pack_state_label),
-        last_error: Some(pack_last_error),
-        is_connected: Some(pack_is_connected),
-        topics_json: Some(pack_topics_json),
-    };
-    0
-}
 
-unsafe extern "C" fn pack_create(host: *const PbHostApi) -> *mut c_void {
-    if host.is_null() {
-        return std::ptr::null_mut();
+    fn config_failed(&mut self, err: String) {
+        self.log(PB_LOG_ERROR, &err);
     }
-    let state = Box::new(PackState::new(*host));
-    Box::into_raw(state) as *mut c_void
-}
 
-unsafe extern "C" fn pack_destroy(handle: *mut c_void) {
-    if handle.is_null() {
-        return;
-    }
-    let mut state = Box::from_raw(handle as *mut PackState);
-    state.stop_embedded();
-    let ids: Vec<String> = state.clients.keys().cloned().collect();
-    for id in ids {
-        if let Some(mut rt) = state.clients.remove(&id) {
-            PackState::stop_client(&mut rt);
-        }
-    }
-}
-
-unsafe extern "C" fn pack_configure(handle: *mut c_void, json: *const c_char, len: usize) -> c_int {
-    let Some(state) = (handle as *mut PackState).as_mut() else {
-        return -1;
-    };
-    if json.is_null() {
-        return -1;
-    }
-    let slice = std::slice::from_raw_parts(json as *const u8, len);
-    let text = match std::str::from_utf8(slice) {
-        Ok(t) => t,
-        Err(_) => {
-            // Some hosts pass NUL-terminated without exact len.
-            match CStr::from_ptr(json).to_str() {
-                Ok(t) => t,
-                Err(_) => return -1,
+    /// Connect the first client that has no session yet (the host calls this once per Start).
+    fn connect(&mut self) -> c_int {
+        for rt in self.clients.values_mut() {
+            if rt.session.is_none() {
+                return match PackState::start_client(rt) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        rt.last_error = e;
+                        -1
+                    }
+                };
             }
         }
-    };
-    match state.configure_json(text) {
-        Ok(()) => 0,
-        Err(e) => {
-            state.log(PB_LOG_ERROR, &e);
-            -1
-        }
-    }
-}
-
-unsafe extern "C" fn pack_connect(handle: *mut c_void) -> c_int {
-    let Some(state) = (handle as *mut PackState).as_mut() else {
-        return -1;
-    };
-    // Connect first client that is not yet connected.
-    for rt in state.clients.values_mut() {
-        if rt.session.is_none() {
-            return match PackState::start_client(rt) {
-                Ok(()) => 0,
-                Err(e) => {
-                    rt.last_error = e;
-                    -1
-                }
-            };
-        }
-    }
-    0
-}
-
-unsafe extern "C" fn pack_disconnect(handle: *mut c_void) -> c_int {
-    let Some(state) = (handle as *mut PackState).as_mut() else {
-        return -1;
-    };
-    for rt in state.clients.values_mut() {
-        PackState::stop_client(rt);
-    }
-    0
-}
-
-unsafe extern "C" fn pack_subscribe(handle: *mut c_void, topic: *const c_char, _qos: u8) -> c_int {
-    // Reuse subscribe ABI: topic string is a NodeId to monitor on the first connected client.
-    let Some(state) = (handle as *mut PackState).as_mut() else {
-        return -1;
-    };
-    if topic.is_null() {
-        return -1;
-    }
-    let Ok(node_id) = CStr::from_ptr(topic).to_str() else {
-        return -1;
-    };
-    let Some(rt) = state.clients.values_mut().find(|c| c.connected) else {
-        return -1;
-    };
-    if !rt
-        .config
-        .monitored_nodes
-        .iter()
-        .any(|b| b.node_id == node_id)
-    {
-        rt.config.monitored_nodes.push(MonitoredBind {
-            node_id: node_id.to_string(),
-            point: String::new(),
-            mode: "subscribe".into(),
-        });
-    }
-    match PackState::sync_monitors(rt) {
-        Ok(()) => 0,
-        Err(_) => -1,
-    }
-}
-
-unsafe extern "C" fn pack_write_point(
-    handle: *mut c_void,
-    _name: *const c_char,
-    _value_kind: i32,
-    _value: *const c_void,
-    _value_len: usize,
-) -> c_int {
-    // v1 hub: expose via embedded server (sync_points). External UA writes deferred.
-    let Some(_state) = (handle as *mut PackState).as_mut() else {
-        return -1;
-    };
-    0
-}
-
-unsafe extern "C" fn pack_poll(handle: *mut c_void) {
-    if let Some(state) = (handle as *mut PackState).as_mut() {
-        state.drain();
-    }
-}
-
-unsafe extern "C" fn pack_state_label(
-    handle: *mut c_void,
-    out: *mut c_char,
-    out_len: usize,
-) -> c_int {
-    let Some(state) = (handle as *mut PackState).as_ref() else {
-        return -1;
-    };
-    write_cstr(out, out_len, &state.aggregate_state())
-}
-
-unsafe extern "C" fn pack_last_error(
-    handle: *mut c_void,
-    out: *mut c_char,
-    out_len: usize,
-) -> c_int {
-    let Some(state) = (handle as *mut PackState).as_ref() else {
-        return -1;
-    };
-    write_cstr(out, out_len, &state.aggregate_error())
-}
-
-unsafe extern "C" fn pack_is_connected(handle: *mut c_void) -> c_int {
-    let Some(state) = (handle as *mut PackState).as_ref() else {
-        return 0;
-    };
-    if state.embedded.is_some() || state.clients.values().any(|c| c.connected) {
-        1
-    } else {
         0
     }
+
+    fn disconnect(&mut self) -> c_int {
+        for rt in self.clients.values_mut() {
+            PackState::stop_client(rt);
+        }
+        0
+    }
+
+    fn shutdown(&mut self) {
+        self.stop_embedded();
+        for rt in self.clients.values_mut() {
+            PackState::stop_client(rt);
+        }
+        self.clients.clear();
+    }
+
+    /// The ABI's `subscribe` is reused: `topic` is a NodeId to monitor on the first connected client.
+    fn subscribe(&mut self, node_id: &str, _qos: u8) -> c_int {
+        let Some(rt) = self.clients.values_mut().find(|c| c.connected) else {
+            return -1;
+        };
+        if !rt.config.monitored_nodes.iter().any(|b| b.node_id == node_id) {
+            rt.config.monitored_nodes.push(MonitoredBind {
+                node_id: node_id.to_string(),
+                point: String::new(),
+                mode: "subscribe".into(),
+            });
+        }
+        match PackState::sync_monitors(rt) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    }
+
+    // `write_point` keeps the default (accept and ignore): v1 exposes points through the embedded
+    // server (`sync_points`); writes to external UA servers are not implemented yet.
+
+    fn poll(&mut self) {
+        self.drain();
+    }
+
+    fn state_label(&self) -> String {
+        self.aggregate_state()
+    }
+
+    fn last_error(&self) -> String {
+        self.aggregate_error()
+    }
+
+    fn is_connected(&self) -> bool {
+        self.embedded.is_some() || self.clients.values().any(|c| c.connected)
+    }
+
+    /// Snapshot JSON (clients + server + browse) the UI parses.
+    fn detail_json(&self) -> String {
+        self.clients_snapshot_json()
+    }
 }
 
-unsafe extern "C" fn pack_topics_json(
-    handle: *mut c_void,
-    out: *mut c_char,
-    out_len: usize,
-) -> c_int {
-    // Snapshot JSON (clients + server + browse) — same host buffer path as MQTT traffic.
-    let Some(state) = (handle as *mut PackState).as_ref() else {
-        return -1;
-    };
-    write_cstr(out, out_len, &state.clients_snapshot_json())
-}
+pb_abi::export_pack!(PackState);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pb_abi::{PbPackApi, PB_ABI_VERSION};
 
     #[test]
     fn register_fills_api() {

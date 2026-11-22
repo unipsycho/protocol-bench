@@ -509,92 +509,15 @@ pub fn paint_full_row(
     action
 }
 
-/// MQTT wire address for a Hub Input bind: `mqtt/<conn>/<topic>[::<path>]`.
-pub fn mqtt_bind_source(conn: &str, topic: &str, path: &str) -> String {
-    let conn = conn.trim();
-    let topic = topic.trim();
-    let path = path.trim();
-    let base = if conn.is_empty() {
-        format!("mqtt/{topic}")
-    } else {
-        format!("mqtt/{conn}/{topic}")
-    };
-    if path.is_empty() {
-        base
-    } else {
-        format!("{base}::{path}")
-    }
-}
+// Wire-address formats live in `pb_points::addr` (shared with the service).
+pub use pb_points::addr::{
+    file_bind_source, http_bind_source, las_bind_source, mqtt_bind_source, snmp_bind_source,
+    stream_bind_source,
+};
 
-/// HTTP wire address: `http/<conn>/<url_path>::<json_path>`.
-pub fn http_bind_source(conn: &str, url_path: &str, json_path: &str) -> String {
-    let conn = conn.trim();
-    let url_path = url_path.trim().trim_start_matches('/');
-    let json_path = json_path.trim();
-    let base = if conn.is_empty() {
-        if url_path.is_empty() {
-            "http".to_string()
-        } else {
-            format!("http/{url_path}")
-        }
-    } else if url_path.is_empty() {
-        format!("http/{conn}")
-    } else {
-        format!("http/{conn}/{url_path}")
-    };
-    if json_path.is_empty() {
-        base
-    } else {
-        format!("{base}::{json_path}")
-    }
-}
-
-/// Streams wire address: `stream/<endpoint>[::<field>]`.
-pub fn stream_bind_source(endpoint: &str, field: &str) -> String {
-    let endpoint = endpoint.trim();
-    let field = field.trim();
-    let base = if endpoint.is_empty() {
-        "stream".to_string()
-    } else {
-        format!("stream/{endpoint}")
-    };
-    if field.is_empty() {
-        base
-    } else {
-        format!("{base}::{field}")
-    }
-}
-
-/// Wire address for an SNMP Input OID bind (`snmp/<target>::<oid>`).
-pub fn snmp_bind_source(target: &str, oid: &str) -> String {
-    let target = target.trim();
-    let oid = oid.trim();
-    let base = if target.is_empty() {
-        "snmp".to_string()
-    } else {
-        format!("snmp/{target}")
-    };
-    if oid.is_empty() {
-        base
-    } else {
-        format!("{base}::{oid}")
-    }
-}
-
-/// Wire address for a LAS Input curve bind (`las/<endpoint>::<curve>`).
-pub fn las_bind_source(endpoint: &str, curve: &str) -> String {
-    let endpoint = endpoint.trim();
-    let curve = curve.trim();
-    let base = if endpoint.is_empty() {
-        "las".to_string()
-    } else {
-        format!("las/{endpoint}")
-    };
-    if curve.is_empty() {
-        base
-    } else {
-        format!("{base}::{curve}")
-    }
+/// Wire address for a Modbus register bind: `modbus/<conn>[/u<unit>]::<area>:<addr>:<type>[:<order>]`.
+pub fn modbus_bind_source(conn: &str, bind: &crate::hubs::ModbusBind) -> String {
+    pb_points::addr::modbus_bind_source(conn, bind.unit as u64, &bind.area, bind.address as u64, &bind.dtype, &bind.order)
 }
 
 /// Global Points panel rows: live bus + Hub Input bind / aggregator placeholders.
@@ -736,6 +659,61 @@ pub fn rows_for_points_panel(
                         });
                     }
                 }
+                HubProto::Modbus => {
+                    let conn = port.modbus_connection.as_str();
+                    for bind in &port.modbus_inputs {
+                        let source = modbus_bind_source(conn, bind);
+                        let id = if bind.point.trim().is_empty() {
+                            "modbus_N".to_string()
+                        } else {
+                            bind.point.trim().to_string()
+                        };
+                        if seen.contains(&id) {
+                            continue;
+                        }
+                        seen.insert(id.clone());
+                        rows.push(PointsTableRow {
+                            id,
+                            source,
+                            value: "—".into(),
+                            quality: "uncertain".into(),
+                            updated: "—".into(),
+                            updated_ms: 0,
+                            bind_index: None,
+                            topic: String::new(),
+                            path: bind.describe(),
+                        });
+                    }
+                }
+                HubProto::Files => {
+                    let src = port.file_source.as_str();
+                    for bind in &port.file_inputs {
+                        let column = bind.column.trim();
+                        if column.is_empty() {
+                            continue;
+                        }
+                        let id = if bind.point.trim().is_empty() {
+                            "file_N".to_string()
+                        } else {
+                            bind.point.trim().to_string()
+                        };
+                        if seen.contains(&id) {
+                            continue;
+                        }
+                        seen.insert(id.clone());
+                        rows.push(PointsTableRow {
+                            id,
+                            source: file_bind_source(src, column),
+                            value: "—".into(),
+                            quality: "uncertain".into(),
+                            updated: "—".into(),
+                            updated_ms: 0,
+                            bind_index: None,
+                            topic: String::new(),
+                            path: bind.column.clone(),
+                        });
+                    }
+                }
                 HubProto::Snmp => {
                     let target = port.snmp_target.as_str();
                     for bind in &port.snmp_inputs {
@@ -796,7 +774,6 @@ pub fn rows_for_points_panel(
                         });
                     }
                 }
-                _ => {}
             }
         }
         for step in &hub.aggregators {
@@ -963,11 +940,7 @@ pub fn format_updated(updated_ms: u64) -> String {
     if updated_ms == 0 {
         return "—".into();
     }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(updated_ms);
-    let age_secs = now_ms.saturating_sub(updated_ms) / 1000;
+    let age_secs = pb_points::now_ms().saturating_sub(updated_ms) / 1000;
 
     // Fresh samples read as live.
     if age_secs < 5 {

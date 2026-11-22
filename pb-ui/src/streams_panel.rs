@@ -3,7 +3,7 @@
 
 use egui::{Layout, RichText, Sense, UiBuilder};
 
-use crate::connection_list::{self, RowAction};
+use crate::connection_list::{self, text_btn, RowAction};
 use crate::theme::{apply_form_spacing, font_ui, form_inset, space, ThemePalette};
 
 const LABEL_W: f32 = 110.0;
@@ -203,13 +203,7 @@ impl StreamsPanelState {
     }
 
     fn unique_id(&self, base: &str) -> String {
-        let mut id = base.to_string();
-        let mut n = 2;
-        while self.endpoints.iter().any(|e| e.id == id) {
-            id = format!("{base}-{n}");
-            n += 1;
-        }
-        id
+        connection_list::unique_id(base, |id| self.endpoints.iter().any(|e| e.id == id))
     }
 
     pub fn refresh_serial_ports(&mut self) {
@@ -503,26 +497,7 @@ fn edit_tcp_listener(ui: &mut egui::Ui, state: &mut StreamsPanelState, p: &Theme
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = space::ITEM_X;
-        ui.add_sized(
-            [LABEL_W, 20.0],
-            egui::Label::new(RichText::new(label).font(font_ui(12.0)).color(p.muted)),
-        );
-        let w = (ui.available_width() - 8.0).clamp(140.0, 420.0);
-        if ui
-            .add(
-                egui::TextEdit::singleline(value)
-                    .desired_width(w)
-                    .margin(egui::Margin::symmetric(6.0, 3.0)),
-            )
-            .changed()
-        {
-            changed = true;
-        }
-    });
-    changed
+    connection_list::labeled_field(ui, LABEL_W, label, value, p)
 }
 
 fn combo_str(
@@ -557,16 +532,3 @@ fn combo_str(
     changed
 }
 
-fn text_btn(ui: &mut egui::Ui, label: &str, selected: bool, p: &ThemePalette) -> egui::Response {
-    let fill = if selected { p.accent } else { p.control };
-    let text = if selected {
-        egui::Color32::from_rgb(0x12, 0x14, 0x18)
-    } else {
-        p.text
-    };
-    ui.add(
-        egui::Button::new(RichText::new(label).font(font_ui(12.0)).color(text))
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, p.line)),
-    )
-}

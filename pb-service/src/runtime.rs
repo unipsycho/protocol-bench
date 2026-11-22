@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use pb_engine::{EngineHandle, EngineId, EngineOptions, HostSnapshot};
 use pb_ipc::{status_from_host, PointBindingWire, ServiceStatus};
+use pb_points::addr::{file_bind_source, http_bind_source, las_bind_source, mqtt_bind_source, snmp_bind_source, stream_bind_source};
 use pb_points::{PointBinding, PointStore};
 
 pub struct Runtime {
@@ -16,6 +17,7 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Spawn the engine (loading packs from `modules`) and, when `project_path` exists, apply it.
     pub fn start(modules: Option<PathBuf>, project_path: PathBuf) -> Self {
         let points = Arc::new(Mutex::new(PointStore::new()));
         let engine = EngineHandle::spawn_with(EngineOptions {
@@ -37,10 +39,12 @@ impl Runtime {
         rt
     }
 
+    /// Engine snapshot (slots + points).
     pub fn snapshot(&self) -> HostSnapshot {
         self.engine.snapshot()
     }
 
+    /// Service status including pack list, hub state and the last project error.
     pub fn status(&self) -> ServiceStatus {
         let host = self.snapshot();
         let mut st = status_from_host(
@@ -69,6 +73,7 @@ impl Runtime {
         st
     }
 
+    /// Read, apply and remember a project file. `auto_run_hubs` starts embedded brokers / servers.
     pub fn load_project_file(&mut self, path: &Path, auto_run_hubs: bool) -> Result<(), String> {
         self.project_path = path.to_path_buf();
         self.auto_run_hubs = auto_run_hubs;
@@ -82,6 +87,7 @@ impl Runtime {
         self.apply_project_value(value, auto_run_hubs)
     }
 
+    /// Apply a project document sent by the UI and save it to disk.
     pub fn put_project(
         &mut self,
         value: serde_json::Value,
@@ -96,6 +102,7 @@ impl Runtime {
         self.persist(&value)
     }
 
+    /// Write the project JSON to `project_path` (pretty-printed, trailing newline).
     pub fn persist(&self, value: &serde_json::Value) -> Result<(), String> {
         if let Some(parent) = self.project_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -173,10 +180,47 @@ impl Runtime {
                 pb_engine::EngineCommand::Configure { json },
             );
         }
+        // Modbus pack — client connections + hub Input poll / Output write binds.
+        if let Some(modbus) = value.get("modbus") {
+            let hubs = value.get("hubs");
+            let json = build_modbus_configure(modbus, hubs);
+            self.engine.submit(
+                EngineId::Modbus,
+                pb_engine::EngineCommand::Configure { json },
+            );
+        }
+        // File follow pack — sources + hub Files Input column binds.
+        if let Some(files) = value.get("files") {
+            let hubs = value.get("hubs");
+            let json = build_files_configure(files, hubs, files_state_dir("file-follow").as_deref());
+            self.engine.submit(
+                EngineId::FileFollow,
+                pb_engine::EngineCommand::Configure { json },
+            );
+        }
+        // SNMP pack — targets + hub SNMP Input OID binds.
+        if let Some(snmp) = value.get("snmp") {
+            let hubs = value.get("hubs");
+            let json = build_snmp_configure(snmp, hubs);
+            self.engine.submit(
+                EngineId::Snmp,
+                pb_engine::EngineCommand::Configure { json },
+            );
+        }
+        // LAS pack — endpoints + hub LAS Input (follow) / Output (write) curve binds.
+        if let Some(las) = value.get("las") {
+            let hubs = value.get("hubs");
+            let json = build_las_configure(las, hubs, files_state_dir("las-follow").as_deref());
+            self.engine.submit(
+                EngineId::Las,
+                pb_engine::EngineCommand::Configure { json },
+            );
+        }
         self.last_error.clear();
         Ok(())
     }
 
+    /// Seed the point store with saved short ids before packs start publishing.
     pub fn import_bindings(
         &mut self,
         points: Vec<PointBindingWire>,
@@ -277,6 +321,69 @@ fn materialize_hub_binds_json(value: &serde_json::Value, store: &mut PointStore)
                         }
                     }
                 }
+                let modbus_conn = port
+                    .get("modbus_connection")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(binds) = port.get("modbus_inputs").and_then(|v| v.as_array()) {
+                    for bind in binds {
+                        let source = modbus_bind_source(modbus_conn, bind);
+                        let point = bind.get("point").and_then(|v| v.as_str()).unwrap_or("");
+                        if point.is_empty() {
+                            let _ = store.ensure_id("modbus", &source);
+                        } else {
+                            store.bind(point, &source);
+                        }
+                    }
+                }
+                let snmp_target = port.get("snmp_target").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(binds) = port.get("snmp_inputs").and_then(|v| v.as_array()) {
+                    for bind in binds {
+                        let oid = bind.get("oid").and_then(|v| v.as_str()).unwrap_or("");
+                        if oid.trim().is_empty() {
+                            continue;
+                        }
+                        let source = snmp_bind_source(snmp_target, oid);
+                        let point = bind.get("point").and_then(|v| v.as_str()).unwrap_or("");
+                        if point.is_empty() {
+                            let _ = store.ensure_id("snmp", &source);
+                        } else {
+                            store.bind(point, &source);
+                        }
+                    }
+                }
+                let las_ep = port.get("las_endpoint").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(binds) = port.get("las_inputs").and_then(|v| v.as_array()) {
+                    for bind in binds {
+                        let curve = bind.get("curve").and_then(|v| v.as_str()).unwrap_or("");
+                        if curve.trim().is_empty() {
+                            continue;
+                        }
+                        let source = las_bind_source(las_ep, curve);
+                        let point = bind.get("point").and_then(|v| v.as_str()).unwrap_or("");
+                        if point.is_empty() {
+                            let _ = store.ensure_id("las", &source);
+                        } else {
+                            store.bind(point, &source);
+                        }
+                    }
+                }
+                let file_src = port.get("file_source").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(binds) = port.get("file_inputs").and_then(|v| v.as_array()) {
+                    for bind in binds {
+                        let column = bind.get("column").and_then(|v| v.as_str()).unwrap_or("");
+                        if column.trim().is_empty() {
+                            continue;
+                        }
+                        let source = file_bind_source(file_src, column);
+                        let point = bind.get("point").and_then(|v| v.as_str()).unwrap_or("");
+                        if point.is_empty() {
+                            let _ = store.ensure_id("file", &source);
+                        } else {
+                            store.bind(point, &source);
+                        }
+                    }
+                }
                 let stream_endpoint = port
                     .get("stream_endpoint")
                     .and_then(|v| v.as_str())
@@ -303,56 +410,6 @@ fn materialize_hub_binds_json(value: &serde_json::Value, store: &mut PointStore)
                 store.bind(&format!("agg_{id}"), &format!("agg/step/{id}"));
             }
         }
-    }
-}
-
-fn mqtt_bind_source(conn: &str, topic: &str, path: &str) -> String {
-    let base = if conn.is_empty() {
-        format!("mqtt/{topic}")
-    } else {
-        format!("mqtt/{conn}/{topic}")
-    };
-    if path.is_empty() {
-        base
-    } else {
-        format!("{base}::{path}")
-    }
-}
-
-fn http_bind_source(conn: &str, url_path: &str, json_path: &str) -> String {
-    let conn = conn.trim();
-    let url_path = url_path.trim().trim_start_matches('/');
-    let json_path = json_path.trim();
-    let base = if conn.is_empty() {
-        if url_path.is_empty() {
-            "http".to_string()
-        } else {
-            format!("http/{url_path}")
-        }
-    } else if url_path.is_empty() {
-        format!("http/{conn}")
-    } else {
-        format!("http/{conn}/{url_path}")
-    };
-    if json_path.is_empty() {
-        base
-    } else {
-        format!("{base}::{json_path}")
-    }
-}
-
-fn stream_bind_source(endpoint: &str, field: &str) -> String {
-    let endpoint = endpoint.trim();
-    let field = field.trim();
-    let base = if endpoint.is_empty() {
-        "stream".to_string()
-    } else {
-        format!("stream/{endpoint}")
-    };
-    if field.is_empty() {
-        base
-    } else {
-        format!("{base}::{field}")
     }
 }
 
@@ -870,4 +927,385 @@ fn build_http_configure(http: &serde_json::Value, hubs: Option<&serde_json::Valu
         "outputs": outputs,
     })
     .to_string()
+}
+
+/// Wire address of a Modbus bind given as JSON (same format the UI builds — see `pb_points::addr`).
+fn modbus_bind_source(conn: &str, bind: &serde_json::Value) -> String {
+    let s = |k: &str, d: &str| bind.get(k).and_then(|v| v.as_str()).unwrap_or(d).to_string();
+    let n = |k: &str| bind.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    pb_points::addr::modbus_bind_source(conn, n("unit"), &s("area", "holding"), n("address"), &s("dtype", "u16"), &s("order", "abcd"))
+}
+
+/// Build Modbus pack configure JSON from the `modbus` section + hub Modbus Input / Output ports.
+fn build_modbus_configure(modbus: &serde_json::Value, hubs: Option<&serde_json::Value>) -> String {
+    // Connection objects already use the pack's field names (id, role, transport, host, port, …).
+    // A Server connection only runs when a Modbus hub picks it (`hub.modbus_server`).
+    let used_servers: std::collections::BTreeSet<String> = hubs
+        .and_then(|h| h.get("hubs"))
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|hub| {
+            hub.get("protocol")
+                .and_then(|v| v.as_str())
+                .is_some_and(|p| p.eq_ignore_ascii_case("modbus"))
+        })
+        .filter_map(|hub| hub.get("modbus_server").and_then(|v| v.as_str()))
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect();
+    let connections: Vec<serde_json::Value> = modbus
+        .get("connections")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut c| {
+            let is_server = c.get("role").and_then(|v| v.as_str()) == Some("server");
+            if is_server {
+                let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let on = c.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                c["enabled"] = serde_json::json!(on && used_servers.contains(&id));
+            }
+            c
+        })
+        .collect();
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let hub_list = hubs
+        .and_then(|h| h.get("hubs"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for hub in hub_list {
+        for key in ["sources", "outputs"] {
+            let incoming = key == "sources";
+            let Some(ports) = hub.get(key).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for port in ports {
+                let proto = port.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
+                if !proto.eq_ignore_ascii_case("modbus") {
+                    continue;
+                }
+                let conn = port
+                    .get("modbus_connection")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if conn.is_empty() {
+                    continue;
+                }
+                let list_key = if incoming { "modbus_inputs" } else { "modbus_outputs" };
+                let mut binds = Vec::new();
+                for bind in port.get(list_key).and_then(|v| v.as_array()).into_iter().flatten() {
+                    let mut b = bind.clone();
+                    if incoming {
+                        b["source"] = serde_json::json!(modbus_bind_source(&conn, bind));
+                    } else if bind.get("point").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                        continue; // an Output bind without a point has nothing to write
+                    }
+                    binds.push(b);
+                }
+                if binds.is_empty() {
+                    continue;
+                }
+                if incoming {
+                    inputs.push(serde_json::json!({
+                        "connection": conn,
+                        "interval_secs": port
+                            .get("modbus_interval_secs")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(1.0),
+                        "binds": binds,
+                    }));
+                } else {
+                    outputs.push(serde_json::json!({ "connection": conn, "binds": binds }));
+                }
+            }
+        }
+    }
+    serde_json::json!({ "connections": connections, "inputs": inputs, "outputs": outputs }).to_string()
+}
+
+/// Where File follow keeps its per-source byte offsets (`<config dir>/file-follow`).
+fn files_state_dir(sub: &str) -> Option<String> {
+    pb_ipc::config_dir().map(|d| d.join(sub).to_string_lossy().into_owned())
+}
+
+/// Build File follow pack configure JSON from the `files` section + hub `Files` Input ports.
+fn build_files_configure(files: &serde_json::Value, hubs: Option<&serde_json::Value>, state_dir: Option<&str>) -> String {
+    let sources = files.get("sources").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let mut inputs = Vec::new();
+    for hub in hubs.and_then(|h| h.get("hubs")).and_then(|v| v.as_array()).into_iter().flatten() {
+        for port in hub.get("sources").and_then(|v| v.as_array()).into_iter().flatten() {
+            let proto = port.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
+            if !proto.eq_ignore_ascii_case("files") {
+                continue;
+            }
+            let source = port.get("file_source").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if source.is_empty() {
+                continue;
+            }
+            let binds: Vec<serde_json::Value> = port
+                .get("file_inputs")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|b| {
+                    let column = b.get("column").and_then(|v| v.as_str())?.trim().to_string();
+                    if column.is_empty() {
+                        return None;
+                    }
+                    Some(serde_json::json!({
+                        "column": column,
+                        "point": b.get("point").and_then(|v| v.as_str()).unwrap_or(""),
+                        "source": file_bind_source(&source, &column),
+                    }))
+                })
+                .collect();
+            if !binds.is_empty() {
+                inputs.push(serde_json::json!({ "source": source, "binds": binds }));
+            }
+        }
+    }
+    serde_json::json!({ "state_dir": state_dir.unwrap_or(""), "sources": sources, "inputs": inputs }).to_string()
+}
+
+fn str_of<'a>(v: &'a serde_json::Value, k: &str) -> &'a str {
+    v.get(k).and_then(|x| x.as_str()).unwrap_or("")
+}
+
+/// Build SNMP pack configure JSON from the `snmp` targets + hub SNMP Input ports.
+fn build_snmp_configure(snmp: &serde_json::Value, hubs: Option<&serde_json::Value>) -> String {
+    let targets = snmp.get("targets").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let mut inputs = Vec::new();
+    for hub in hubs.and_then(|h| h.get("hubs")).and_then(|v| v.as_array()).into_iter().flatten() {
+        for port in hub.get("sources").and_then(|v| v.as_array()).into_iter().flatten() {
+            if !str_of(port, "protocol").eq_ignore_ascii_case("snmp") {
+                continue;
+            }
+            let target = str_of(port, "snmp_target").to_string();
+            if target.is_empty() {
+                continue;
+            }
+            let binds: Vec<serde_json::Value> = port
+                .get("snmp_inputs")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter(|b| !str_of(b, "oid").trim().is_empty())
+                .map(|b| {
+                    serde_json::json!({
+                        "oid": str_of(b, "oid").trim(),
+                        "point": str_of(b, "point"),
+                        "source": snmp_bind_source(&target, str_of(b, "oid")),
+                    })
+                })
+                .collect();
+            if !binds.is_empty() {
+                inputs.push(serde_json::json!({
+                    "target": target,
+                    "interval_secs": port.get("snmp_interval_secs").and_then(|v| v.as_f64()).unwrap_or(10.0),
+                    "binds": binds,
+                }));
+            }
+        }
+    }
+    serde_json::json!({ "targets": targets, "inputs": inputs }).to_string()
+}
+
+/// Build LAS pack configure JSON from the `las` endpoints + hub LAS Input / Output ports.
+fn build_las_configure(las: &serde_json::Value, hubs: Option<&serde_json::Value>, state_dir: Option<&str>) -> String {
+    let endpoints = las.get("endpoints").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let (mut inputs, mut outputs) = (Vec::new(), Vec::new());
+    for hub in hubs.and_then(|h| h.get("hubs")).and_then(|v| v.as_array()).into_iter().flatten() {
+        for key in ["sources", "outputs"] {
+            let incoming = key == "sources";
+            for port in hub.get(key).and_then(|v| v.as_array()).into_iter().flatten() {
+                if !str_of(port, "protocol").eq_ignore_ascii_case("las") {
+                    continue;
+                }
+                let endpoint = str_of(port, "las_endpoint").to_string();
+                if endpoint.is_empty() {
+                    continue;
+                }
+                let list = port.get(if incoming { "las_inputs" } else { "las_outputs" }).and_then(|v| v.as_array());
+                let binds: Vec<serde_json::Value> = list
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| !str_of(b, "curve").trim().is_empty())
+                    .filter(|b| incoming || !str_of(b, "point").trim().is_empty())
+                    .map(|b| {
+                        serde_json::json!({
+                            "curve": str_of(b, "curve").trim(),
+                            "point": str_of(b, "point"),
+                            "source": if incoming { las_bind_source(&endpoint, str_of(b, "curve")) } else { String::new() },
+                        })
+                    })
+                    .collect();
+                if binds.is_empty() {
+                    continue;
+                }
+                if incoming {
+                    inputs.push(serde_json::json!({ "endpoint": endpoint, "binds": binds }));
+                } else {
+                    let index = match str_of(port, "las_index") {
+                        "" => "depth",
+                        other => other,
+                    };
+                    outputs.push(serde_json::json!({ "endpoint": endpoint, "index": index, "binds": binds }));
+                }
+            }
+        }
+    }
+    serde_json::json!({ "state_dir": state_dir.unwrap_or(""), "endpoints": endpoints, "inputs": inputs, "outputs": outputs }).to_string()
+}
+
+#[cfg(test)]
+mod snmp_las_tests {
+    use super::*;
+
+    #[test]
+    fn snmp_config_keeps_targets_and_binds() {
+        let snmp = serde_json::json!({"targets":[{"id":"sw","host":"10.0.0.2","port":161,"version":"v2c","community":"public","timeout_secs":3}]});
+        let hubs = serde_json::json!({"hubs":[{"sources":[
+            {"protocol":"Snmp","snmp_target":"sw","snmp_interval_secs":5.0,"snmp_inputs":[{"oid":" 1.3.6.1.2.1.1.5.0","point":"snmp_1"},{"oid":" ","point":"x"}]},
+            {"protocol":"Snmp","snmp_target":"","snmp_inputs":[{"oid":"1.3","point":""}]},
+            {"protocol":"Http","snmp_target":"sw","snmp_inputs":[{"oid":"1.3","point":""}]}]}]});
+        let out: serde_json::Value = serde_json::from_str(&build_snmp_configure(&snmp, Some(&hubs))).unwrap();
+        assert_eq!(out["targets"][0]["host"], "10.0.0.2");
+        let inputs = out["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0]["interval_secs"], 5.0);
+        assert_eq!(inputs[0]["binds"].as_array().unwrap().len(), 1);
+        assert_eq!(inputs[0]["binds"][0]["source"], "snmp/sw::1.3.6.1.2.1.1.5.0");
+    }
+
+    #[test]
+    fn las_config_splits_follow_and_write_and_defaults_index() {
+        let las = serde_json::json!({"endpoints":[
+            {"id":"in","role":"incoming","path":"/a.las","follow":true},{"id":"out","role":"outgoing","path":"/b.las"}]});
+        let hubs = serde_json::json!({"hubs":[{"sources":[
+            {"protocol":"Las","las_endpoint":"in","las_inputs":[{"curve":"GR","point":"las_1"},{"curve":" ","point":""}]}],
+          "outputs":[
+            {"protocol":"Las","las_endpoint":"out","las_index":"","las_outputs":[{"point":"depth","curve":"DEPT"},{"point":"","curve":"GR"}]},
+            {"protocol":"Las","las_endpoint":"","las_outputs":[{"point":"p","curve":"GR"}]}]}]});
+        let out: serde_json::Value = serde_json::from_str(&build_las_configure(&las, Some(&hubs), Some("/cfg/las"))).unwrap();
+        assert_eq!(out["state_dir"], "/cfg/las");
+        assert_eq!(out["inputs"][0]["binds"].as_array().unwrap().len(), 1);
+        assert_eq!(out["inputs"][0]["binds"][0]["source"], "las/in::GR");
+        let o = out["outputs"].as_array().unwrap();
+        assert_eq!(o.len(), 1, "endpoint-less port skipped");
+        assert_eq!(o[0]["index"], "depth");
+        assert_eq!(o[0]["binds"].as_array().unwrap().len(), 1, "output bind without a point dropped");
+    }
+
+    #[test]
+    fn materialize_allocates_snmp_and_las_ids() {
+        let value = serde_json::json!({"hubs":{"hubs":[{"sources":[
+            {"protocol":"Snmp","snmp_target":"sw","snmp_inputs":[{"oid":"1.3.6.1.2.1.1.5.0","point":""}]},
+            {"protocol":"Las","las_endpoint":"w","las_inputs":[{"curve":"GR","point":""}]}],"outputs":[]}]}});
+        let mut store = PointStore::default();
+        materialize_hub_binds_json(&value, &mut store);
+        assert_eq!(store.id_for_source("snmp/sw::1.3.6.1.2.1.1.5.0"), Some("snmp_1"));
+        assert_eq!(store.id_for_source("las/w::GR"), Some("las_2"));
+    }
+}
+
+#[cfg(test)]
+mod files_tests {
+    use super::*;
+
+    #[test]
+    fn file_sources_and_binds_become_pack_config() {
+        let files = serde_json::json!({"sources":[
+            {"id":"meter","path":"/var/log/m.csv","parser":"csv","header_row":true,"delimiter":",","poll_ms":500,"start_at":"end","follow_rotation":true}]});
+        let hubs = serde_json::json!({"hubs":[{"sources":[
+            {"protocol":"Files","file_source":"meter","file_inputs":[{"column":"temp","point":"file_1"},{"column":" ","point":"x"}]},
+            {"protocol":"Files","file_source":"","file_inputs":[{"column":"a","point":""}]},
+            {"protocol":"Modbus","file_source":"meter","file_inputs":[{"column":"a","point":""}]}]}]});
+        let out: serde_json::Value = serde_json::from_str(&build_files_configure(&files, Some(&hubs), Some("/cfg/ff"))).unwrap();
+        assert_eq!(out["state_dir"], "/cfg/ff");
+        assert_eq!(out["sources"][0]["id"], "meter");
+        let inputs = out["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 1, "blank-source and non-Files ports are skipped");
+        assert_eq!(inputs[0]["binds"].as_array().unwrap().len(), 1, "blank column dropped");
+        assert_eq!(inputs[0]["binds"][0]["source"], "file/meter::temp");
+    }
+
+    #[test]
+    fn materialize_allocates_file_ids() {
+        let value = serde_json::json!({"hubs":{"hubs":[{"sources":[
+            {"protocol":"Files","file_source":"meter","file_inputs":[{"column":"temp","point":""}]}],"outputs":[]}]}});
+        let mut store = PointStore::default();
+        materialize_hub_binds_json(&value, &mut store);
+        assert_eq!(store.id_for_source("file/meter::temp"), Some("file_1"));
+    }
+}
+
+#[cfg(test)]
+mod modbus_tests {
+    use super::*;
+
+    fn bind(area: &str, addr: u64, dt: &str, order: &str, unit: u64, point: &str) -> serde_json::Value {
+        serde_json::json!({"area":area,"address":addr,"dtype":dt,"order":order,"unit":unit,"point":point})
+    }
+
+    #[test]
+    fn source_strings_match_the_ui_format() {
+        // Same literals asserted in pb-ui `modbus_source_strings_match_the_service`.
+        assert_eq!(modbus_bind_source("plc", &bind("holding", 100, "f32", "abcd", 0, "")), "modbus/plc::holding:100:f32");
+        assert_eq!(modbus_bind_source("plc", &bind("holding", 100, "f32", "cdab", 0, "")), "modbus/plc::holding:100:f32:cdab");
+        assert_eq!(modbus_bind_source("plc", &bind("coil", 3, "bool", "abcd", 7, "")), "modbus/plc/u7::coil:3:bool");
+        assert_eq!(modbus_bind_source("", &bind("input", 0, "u16", "abcd", 0, "")), "modbus::input:0:u16");
+    }
+
+    #[test]
+    fn configure_json_splits_inputs_and_outputs_per_connection() {
+        let modbus = serde_json::json!({"connections":[
+            {"id":"plc","role":"client","transport":"tcp","host":"10.0.0.5","port":502,"map":[]},
+            {"id":"hub","role":"server","transport":"tcp","host":"0.0.0.0","port":1502}]});
+        let hubs = serde_json::json!({"hubs":[{"sources":[
+            {"protocol":"Modbus","modbus_connection":"plc","modbus_interval_secs":0.5,
+             "modbus_inputs":[bind("holding",0,"f32","cdab",0,"modbus_1")]},
+            {"protocol":"Mqtt","modbus_connection":"plc","modbus_inputs":[bind("holding",9,"u16","abcd",0,"")]},
+            {"protocol":"Modbus","modbus_connection":"","modbus_inputs":[bind("holding",1,"u16","abcd",0,"")]}],
+          "outputs":[{"protocol":"Modbus","modbus_connection":"plc","modbus_outputs":[
+            bind("holding",10,"f32","cdab",0,"setpoint"), bind("coil",1,"bool","abcd",0,"")]}]}]});
+        let out: serde_json::Value = serde_json::from_str(&build_modbus_configure(&modbus, Some(&hubs))).unwrap();
+        let conns = out["connections"].as_array().unwrap();
+        assert_eq!(conns.len(), 2);
+        assert_eq!(conns[1]["enabled"], false, "server no hub picks stays off");
+        assert!(conns[0].get("enabled").is_none());
+        let inputs = out["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 1, "non-Modbus and unconnected ports are skipped");
+        assert_eq!(inputs[0]["interval_secs"], 0.5);
+        assert_eq!(inputs[0]["binds"][0]["source"], "modbus/plc::holding:0:f32:cdab");
+        let outputs = out["outputs"].as_array().unwrap();
+        assert_eq!(outputs[0]["binds"].as_array().unwrap().len(), 1, "pointless output bind dropped");
+        assert_eq!(outputs[0]["binds"][0]["point"], "setpoint");
+    }
+
+    #[test]
+    fn server_enabled_only_when_a_modbus_hub_picks_it() {
+        let modbus = serde_json::json!({"connections":[
+            {"id":"a","role":"server","transport":"tcp"},{"id":"b","role":"server","transport":"tcp"}]});
+        let hubs = serde_json::json!({"hubs":[
+            {"protocol":"Modbus","modbus_server":"b","sources":[],"outputs":[]},
+            {"protocol":"Mqtt","modbus_server":"a","sources":[],"outputs":[]}]});
+        let out: serde_json::Value = serde_json::from_str(&build_modbus_configure(&modbus, Some(&hubs))).unwrap();
+        assert_eq!(out["connections"][0]["enabled"], false);
+        assert_eq!(out["connections"][1]["enabled"], true);
+    }
+
+    #[test]
+    fn materialize_allocates_modbus_ids() {
+        let value = serde_json::json!({"hubs":{"hubs":[{"sources":[
+            {"protocol":"Modbus","modbus_connection":"plc","modbus_inputs":[bind("holding",0,"f32","cdab",0,"")]}],
+            "outputs":[]}]}});
+        let mut store = PointStore::default();
+        materialize_hub_binds_json(&value, &mut store);
+        assert_eq!(store.id_for_source("modbus/plc::holding:0:f32:cdab"), Some("modbus_1"));
+    }
 }

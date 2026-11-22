@@ -170,6 +170,23 @@ fn paint_listeners(
             p,
         );
     }
+    // Modbus server connections a hub is serving (running or retrying).
+    let (live, pack_loaded) = crate::modbus_panel::live_from_host(host);
+    if pack_loaded {
+        for l in live.iter().filter(|l| l.role == "server") {
+            any = true;
+            let err = (!l.error.is_empty()).then_some(l.error.as_str());
+            status_row(
+                ui,
+                &format!("Modbus · {}", l.id),
+                &l.endpoint,
+                if l.connected { "running" } else { "stopped" },
+                l.connected,
+                err,
+                p,
+            );
+        }
+    }
     if !any {
         ui.label(
             RichText::new("No embedded hubs configured.")
@@ -277,6 +294,23 @@ fn paint_connected(
                     };
                     rows.push((format!("OPC UA · {title}"), ep));
                 }
+            }
+        }
+    }
+
+    // Modbus: outbound client links that are up, and masters connected to our servers.
+    let (live, pack_loaded) = crate::modbus_panel::live_from_host(host);
+    if pack_loaded {
+        for l in &live {
+            if l.role == "server" {
+                if let Some(n) = l.clients.filter(|n| *n > 0) {
+                    rows.push((
+                        format!("Modbus · {}", l.id),
+                        format!("{n} master{} on {}", if n == 1 { "" } else { "s" }, l.endpoint),
+                    ));
+                }
+            } else if l.connected {
+                rows.push((format!("Modbus · {}", l.id), l.endpoint.clone()));
             }
         }
     }

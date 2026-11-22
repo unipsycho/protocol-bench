@@ -3673,11 +3673,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pb-files"
+version = "0.1.0"
+dependencies = [
+ "pb-abi",
+ "pb-json",
+ "pb-tail",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pb-http"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "pb-abi",
+ "pb-json",
  "serde",
  "serde_json",
  "ureq",
@@ -3695,10 +3707,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "pb-json"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "pb-las"
+version = "0.1.0"
+dependencies = [
+ "pb-abi",
+ "pb-tail",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pb-modbus"
+version = "0.1.0"
+dependencies = [
+ "pb-abi",
+ "serde",
+ "serde_json",
+ "serialport",
+]
+
+[[package]]
 name = "pb-mqtt"
 version = "0.1.0"
 dependencies = [
  "pb-abi",
+ "pb-json",
  "rumqttc",
  "rumqttd",
  "serde",
@@ -3738,6 +3778,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pb-snmp"
+version = "0.1.0"
+dependencies = [
+ "pb-abi",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pb-streams"
 version = "0.1.0"
 dependencies = [
@@ -3746,6 +3795,14 @@ dependencies = [
  "serde",
  "serde_json",
  "serialport",
+]
+
+[[package]]
+name = "pb-tail"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3759,6 +3816,7 @@ dependencies = [
  "image",
  "pb-engine",
  "pb-ipc",
+ "pb-modbus",
  "pb-points",
  "rfd",
  "serde",

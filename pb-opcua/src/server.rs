@@ -217,6 +217,9 @@ pub struct EmbeddedServerConfig {
     pub port: u16,
     pub application_uri: String,
     pub application_name: String,
+    /// Stored from the project but **not enforced yet**: the server always offers anonymous login
+    /// because user accounts are not implemented (see `tokens` in `run_server`).
+    #[allow(dead_code)]
     pub allow_anonymous: bool,
     pub enable_sign_and_encrypt: bool,
     pub auto_generate_cert: bool,
@@ -232,11 +235,9 @@ async fn run_server(
     cancel: CancellationToken,
     live: Arc<Mutex<Option<LiveServer>>>,
 ) -> Result<(), String> {
-    let tokens: Vec<&str> = if cfg.allow_anonymous {
-        vec![ANONYMOUS_USER_TOKEN_ID]
-    } else {
-        vec![ANONYMOUS_USER_TOKEN_ID] // v1 still offers anonymous; users[] later
-    };
+    // v1 always offers anonymous, even when `allow_anonymous` is off: user accounts (`users[]`)
+    // are not implemented yet, so refusing anonymous would leave no way in.
+    let tokens: Vec<&str> = vec![ANONYMOUS_USER_TOKEN_ID];
 
     // async-opcua requires at least one discovery URL (build fails otherwise).
     let discovery = format!("opc.tcp://{advertise}:{}/", cfg.port);

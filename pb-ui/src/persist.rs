@@ -90,17 +90,53 @@ pub fn remove_recent_project(state: &mut UiState, path: &Path) -> bool {
     state.recent_projects.len() != n
 }
 
-/// Compact menu label: `name — parent` (full path stays on hover).
-pub fn recent_project_label(path: &str) -> String {
-    let p = Path::new(path);
-    match (
-        p.file_name().and_then(|s| s.to_str()),
-        p.parent().map(|parent| parent.display().to_string()),
-    ) {
-        (Some(name), Some(parent)) if !parent.is_empty() => format!("{name} — {parent}"),
-        (Some(name), _) => name.to_string(),
-        _ => path.to_string(),
+/// Is this JSON file a Protocol Bench project (not `ipc.json`, a sidecar or some other JSON)?
+/// Cheap structural check: an object with a numeric `version` and a `hubs` or `mqtt` section.
+pub fn looks_like_project(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    value.get("version").map_or(false, |v| v.is_number())
+        && (value.get("hubs").is_some() || value.get("mqtt").is_some())
+}
+
+/// Recent projects that still exist on disk and are projects (old entries such as `ipc.json`
+/// are skipped), newest first. The stored strings are returned unchanged so the menu can open
+/// them exactly as recorded.
+pub fn existing_recent_projects(state: &UiState) -> Vec<PathBuf> {
+    state
+        .recent_projects
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file() && looks_like_project(p))
+        .collect()
+}
+
+/// Forget every recent project (File → Open recent → Clear). Returns true when the list changed.
+pub fn clear_recent_projects(state: &mut UiState) -> bool {
+    let changed = !state.recent_projects.is_empty();
+    state.recent_projects.clear();
+    changed
+}
+
+/// Folder the Open / Save as dialogs should start in: the current project's folder, unless
+/// that is the service's own config folder (the default project lives there and the sample
+/// projects do not), in which case the folder of the newest recent project elsewhere.
+pub fn dialog_start_dir(state: &UiState, current: &Path, config_dir: Option<&Path>) -> Option<PathBuf> {
+    let is_config = |d: &Path| config_dir.map_or(false, |c| c == d);
+    let current_dir = current.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = current_dir.filter(|d| !is_config(d)) {
+        return Some(dir.to_path_buf());
     }
+    state
+        .recent_projects
+        .iter()
+        .filter_map(|r| Path::new(r).parent().map(Path::to_path_buf))
+        .find(|d| !is_config(d) && d.is_dir())
+        .or_else(|| current_dir.map(Path::to_path_buf))
 }
 
 impl UiState {
@@ -216,6 +252,38 @@ mod tests {
         assert!(state.pane_visible(last));
         assert!(!state.toggle_pane_visible(last));
         assert!(state.pane_visible(last));
+    }
+
+    #[test]
+    fn existing_recent_projects_skip_missing_and_clear_empties() {
+        let dir = std::env::temp_dir().join(format!("pb-recent-exist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kept = dir.join("kept.json");
+        std::fs::write(&kept, r#"{"version":10,"hubs":{}}"#).unwrap();
+        let ipc = dir.join("ipc.json");
+        std::fs::write(&ipc, r#"{"host":"127.0.0.1","port":1}"#).unwrap();
+        let mut state = UiState::default();
+        note_recent_project(&mut state, &dir.join("gone.json"));
+        note_recent_project(&mut state, &ipc);
+        note_recent_project(&mut state, &kept);
+        let got = existing_recent_projects(&state);
+        assert_eq!(got.len(), 1, "missing files and ipc.json are skipped");
+        assert!(got[0].ends_with("kept.json"));
+        assert!(clear_recent_projects(&mut state));
+        assert!(state.recent_projects.is_empty());
+        assert!(!clear_recent_projects(&mut state));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dialog_skips_the_config_folder() {
+        let mut state = UiState::default();
+        state.recent_projects = vec!["/tmp/work/x.json".into(), "/cfg/project.json".into()];
+        let cfg = Path::new("/cfg");
+        // current project is the default one in the config folder -> use the recent elsewhere
+        let got = dialog_start_dir(&state, Path::new("/cfg/project.json"), Some(cfg));
+        // /tmp/work does not exist here, so only the fallback (current dir) is possible
+        assert_eq!(got, Some(PathBuf::from("/cfg")));
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub struct MqttSession {
 }
 
 impl MqttSession {
+    /// Start the session thread; connection happens asynchronously and is reported through events.
     pub fn spawn(
         host: String,
         port: u16,
@@ -73,22 +74,26 @@ impl MqttSession {
         Ok(Self { client, stop, rx })
     }
 
+    /// Next pending [`SessionEvent`], non-blocking.
     pub fn try_recv(&self) -> Result<SessionEvent, TryRecvError> {
         self.rx.try_recv()
     }
 
+    /// Subscribe on the live session.
     pub fn subscribe(&self, topic: &str, qos: u8) -> Result<(), String> {
         self.client
             .subscribe(topic, to_qos(qos))
             .map_err(|e| format!("subscribe: {e}"))
     }
 
+    /// Publish on the live session.
     pub fn publish(&self, topic: &str, payload: &[u8], qos: u8, retain: bool) -> Result<(), String> {
         self.client
             .publish(topic, to_qos(qos), retain, payload)
             .map_err(|e| format!("publish: {e}"))
     }
 
+    /// Disconnect and join the session thread.
     pub fn stop(self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.client.disconnect();

@@ -442,7 +442,7 @@ fn paint_body(
         .color(p.muted),
     );
     ui.add_space(space::AFTER_BLURB);
-    clients_list(ui, state, engine, hubs, p);
+    clients_list(ui, state, p);
     if let Some(i) = connection_list::confirm_delete(ui.ctx(), &mut state.pending_delete, p) {
         remove_opcua_client(state, engine, hubs, i);
     }
@@ -696,13 +696,7 @@ fn stop_embedded(engine: &EngineHandle, state: &mut OpcUaPanelState) {
     state.server_status = "Stopped".into();
 }
 
-fn clients_list(
-    ui: &mut egui::Ui,
-    state: &mut OpcUaPanelState,
-    engine: &EngineHandle,
-    hubs: &HubModel,
-    p: &ThemePalette,
-) {
+fn clients_list(ui: &mut egui::Ui, state: &mut OpcUaPanelState, p: &ThemePalette) {
     let mut select = None;
     let show_delete = state.clients.len() > 1;
     for (i, client) in state.clients.iter().enumerate() {
@@ -1056,16 +1050,6 @@ fn labeled_password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &Them
             .changed();
     });
     changed
-}
-
-fn text_btn(ui: &mut egui::Ui, label: &str, selected: bool, p: &ThemePalette) -> egui::Response {
-    let fill = if selected { p.accent } else { p.control };
-    let text = if selected { Color32::WHITE } else { p.text };
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).font(font_ui(12.0)).color(text))
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, p.line)),
-    )
 }
 
 fn secondary_btn(ui: &mut egui::Ui, label: &str, p: &ThemePalette) -> egui::Response {

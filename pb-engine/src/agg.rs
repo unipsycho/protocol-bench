@@ -1,9 +1,9 @@
 //! Multi-member aggregators → host points `agg_N`.
 //! Quality is worst-wins across contributing members.
 
+use crate::calc::fmt_num;
 use pb_points::{PointValue, Quality};
 use std::collections::{HashMap, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One aggregator step synced from the hub diagram.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -34,13 +34,6 @@ impl AggRuntime {
     pub fn clear(&mut self) {
         self.hist.clear();
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Parse window spec → (max_count, max_age_ms). Both None = current values only.
@@ -106,18 +99,6 @@ fn median(mut xs: Vec<f64>) -> Option<f64> {
         Some(xs[n / 2])
     } else {
         Some((xs[n / 2 - 1] + xs[n / 2]) * 0.5)
-    }
-}
-
-fn fmt_num(v: f64) -> String {
-    if !v.is_finite() {
-        return "nan".into();
-    }
-    if v.fract().abs() < 1e-12 {
-        format!("{v:.0}")
-    } else {
-        let s = format!("{v:.10}");
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 }
 
@@ -257,7 +238,7 @@ pub fn evaluate_all(
     rt: &mut AggRuntime,
     lookup: &dyn Fn(&str) -> Option<MemberReading>,
 ) -> Vec<AggOutput> {
-    let t = now_ms();
+    let t = pb_points::now_ms();
     let mut out = Vec::new();
     for cfg in configs {
         let members: Vec<String> = cfg

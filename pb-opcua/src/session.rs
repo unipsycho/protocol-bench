@@ -53,6 +53,7 @@ pub struct OpcUaSession {
 }
 
 impl OpcUaSession {
+    /// Start the session thread; connection happens asynchronously and is reported through events.
     pub fn spawn(
         endpoint_url: String,
         security_policy: String,
@@ -109,10 +110,12 @@ impl OpcUaSession {
         })
     }
 
+    /// Next pending [`SessionEvent`], non-blocking.
     pub fn try_recv(&self) -> Result<SessionEvent, TryRecvError> {
         self.ev_rx.try_recv()
     }
 
+    /// Request the children of `node_id`; the result arrives as an event.
     pub fn browse(&self, node_id: &str) -> Result<(), String> {
         self.cmd_tx
             .send(Cmd::Browse {
@@ -121,6 +124,7 @@ impl OpcUaSession {
             .map_err(|_| "client session closed".into())
     }
 
+    /// Create monitored items for `node_ids` at `interval_ms`.
     pub fn subscribe(&self, node_ids: Vec<String>, interval_ms: u64) -> Result<(), String> {
         self.cmd_tx
             .send(Cmd::Subscribe {
@@ -130,12 +134,14 @@ impl OpcUaSession {
             .map_err(|_| "client session closed".into())
     }
 
+    /// Read `node_ids` once (fallback when subscriptions are refused).
     pub fn read_poll(&self, node_ids: Vec<String>) -> Result<(), String> {
         self.cmd_tx
             .send(Cmd::Read { node_ids })
             .map_err(|_| "client session closed".into())
     }
 
+    /// Disconnect and join the session thread.
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.send(Cmd::Stop);

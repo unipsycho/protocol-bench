@@ -3,6 +3,11 @@
 //! Packs export [`pb_pack_abi_version`] and [`pb_pack_register`]. The host
 //! refuses to load a pack when the ABI major does not match [`PB_ABI_VERSION`].
 
+pub mod pack;
+pub mod worker;
+
+pub use pack::{value_text, HostRef, Pack};
+
 use std::os::raw::{c_char, c_int, c_void};
 
 /// Host / pack ABI major. Bump when the C layout or semantics break.
@@ -115,6 +120,10 @@ pub const PB_PACK_ABI_VERSION_SYMBOL: &[u8] = b"pb_pack_abi_version\0";
 pub const PB_PACK_REGISTER_SYMBOL: &[u8] = b"pb_pack_register\0";
 
 /// Copy a UTF-8 string into a C buffer (NUL-terminated). Returns bytes excluding NUL, or -1.
+/// The text is truncated to fit `out_len - 1` bytes (a multi-byte character may be cut).
+///
+/// # Safety
+/// `out` must be null or valid for writes of `out_len` bytes.
 pub unsafe fn write_cstr(out: *mut c_char, out_len: usize, text: &str) -> c_int {
     if out.is_null() || out_len == 0 {
         return -1;

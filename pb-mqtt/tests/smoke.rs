@@ -236,15 +236,15 @@ fn wildcard_hash_and_plus_subscribe() {
     assert!(n > 0, "topics_json empty");
     let snap = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
     let parsed: serde_json::Value =
-        serde_json::from_str(&snap).expect(&format!("topics_json invalid: {snap}"));
+        serde_json::from_str(&snap).unwrap_or_else(|_| panic!("topics_json invalid: {snap}"));
     let subs = parsed[0]["topics"].as_array().expect("topics array");
     let sub_strs: Vec<&str> = subs.iter().filter_map(|v| v.as_str()).collect();
     assert!(
-        sub_strs.iter().any(|s| *s == "pb/wc/#"),
+        sub_strs.contains(&"pb/wc/#"),
         "missing # filter in snapshot: {sub_strs:?}"
     );
     assert!(
-        sub_strs.iter().any(|s| *s == "pb/plus/+/x"),
+        sub_strs.contains(&"pb/plus/+/x"),
         "missing + filter in snapshot: {sub_strs:?}"
     );
 

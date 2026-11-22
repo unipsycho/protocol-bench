@@ -3,7 +3,6 @@
 //!
 //! Point ids are always `mqtt/<client_name>/<topic>` (and `…::path` for JSON fields).
 
-use serde_json::Value;
 
 /// Point id for a whole topic on one client: `mqtt/<client>/<topic>`.
 pub fn point_id_for_client_topic(client: &str, topic: &str) -> String {
@@ -12,7 +11,7 @@ pub fn point_id_for_client_topic(client: &str, topic: &str) -> String {
 
 /// Point id for a JSON field: `mqtt/<client>/<topic>::<path>`.
 pub fn point_id_for_client_field(client: &str, topic: &str, path: &str) -> String {
-    let path = normalize_field_path(path);
+    let path = pb_json::normalize_path(path);
     format!("mqtt/{client}/{topic}::{path}")
 }
 
@@ -61,72 +60,6 @@ pub fn migrate_point_id(name: &str, known_clients: &[String], default_client: &s
     }
 }
 
-/// Normalize a field path: strip `$` / `$.`, turn `foo[0].bar` into `foo.0.bar`.
-pub fn normalize_field_path(path: &str) -> String {
-    let p = path.trim();
-    let p = p.strip_prefix("$.").unwrap_or(p);
-    let p = if p == "$" {
-        ""
-    } else {
-        p.strip_prefix('$').unwrap_or(p)
-    };
-    let mut out = String::with_capacity(p.len());
-    let mut chars = p.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '[' {
-            let mut idx = String::new();
-            while let Some(&d) = chars.peek() {
-                chars.next();
-                if d == ']' {
-                    break;
-                }
-                idx.push(d);
-            }
-            let idx = idx.trim();
-            if idx.is_empty() {
-                continue;
-            }
-            if !out.is_empty() && !out.ends_with('.') {
-                out.push('.');
-            }
-            out.push_str(idx);
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Walk `dotted.path` (objects + numeric array segments) on a JSON value.
-pub fn get_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
-    let norm = normalize_field_path(path);
-    if norm.is_empty() {
-        return Some(root);
-    }
-    let mut cur = root;
-    for seg in norm.split('.').filter(|s| !s.is_empty()) {
-        cur = if let Ok(i) = seg.parse::<usize>() {
-            cur.get(i).or_else(|| cur.get(seg))?
-        } else {
-            cur.get(seg)?
-        };
-    }
-    Some(cur)
-}
-
-/// Extract a scalar (or compact JSON) at `path` from a UTF-8 JSON payload.
-pub fn extract_path_value(payload: &str, path: &str) -> Option<String> {
-    let root: Value = serde_json::from_str(payload.trim()).ok()?;
-    let cur = get_at_path(&root, path)?;
-    Some(match cur {
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => s.clone(),
-        Value::Null => "null".into(),
-        other => other.to_string(),
-    })
-}
-
 /// MQTT-style topic filter match (`+` single level, `#` multi-level).
 pub fn topic_matches(filter: &str, topic: &str) -> bool {
     let filter = filter.trim();
@@ -157,19 +90,6 @@ pub fn topic_matches(filter: &str, topic: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extracts_nested_and_array() {
-        let payload = r#"{"room":{"temp":21.5},"tags":[{"id":"a"}]}"#;
-        assert_eq!(
-            extract_path_value(payload, "room.temp").as_deref(),
-            Some("21.5")
-        );
-        assert_eq!(
-            extract_path_value(payload, "tags[0].id").as_deref(),
-            Some("a")
-        );
-    }
 
     #[test]
     fn topic_filter_wildcards() {

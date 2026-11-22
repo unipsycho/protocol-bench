@@ -9,7 +9,7 @@ use egui::{
 };
 use serde::Deserialize;
 
-use pb_engine::{EngineId, HostSnapshot, PointSnapshot, SlotSnapshot};
+use pb_engine::{EngineId, HostSnapshot, PointSnapshot};
 use std::collections::BTreeMap;
 
 use crate::dock::DockPane;
@@ -25,6 +25,7 @@ use crate::theme::{
     after_field, apply_form_spacing, blend_scope, divider_bar, font_mono, font_semi, font_ui, mix,
     space, tint, ThemePalette, SEP,
 };
+use crate::form;
 use crate::topic_tree::{self, TopicTree, TreeMode};
 
 const PORT_W: f32 = 156.0;
@@ -32,9 +33,10 @@ const PORT_H: f32 = 44.0;
 const HUB_W: f32 = 160.0;
 const HUB_H: f32 = 68.0;
 const GAP: f32 = 12.0;
-const COL_GAP: f32 = 52.0;
+/// Clear space between columns (port · transform · hub); room for the arrows.
+const COL_GAP: f32 = 76.0;
 const MARGIN: f32 = 40.0;
-const INSPECT_DEFAULT: f32 = 276.0;
+const INSPECT_DEFAULT: f32 = 320.0;
 const INSPECT_MIN: f32 = 180.0;
 const DIAGRAM_MIN: f32 = 280.0;
 /// Shared height for Sources/Outputs name · protocol · remove controls.
@@ -234,6 +236,18 @@ pub struct LasOutputBind {
     pub curve: String,
 }
 
+pub use crate::modbus_panel::ModbusBind;
+
+/// Input node: file column / JSON path → host point (`file_N`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileInputBind {
+    /// CSV header name (or 0-based index) / JSON-lines dotted path.
+    #[serde(default)]
+    pub column: String,
+    #[serde(default)]
+    pub point: String,
+}
+
 /// Input node: SNMP OID → host point (`snmp_N`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SnmpInputBind {
@@ -363,6 +377,25 @@ pub struct HubPort {
     pub snmp_interval_secs: f32,
     #[serde(default)]
     pub snmp_inputs: Vec<SnmpInputBind>,
+    /// Modbus client connection id (Modbus panel, role Client).
+    #[serde(default)]
+    pub modbus_connection: String,
+    /// Poll interval seconds (Modbus Input).
+    #[serde(default = "default_modbus_interval")]
+    pub modbus_interval_secs: f32,
+    #[serde(default)]
+    pub modbus_inputs: Vec<ModbusBind>,
+    #[serde(default)]
+    pub modbus_outputs: Vec<ModbusBind>,
+    /// File-follow source id (File follow panel).
+    #[serde(default)]
+    pub file_source: String,
+    #[serde(default)]
+    pub file_inputs: Vec<FileInputBind>,
+    #[serde(skip)]
+    pub draft_modbus: Option<ModbusBind>,
+    #[serde(skip)]
+    pub draft_file_column: String,
     /// Ephemeral inspector drafts — not persisted.
     #[serde(skip)]
     pub draft_mqtt_topic: String,
@@ -422,6 +455,7 @@ fn default_stream_idle() -> f32 { 50.0 }
 fn default_stream_parser() -> String { "whole_line".into() }
 fn default_stream_ts() -> String { "receive".into() }
 fn default_snmp_interval() -> f32 { 10.0 }
+fn default_modbus_interval() -> f32 { 1.0 }
 fn default_las_index() -> String { "depth".into() }
 
 impl HubPort {
@@ -458,6 +492,14 @@ impl HubPort {
             las_index: default_las_index(),
             las_inputs: Vec::new(),
             las_outputs: Vec::new(),
+            modbus_connection: String::new(),
+            modbus_interval_secs: default_modbus_interval(),
+            modbus_inputs: Vec::new(),
+            modbus_outputs: Vec::new(),
+            file_source: String::new(),
+            file_inputs: Vec::new(),
+            draft_modbus: None,
+            draft_file_column: String::new(),
             snmp_target: String::new(),
             snmp_interval_secs: default_snmp_interval(),
             snmp_inputs: Vec::new(),
@@ -556,6 +598,9 @@ pub struct Hub {
     /// Center on the diagram, once the user has dragged this hub.
     #[serde(default)]
     pub at: Option<[f32; 2]>,
+    /// Modbus hub: id of the Server connection (Modbus panel) this hub listens on.
+    #[serde(default)]
+    pub modbus_server: String,
 }
 
 impl Hub {
@@ -662,11 +707,41 @@ pub struct HubModel {
     /// Selected fan-in wire index (PB-73). Ephemeral.
     #[serde(skip)]
     pub selected_feed: Option<usize>,
+    /// Connection pick-lists mirrored from the Modbus / File follow panels each frame.
+    #[serde(skip)]
+    pub choices: ExtChoices,
+}
+
+impl PartialEq for ExtChoices {
+    /// Session-only mirror — never counts as a project change.
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+/// `(id, label)` pick-lists for protocols whose panel state is not threaded into the diagram.
+#[derive(Debug, Clone, Default)]
+pub struct ExtChoices {
+    pub modbus_clients: Vec<(String, String)>,
+    pub modbus_servers: Vec<(String, String)>,
+    pub file_sources: Vec<(String, String)>,
 }
 
 impl Default for HubModel {
     fn default() -> Self {
         Self::sample()
+    }
+}
+
+/// Sample Modbus register bind (explicit point id so the server map can reference it).
+fn mb_bind(area: &str, address: u16, dtype: &str, order: &str, point: &str) -> ModbusBind {
+    ModbusBind {
+        area: area.into(),
+        address,
+        dtype: dtype.into(),
+        order: order.into(),
+        unit: 0,
+        point: point.into(),
     }
 }
 
@@ -685,22 +760,76 @@ impl HubModel {
             feeds: Vec::new(),
             undo: HubUndoStack::default(),
             selected_feed: None,
+            choices: ExtChoices::default(),
             hubs: vec![
                 Hub {
                     id: 1,
                     name: "Plant".into(),
                     protocol: HubProto::Modbus,
                     sources: vec![
-                        HubPort::new(2, HubProto::Modbus, "RTU line"),
+                        // Tank PLC over Modbus TCP — the main field device.
+                        {
+                            let mut p = HubPort::new(2, HubProto::Modbus, "Tank PLC");
+                            p.modbus_connection = "plc".into();
+                            p.modbus_interval_secs = 1.0;
+                            p.modbus_inputs = vec![
+                                mb_bind("holding", 100, "f32", "cdab", "modbus_1"), // tank level %
+                                mb_bind("holding", 102, "f32", "cdab", "modbus_2"), // tank temp °C
+                                mb_bind("holding", 110, "u32", "abcd", "modbus_3"), // flow total
+                                mb_bind("coil", 0, "bool", "abcd", "modbus_4"),     // pump running
+                                mb_bind("discrete", 0, "bool", "abcd", "modbus_5"), // high-level switch
+                                mb_bind("holding", 120, "bit3", "abcd", "modbus_6"), // alarm word bit 3
+                            ];
+                            p
+                        },
+                        // Power meter on an RS-485 line (Modbus RTU, unit 3).
+                        {
+                            let mut p = HubPort::new(10, HubProto::Modbus, "Power meter");
+                            p.modbus_connection = "meter".into();
+                            p.modbus_interval_secs = 5.0;
+                            p.modbus_inputs = vec![
+                                mb_bind("input", 0, "u16", "abcd", "modbus_7"), // volts
+                                mb_bind("input", 2, "f32", "badc", "modbus_8"), // kW
+                            ];
+                            p
+                        },
                         HubPort::new(3, HubProto::Streams, "Serial A"),
                     ],
                     outputs: vec![
-                        HubPort::new(4, HubProto::Mqtt, "Plant topics"),
+                        // Publish the plant picture to MQTT.
+                        {
+                            let mut p = HubPort::new(4, HubProto::Mqtt, "Plant topics");
+                            p.mqtt_connection = "local".into();
+                            let out = |point: &str, topic: &str| MqttOutputBind {
+                                point: point.into(),
+                                topic: topic.into(),
+                                qos: 0,
+                                retain: false,
+                                auto: false,
+                            };
+                            p.mqtt_outputs = vec![
+                                out("modbus_1", "plant/tank/level"),
+                                out("modbus_2", "plant/tank/temp"),
+                                out("modbus_3", "plant/flow/total"),
+                                out("modbus_4", "plant/pump/running"),
+                                out("modbus_6", "plant/tank/alarm"),
+                                out("modbus_8", "plant/power/kw"),
+                            ];
+                            p
+                        },
                         HubPort::new(5, HubProto::OpcUa, "SCADA"),
+                        // MQTT command → Modbus coil on the PLC (start / stop the pump).
+                        {
+                            let mut p = HubPort::new(9, HubProto::Modbus, "Pump command");
+                            p.modbus_connection = "plc".into();
+                            p.modbus_outputs = vec![mb_bind("coil", 1, "bool", "abcd", "mqtt_1")];
+                            p
+                        },
                     ],
                     aggregators: vec![],
                     calculations: vec![],
                     at: None,
+                    modbus_server: "hub".into(),
                 },
                 Hub {
                     id: 6,
@@ -709,6 +838,11 @@ impl HubModel {
                     sources: vec![{
                         let mut p = HubPort::new(7, HubProto::Mqtt, "Local broker");
                         p.mqtt_connection = "local".into();
+                        p.mqtt_inputs = vec![MqttInputBind {
+                            topic: "plant/pump/cmd".into(),
+                            path: String::new(),
+                            point: "mqtt_1".into(),
+                        }];
                         p
                     }],
                     outputs: vec![{
@@ -719,6 +853,7 @@ impl HubModel {
                     aggregators: vec![],
                     calculations: vec![],
                     at: None,
+                    modbus_server: String::new(),
                 },
             ],
         }
@@ -1048,6 +1183,7 @@ impl HubModel {
             aggregators: vec![],
             calculations: vec![],
             at: None,
+            modbus_server: String::new(),
         });
         self.focus_hub(id);
     }
@@ -1847,7 +1983,9 @@ fn layout_nodes(hubs: &[Hub]) -> Vec<Placed> {
             );
         }
     }
-    // Edge transforms: on their port↔hub segment, or free-floating when orphaned (PB-68).
+    // Transforms: default slot comes from `default_spots` (own column between port and hub,
+    // so arrows stay visible); a dragged port carries its transforms along, a dragged
+    // transform wins over both.
     for hub in hubs {
         let Some(hub_node) = nodes
             .iter()
@@ -1856,7 +1994,12 @@ fn layout_nodes(hubs: &[Hub]) -> Vec<Placed> {
         else {
             continue;
         };
-        let steps: Vec<(u64, Role, u64, Option<[f32; 2]>)> = hub
+        let hub_origin = hub_default
+            .iter()
+            .find(|(id, _)| *id == hub.id)
+            .map(|(_, c)| *c)
+            .unwrap_or(hub_node.rect.center());
+        let steps = hub
             .aggregators
             .iter()
             .map(|s| (s.id, Role::Aggregator, s.edge_port, s.at))
@@ -1864,69 +2007,31 @@ fn layout_nodes(hubs: &[Hub]) -> Vec<Placed> {
                 hub.calculations
                     .iter()
                     .map(|s| (s.id, Role::Calculation, s.edge_port, s.at)),
-            )
-            .collect();
-        // Group by edge_port for even spacing; orphans (edge_port 0 / missing) use at/hub.
-        let mut by_edge: BTreeMap<u64, Vec<(u64, Role, Option<[f32; 2]>)>> = BTreeMap::new();
-        let mut orphans = Vec::new();
+            );
         for (id, role, edge_port, at) in steps {
-            let port_exists = hub.sources.iter().any(|p| p.id == edge_port)
-                || hub.outputs.iter().any(|p| p.id == edge_port);
-            if edge_port != 0 && port_exists {
-                by_edge
-                    .entry(edge_port)
-                    .or_default()
-                    .push((id, role, at));
-            } else {
-                orphans.push((id, role, at));
-            }
-        }
-        for (edge_port, on_edge) in by_edge {
-            let Some(port_node) = nodes
+            let spot = defaults
                 .iter()
-                .find(|node| node.hub_id == hub.id && node.port_id == Some(edge_port))
-                .copied()
-            else {
-                for (id, role, at) in on_edge {
-                    let center = at
-                        .map(|at| pos2(at[0], at[1]))
-                        .unwrap_or(hub_node.rect.center() + vec2(0.0, 48.0));
-                    nodes.push(placed(
-                        hub.id,
-                        Some(id),
-                        role,
-                        center,
-                        vec2(PORT_W, PORT_H),
-                    ));
-                }
-                continue;
+                .find(|spot| spot.hub_id == hub.id && spot.port_id == Some(id))
+                .map(|spot| spot.center);
+            let port_node = if edge_port != 0 {
+                nodes
+                    .iter()
+                    .find(|node| node.hub_id == hub.id && node.port_id == Some(edge_port))
+                    .copied()
+            } else {
+                None
             };
-            let n = on_edge.len() as f32;
-            for (i, (id, role, at)) in on_edge.into_iter().enumerate() {
-                let t = (i as f32 + 1.0) / (n + 1.0);
-                let mid =
-                    port_node.rect.center() + (hub_node.rect.center() - port_node.rect.center()) * t;
-                let center = at.map(|at| pos2(at[0], at[1])).unwrap_or(mid);
-                nodes.push(placed(
-                    hub.id,
-                    Some(id),
-                    role,
-                    center,
-                    vec2(PORT_W, PORT_H),
-                ));
-            }
-        }
-        for (i, (id, role, at)) in orphans.into_iter().enumerate() {
-            let center = at.map(|at| pos2(at[0], at[1])).unwrap_or_else(|| {
-                hub_node.rect.center() + vec2(0.0, 56.0 + i as f32 * (PORT_H + 12.0))
-            });
-            nodes.push(placed(
-                hub.id,
-                Some(id),
-                role,
-                center,
-                vec2(PORT_W, PORT_H),
-            ));
+            let port_spot = defaults
+                .iter()
+                .find(|s| s.hub_id == hub.id && s.port_id == Some(edge_port))
+                .map(|s| s.center);
+            let fallback = match (spot, port_node, port_spot) {
+                (Some(spot), Some(node), Some(origin)) => node.rect.center() + (spot - origin),
+                (Some(spot), _, _) => hub_node.rect.center() + (spot - hub_origin),
+                _ => hub_node.rect.center() + vec2(0.0, 56.0),
+            };
+            let center = at.map(|at| pos2(at[0], at[1])).unwrap_or(fallback);
+            nodes.push(placed(hub.id, Some(id), role, center, vec2(PORT_W, PORT_H)));
         }
     }
     nodes
@@ -1966,59 +2071,155 @@ fn placed(hub_id: u64, port_id: Option<u64>, role: Role, center: Pos2, size: Vec
     }
 }
 
+/// Automatic arrangement ("Arrange"): one band per hub, stacked top to bottom.
+///
+/// Columns left to right: sources · source transforms · hub · output transforms · outputs.
+/// A transform column exists only when some port on that side has transforms. Every column
+/// gap is `COL_GAP` so arrows always have room, and every port gets a vertical slot tall
+/// enough for its own transforms, so no two boxes can overlap.
 fn default_spots(hubs: &[Hub]) -> Vec<Spot> {
-    let src_x = MARGIN + PORT_W * 0.5;
-    let hub_x = MARGIN + PORT_W + COL_GAP + HUB_W * 0.5;
-    let out_x = hub_x + HUB_W * 0.5 + COL_GAP + PORT_W * 0.5;
     let mut y = MARGIN;
     let mut spots = Vec::new();
     for hub in hubs {
-        let rows = hub.sources.len().max(hub.outputs.len()).max(1) as f32;
-        let stack = rows * PORT_H + (rows - 1.0).max(0.0) * GAP;
-        let band = stack.max(HUB_H) + 36.0;
+        let src_slots = port_slots(hub, &hub.sources);
+        let out_slots = port_slots(hub, &hub.outputs);
+        let orphans = orphan_steps(hub);
+        let orphan_h = if orphans.is_empty() {
+            0.0
+        } else {
+            2.0 * (GAP + stack_h(orphans.len()))
+        };
+        let inner = stack_total(&src_slots)
+            .max(stack_total(&out_slots))
+            .max(HUB_H + orphan_h);
+        let band = inner + 36.0;
         let mid = y + band * 0.5;
+
+        let has_src_steps = src_slots.iter().any(|slot| !slot.steps.is_empty());
+        let has_out_steps = out_slots.iter().any(|slot| !slot.steps.is_empty());
+        let mut x = MARGIN;
+        let src_x = x + PORT_W * 0.5;
+        x += PORT_W + COL_GAP;
+        let src_step_x = x + PORT_W * 0.5;
+        if has_src_steps {
+            x += PORT_W + COL_GAP;
+        }
+        let hub_x = x + HUB_W * 0.5;
+        x += HUB_W + COL_GAP;
+        let out_step_x = x + PORT_W * 0.5;
+        if has_out_steps {
+            x += PORT_W + COL_GAP;
+        }
+        let out_x = x + PORT_W * 0.5;
+
         spots.push(Spot {
             hub_id: hub.id,
             port_id: None,
             role: Role::Hub,
             center: pos2(hub_x, mid),
         });
-        push_port_spots(&mut spots, &hub.sources, Role::Source, src_x, mid, hub.id);
-        push_port_spots(&mut spots, &hub.outputs, Role::Output, out_x, mid, hub.id);
+        push_slot_spots(&mut spots, hub.id, &src_slots, Role::Source, src_x, src_step_x, mid);
+        push_slot_spots(&mut spots, hub.id, &out_slots, Role::Output, out_x, out_step_x, mid);
+        let mut oy = mid + HUB_H * 0.5 + GAP + PORT_H * 0.5;
+        for (id, role) in orphans {
+            spots.push(Spot {
+                hub_id: hub.id,
+                port_id: Some(id),
+                role,
+                center: pos2(hub_x, oy),
+            });
+            oy += PORT_H + GAP;
+        }
         y += band + 28.0;
     }
     spots
 }
 
-fn push_port_spots(
-    spots: &mut Vec<Spot>,
-    ports: &[HubPort],
-    role: Role,
-    x: f32,
-    mid: f32,
-    hub_id: u64,
-) {
-    if ports.is_empty() {
-        return;
-    }
-    let ids: Vec<(u64, Role)> = ports.iter().map(|port| (port.id, role)).collect();
-    push_id_spots(spots, &ids, x, mid, hub_id);
+/// One port plus the transforms that sit on its edge.
+struct PortSlot {
+    port_id: u64,
+    steps: Vec<(u64, Role)>,
 }
 
-fn push_id_spots(spots: &mut Vec<Spot>, ids: &[(u64, Role)], x: f32, mid: f32, hub_id: u64) {
-    if ids.is_empty() {
-        return;
+impl PortSlot {
+    /// Slot height: the port, or its transform stack when that is taller.
+    fn height(&self) -> f32 {
+        PORT_H.max(stack_h(self.steps.len()))
     }
-    let stack = ids.len() as f32 * PORT_H + (ids.len() - 1) as f32 * GAP;
-    let mut y = mid - stack * 0.5 + PORT_H * 0.5;
-    for &(id, role) in ids {
+}
+
+/// Height of `n` stacked boxes with `GAP` between them (0 for none).
+fn stack_h(n: usize) -> f32 {
+    if n == 0 {
+        0.0
+    } else {
+        n as f32 * PORT_H + (n - 1) as f32 * GAP
+    }
+}
+
+fn stack_total(slots: &[PortSlot]) -> f32 {
+    if slots.is_empty() {
+        return 0.0;
+    }
+    slots.iter().map(PortSlot::height).sum::<f32>() + (slots.len() - 1) as f32 * GAP
+}
+
+fn port_slots(hub: &Hub, ports: &[HubPort]) -> Vec<PortSlot> {
+    ports
+        .iter()
+        .map(|port| PortSlot {
+            port_id: port.id,
+            steps: hub.steps_on(port.id),
+        })
+        .collect()
+}
+
+/// Transforms whose edge port is gone or unset; they float under the hub.
+fn orphan_steps(hub: &Hub) -> Vec<(u64, Role)> {
+    let mut out = Vec::new();
+    for step in &hub.aggregators {
+        if !hub.has_port(step.edge_port) {
+            out.push((step.id, Role::Aggregator));
+        }
+    }
+    for step in &hub.calculations {
+        if !hub.has_port(step.edge_port) {
+            out.push((step.id, Role::Calculation));
+        }
+    }
+    out
+}
+
+fn push_slot_spots(
+    spots: &mut Vec<Spot>,
+    hub_id: u64,
+    slots: &[PortSlot],
+    role: Role,
+    port_x: f32,
+    step_x: f32,
+    mid: f32,
+) {
+    let mut top = mid - stack_total(slots) * 0.5;
+    for slot in slots {
+        let h = slot.height();
+        let slot_mid = top + h * 0.5;
         spots.push(Spot {
             hub_id,
-            port_id: Some(id),
+            port_id: Some(slot.port_id),
             role,
-            center: pos2(x, y),
+            center: pos2(port_x, slot_mid),
         });
-        y += PORT_H + GAP;
+        let mut sy = slot_mid - stack_h(slot.steps.len()) * 0.5 + PORT_H * 0.5;
+        for &(id, step_role) in &slot.steps {
+            spots.push(Spot {
+                hub_id,
+                port_id: Some(id),
+                role: step_role,
+                center: pos2(step_x, sy),
+            });
+            sy += PORT_H + GAP;
+        }
+        top += h + GAP;
     }
 }
 
@@ -3960,7 +4161,7 @@ fn edit_selected(
             engine,
         );
     }
-    edit_hub(ui, model, p)
+    edit_hub(ui, model, p, host)
 }
 
 fn edit_step(
@@ -4121,11 +4322,12 @@ fn edit_port(
         ui.set_min_height(PORT_ROW_H);
         let current = port_field(model, hub_id, port_id).protocol;
         let mut next = current;
+        let combo_w = proto_combo_width(ui, p);
         ui.scope(|ui| {
-            ui.spacing_mut().interact_size = vec2(PORT_PROTO_W, PORT_ROW_H);
+            ui.spacing_mut().interact_size = vec2(combo_w, PORT_ROW_H);
             egui::ComboBox::from_id_salt(("pb_inspect_proto", port_id))
                 .selected_text(current.label())
-                .width(PORT_PROTO_W)
+                .width(combo_w)
                 .show_ui(ui, |ui| {
                     for proto in HubProto::ALL {
                         ui.selectable_value(&mut next, proto, proto.label());
@@ -4141,7 +4343,7 @@ fn edit_port(
                 .font(font_ui(12.0))
                 .color(p.muted),
         );
-        let name_w = (ui.available_width() - 4.0).max(80.0);
+        let name_w = (ui.available_width() - 6.0).max(80.0);
         let label = &mut port_field(model, hub_id, port_id).label;
         if ui
             .add_sized(
@@ -4228,8 +4430,17 @@ fn edit_port(
             port_id,
             incoming,
             las_connections,
+            host,
             p,
         ));
+    }
+    if proto == HubProto::Modbus {
+        ui.add_space(space::SECTION - 2.0);
+        change = change.join(edit_modbus_port_binds(ui, model, hub_id, port_id, incoming, host, p));
+    }
+    if proto == HubProto::Files {
+        ui.add_space(space::SECTION - 2.0);
+        change = change.join(edit_file_port_binds(ui, model, hub_id, port_id, incoming, host, p));
     }
     if proto == HubProto::Snmp {
         ui.add_space(space::SECTION - 2.0);
@@ -4240,6 +4451,7 @@ fn edit_port(
             port_id,
             incoming,
             snmp_connections,
+            host,
             p,
         ));
     }
@@ -4361,43 +4573,45 @@ fn edit_opcua_input_binds(
     let draft_id = egui::Id::new(("pb_opcua_draft", port_id));
     let (mut draft_node, mut draft_point): (String, String) =
         ui.ctx().data_mut(|d| d.get_temp(draft_id).unwrap_or_default());
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = space::BUTTON;
-        let node_changed = ui
-            .add(
-                egui::TextEdit::singleline(&mut draft_node)
-                    .hint_text("ns=2;s=Temperature")
-                    .desired_width(180.0)
-                    .margin(egui::Margin::symmetric(6.0, 4.0)),
+    let mut add_bind = false;
+    let mut draft = (draft_node, draft_point);
+    let edited = form::flow(ui, &mut draft, p, vec![
+        form::Cell::grow("NodeId", 150.0, |ui, w, d: &mut (String, String)| {
+            ui.add_sized(
+                [w, form::ROW_H - 2.0],
+                egui::TextEdit::singleline(&mut d.0).hint_text("ns=2;s=Temperature").desired_width(w),
             )
-            .changed();
-        let point_changed = ui
-            .add(
-                egui::TextEdit::singleline(&mut draft_point)
-                    .hint_text("point (optional)")
-                    .desired_width(100.0)
-                    .margin(egui::Margin::symmetric(6.0, 4.0)),
+            .changed()
+        }),
+        form::Cell::grow_to("Point", 90.0, 200.0, |ui, w, d: &mut (String, String)| {
+            ui.add_sized(
+                [w, form::ROW_H - 2.0],
+                egui::TextEdit::singleline(&mut d.1).hint_text("(optional)").desired_width(w),
             )
-            .changed();
-        if node_changed || point_changed {
-            ui.ctx()
-                .data_mut(|d| d.insert_temp(draft_id, (draft_node.clone(), draft_point.clone())));
-        }
-        if text_button(ui, "Add bind", false, p).clicked() && !draft_node.trim().is_empty() {
-            port_field(model, hub_id, port_id)
-                .opcua_inputs
-                .push(OpcUaInputBind {
-                    node_id: draft_node.trim().to_string(),
-                    point: draft_point.trim().to_string(),
-                    mode: "subscribe".into(),
-                });
-            draft_node.clear();
-            draft_point.clear();
-            ui.ctx()
-                .data_mut(|d| d.insert_temp(draft_id, (draft_node.clone(), draft_point.clone())));
-            change.dirty = true;
-        }
-    });
+            .changed()
+        }),
+        form::Cell::fixed("", 70.0, |ui, _w, _d: &mut (String, String)| {
+            add_bind = text_button(ui, "Add bind", false, p).clicked();
+            false
+        }),
+    ]);
+    let (mut draft_node, mut draft_point) = draft;
+    if add_bind && !draft_node.trim().is_empty() {
+        port_field(model, hub_id, port_id)
+            .opcua_inputs
+            .push(OpcUaInputBind {
+                node_id: draft_node.trim().to_string(),
+                point: draft_point.trim().to_string(),
+                mode: "subscribe".into(),
+            });
+        draft_node.clear();
+        draft_point.clear();
+        change.dirty = true;
+    }
+    if edited || add_bind {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(draft_id, (draft_node.clone(), draft_point.clone())));
+    }
     after_field(ui);
     ui.label(
         egui::RichText::new(
@@ -4463,44 +4677,17 @@ fn edit_http_port_binds(
         let mut do_fetch = false;
         {
             let port = port_field(model, hub_id, port_id);
-            let mut method = port.http_method.clone();
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = space::ITEM_X;
-                ui.label(
-                    egui::RichText::new("Method")
-                        .font(font_ui(12.0))
-                        .color(p.muted),
-                );
-                egui::ComboBox::from_id_salt(("pb_http_method", port_id))
-                    .selected_text(&method)
-                    .width(80.0)
-                    .show_ui(ui, |ui| {
-                        for m in ["GET", "POST"] {
-                            ui.selectable_value(&mut method, m.to_string(), m);
-                        }
-                    });
-            });
-            if method != port.http_method {
-                port.http_method = method;
+            if form::flow(ui, port, p, vec![
+                form::Cell::fixed("Method", 80.0, |ui, w, port: &mut HubPort| {
+                    form::combo(ui, ("pb_http_method", port_id), w, &mut port.http_method, &[("GET", "GET"), ("POST", "POST")])
+                }),
+                form::Cell::fixed("Every (s)", 64.0, |ui, w, port: &mut HubPort| {
+                    form::drag_f32(ui, w, &mut port.http_interval_secs, 0.25, 0.5..=3600.0)
+                }),
+                form::Cell::grow("Path", 140.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.http_url_path)),
+            ]) {
                 change.dirty = true;
             }
-            inspect_field(ui, "Path", &mut port.http_url_path, p);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = space::ITEM_X;
-                ui.label(
-                    egui::RichText::new("Every (s)")
-                        .font(font_ui(12.0))
-                        .color(p.muted),
-                );
-                let mut interval = port.http_interval_secs;
-                if ui
-                    .add(egui::DragValue::new(&mut interval).speed(0.25).range(0.5..=3600.0))
-                    .changed()
-                {
-                    port.http_interval_secs = interval;
-                    change.dirty = true;
-                }
-            });
             ui.add_space(space::AFTER_FIELD);
             if text_button(ui, "Fetch preview", false, p).clicked() {
                 do_fetch = true;
@@ -4670,10 +4857,13 @@ fn edit_http_port_binds(
         let mut add_manual = false;
         {
             let port = port_field(model, hub_id, port_id);
-            inspect_field(ui, "JSON path", &mut port.draft_http_json_path, p);
-            if text_button(ui, "Add bind", false, p).clicked() {
-                add_manual = true;
-            }
+            form::flow(ui, port, p, vec![
+                form::Cell::grow("JSON path", 120.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_http_json_path)),
+                form::Cell::fixed("", 70.0, |ui, _w, _port: &mut HubPort| {
+                    add_manual = text_button(ui, "Add bind", false, p).clicked();
+                    false
+                }),
+            ]);
         }
         if add_manual {
             let port = port_field(model, hub_id, port_id);
@@ -4705,32 +4895,17 @@ fn edit_http_port_binds(
         ui.add_space(space::AFTER_HEADING);
         {
             let port = port_field(model, hub_id, port_id);
-            let mut method = if port.http_method == "GET" {
-                "POST".to_string()
-            } else {
-                port.http_method.clone()
-            };
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = space::ITEM_X;
-                ui.label(
-                    egui::RichText::new("Method")
-                        .font(font_ui(12.0))
-                        .color(p.muted),
-                );
-                egui::ComboBox::from_id_salt(("pb_http_out_method", port_id))
-                    .selected_text(&method)
-                    .width(90.0)
-                    .show_ui(ui, |ui| {
-                        for m in ["POST", "PUT", "PATCH"] {
-                            ui.selectable_value(&mut method, m.to_string(), m);
-                        }
-                    });
-            });
-            if method != port.http_method {
-                port.http_method = method;
+            if port.http_method == "GET" {
+                port.http_method = "POST".to_string();
+            }
+            if form::flow(ui, port, p, vec![
+                form::Cell::fixed("Method", 90.0, |ui, w, port: &mut HubPort| {
+                    form::combo(ui, ("pb_http_out_method", port_id), w, &mut port.http_method, &[("POST", "POST"), ("PUT", "PUT"), ("PATCH", "PATCH")])
+                }),
+                form::Cell::grow("Path", 140.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.http_url_path)),
+            ]) {
                 change.dirty = true;
             }
-            inspect_field(ui, "Path", &mut port.http_url_path, p);
         }
 
         ui.add_space(space::SECTION - 2.0);
@@ -4756,11 +4931,14 @@ fn edit_http_port_binds(
                     }
                 });
             }
-            inspect_field(ui, "Point", &mut port.draft_http_out_point, p);
-            inspect_field(ui, "JSON path", &mut port.draft_http_out_json_path, p);
-            if text_button(ui, "Add bind", false, p).clicked() {
-                add = true;
-            }
+            form::flow(ui, port, p, vec![
+                form::Cell::grow("Point", 90.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_http_out_point)),
+                form::Cell::grow("JSON path", 100.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_http_out_json_path)),
+                form::Cell::fixed("", 70.0, |ui, _w, _port: &mut HubPort| {
+                    add = text_button(ui, "Add bind", false, p).clicked();
+                    false
+                }),
+            ]);
         }
         if let Some(i) = remove {
             port_field(model, hub_id, port_id).http_outputs.remove(i);
@@ -4833,53 +5011,34 @@ fn edit_streams_port_binds(
     ui.add_space(space::AFTER_HEADING);
     {
         let port = port_field(model, hub_id, port_id);
-        change.dirty |= combo_owned(
-            ui,
-            "Mode",
-            &mut port.stream_frame,
-            &[("delimited", "Delimited"), ("transparent", "Transparent")],
-            ("pb_stream_frame", port_id),
-            p,
-        );
+        let mut cells: Vec<form::Cell<HubPort>> = vec![form::Cell::fixed("Mode", 120.0, |ui, w, port: &mut HubPort| {
+            form::combo(ui, ("pb_stream_frame", port_id), w, &mut port.stream_frame,
+                &[("delimited", "Delimited"), ("transparent", "Transparent")])
+        })];
         if port.stream_frame != "transparent" {
-            change.dirty |= combo_owned(
-                ui,
-                "EOL",
-                &mut port.stream_eol,
-                &[
+            cells.push(form::Cell::fixed("EOL", 130.0, |ui, w, port: &mut HubPort| {
+                form::combo(ui, ("pb_stream_eol", port_id), w, &mut port.stream_eol, &[
                     ("lf", "LF (\\n)"),
                     ("crlf", "CRLF"),
                     ("cr", "CR"),
                     ("custom", "Custom"),
                     ("idle", "Idle time only"),
                     ("eol_idle", "EOL or idle"),
-                ],
-                ("pb_stream_eol", port_id),
-                p,
-            );
+                ])
+            }));
             if port.stream_eol == "custom" {
-                inspect_field(ui, "Custom EOL", &mut port.stream_eol_custom, p);
+                cells.push(form::Cell::grow_to("Custom EOL", 60.0, 140.0, |ui, w, port: &mut HubPort| {
+                    form::text(ui, w, &mut port.stream_eol_custom)
+                }));
             }
-            if matches!(port.stream_eol.as_str(), "idle" | "eol_idle")
-                || port.stream_frame == "delimited"
-            {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = space::ITEM_X;
-                    ui.label(
-                        egui::RichText::new("Idle (ms)")
-                            .font(font_ui(12.0))
-                            .color(p.muted),
-                    );
-                    let mut idle = port.stream_idle_ms;
-                    if ui
-                        .add(egui::DragValue::new(&mut idle).speed(1.0).range(1.0..=10_000.0))
-                        .changed()
-                    {
-                        port.stream_idle_ms = idle;
-                        change.dirty = true;
-                    }
-                });
+            if matches!(port.stream_eol.as_str(), "idle" | "eol_idle") || port.stream_frame == "delimited" {
+                cells.push(form::Cell::fixed("Idle (ms)", 64.0, |ui, w, port: &mut HubPort| {
+                    form::drag_f32(ui, w, &mut port.stream_idle_ms, 1.0, 1.0..=10_000.0)
+                }));
             }
+        }
+        if form::flow(ui, port, p, cells) {
+            change.dirty = true;
         }
     }
 
@@ -4893,48 +5052,52 @@ fn edit_streams_port_binds(
         ui.add_space(space::AFTER_HEADING);
         {
             let port = port_field(model, hub_id, port_id);
-            change.dirty |= combo_owned(
-                ui,
-                "Parser",
-                &mut port.stream_parser,
-                &[
-                    ("whole_line", "Whole line"),
-                    ("csv", "CSV"),
-                    ("tsv", "TSV (tab)"),
-                    ("whitespace", "Whitespace"),
-                    ("fixed", "Fixed width"),
-                    ("regex", "Regex"),
-                ],
-                ("pb_stream_parser", port_id),
-                p,
-            );
+            let mut cells: Vec<form::Cell<HubPort>> = vec![
+                form::Cell::fixed("Parser", 120.0, |ui, w, port: &mut HubPort| {
+                    form::combo(ui, ("pb_stream_parser", port_id), w, &mut port.stream_parser, &[
+                        ("whole_line", "Whole line"),
+                        ("csv", "CSV"),
+                        ("tsv", "TSV (tab)"),
+                        ("whitespace", "Whitespace"),
+                        ("fixed", "Fixed width"),
+                        ("regex", "Regex"),
+                    ])
+                }),
+                form::Cell::fixed("Timestamp", 130.0, |ui, w, port: &mut HubPort| {
+                    form::combo(ui, ("pb_stream_ts", port_id), w, &mut port.stream_timestamp, &[
+                        ("none", "None"),
+                        ("receive", "Receive time"),
+                        ("iso8601", "ISO-8601 field"),
+                        ("epoch_ms", "Epoch ms field"),
+                        ("custom", "Custom format"),
+                    ])
+                }),
+            ];
             if port.stream_parser == "fixed" {
-                inspect_field(ui, "Widths", &mut port.stream_fixed_widths, p);
+                cells.push(form::Cell::grow("Widths", 90.0, |ui, w, port: &mut HubPort| {
+                    form::text(ui, w, &mut port.stream_fixed_widths)
+                }));
+            }
+            if port.stream_parser == "regex" {
+                cells.push(form::Cell::grow("Regex", 110.0, |ui, w, port: &mut HubPort| {
+                    form::text(ui, w, &mut port.stream_regex)
+                }));
+            }
+            if port.stream_timestamp == "custom" {
+                cells.push(form::Cell::grow("Format", 100.0, |ui, w, port: &mut HubPort| {
+                    form::text(ui, w, &mut port.stream_timestamp_custom)
+                }));
+            }
+            let fixed_hint = port.stream_parser == "fixed";
+            if form::flow(ui, port, p, cells) {
+                change.dirty = true;
+            }
+            if fixed_hint {
                 ui.label(
-                    egui::RichText::new("Comma-separated column widths, e.g. 8,12,6")
+                    egui::RichText::new("Widths: comma-separated column widths, e.g. 8,12,6")
                         .font(font_ui(11.0))
                         .color(p.muted),
                 );
-            }
-            if port.stream_parser == "regex" {
-                inspect_field(ui, "Regex", &mut port.stream_regex, p);
-            }
-            change.dirty |= combo_owned(
-                ui,
-                "Timestamp",
-                &mut port.stream_timestamp,
-                &[
-                    ("none", "None"),
-                    ("receive", "Receive time"),
-                    ("iso8601", "ISO-8601 field"),
-                    ("epoch_ms", "Epoch ms field"),
-                    ("custom", "Custom format"),
-                ],
-                ("pb_stream_ts", port_id),
-                p,
-            );
-            if port.stream_timestamp == "custom" {
-                inspect_field(ui, "Format", &mut port.stream_timestamp_custom, p);
             }
         }
 
@@ -5090,10 +5253,13 @@ fn edit_streams_port_binds(
         let mut add_manual = false;
         {
             let port = port_field(model, hub_id, port_id);
-            inspect_field(ui, "Field #", &mut port.draft_stream_field, p);
-            if text_button(ui, "Add bind", false, p).clicked() {
-                add_manual = true;
-            }
+            form::flow(ui, port, p, vec![
+                form::Cell::grow("Field #", 90.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_stream_field)),
+                form::Cell::fixed("", 70.0, |ui, _w, _port: &mut HubPort| {
+                    add_manual = text_button(ui, "Add bind", false, p).clicked();
+                    false
+                }),
+            ]);
         }
         if add_manual {
             let port = port_field(model, hub_id, port_id);
@@ -5114,36 +5280,33 @@ fn edit_streams_port_binds(
         ui.add_space(space::AFTER_HEADING);
         {
             let port = port_field(model, hub_id, port_id);
-            change.dirty |= combo_owned(
-                ui,
-                "Layout",
-                &mut port.stream_parser,
-                &[
-                    ("whole_line", "Whole line"),
-                    ("csv", "CSV"),
-                    ("tsv", "TSV"),
-                    ("whitespace", "Whitespace"),
-                    ("fixed", "Fixed width"),
-                ],
-                ("pb_stream_out_layout", port_id),
-                p,
-            );
-            change.dirty |= combo_owned(
-                ui,
-                "Trailer",
-                &mut port.stream_eol,
-                &[
-                    ("lf", "LF (\\n)"),
-                    ("crlf", "CRLF"),
-                    ("cr", "CR"),
-                    ("custom", "Custom"),
-                    ("none", "None"),
-                ],
-                ("pb_stream_out_eol", port_id),
-                p,
-            );
+            let mut cells: Vec<form::Cell<HubPort>> = vec![
+                form::Cell::fixed("Layout", 120.0, |ui, w, port: &mut HubPort| {
+                    form::combo(ui, ("pb_stream_out_layout", port_id), w, &mut port.stream_parser, &[
+                        ("whole_line", "Whole line"),
+                        ("csv", "CSV"),
+                        ("tsv", "TSV"),
+                        ("whitespace", "Whitespace"),
+                        ("fixed", "Fixed width"),
+                    ])
+                }),
+                form::Cell::fixed("Trailer", 100.0, |ui, w, port: &mut HubPort| {
+                    form::combo(ui, ("pb_stream_out_eol", port_id), w, &mut port.stream_eol, &[
+                        ("lf", "LF (\\n)"),
+                        ("crlf", "CRLF"),
+                        ("cr", "CR"),
+                        ("custom", "Custom"),
+                        ("none", "None"),
+                    ])
+                }),
+            ];
             if port.stream_eol == "custom" {
-                inspect_field(ui, "Custom", &mut port.stream_eol_custom, p);
+                cells.push(form::Cell::grow_to("Custom", 60.0, 140.0, |ui, w, port: &mut HubPort| {
+                    form::text(ui, w, &mut port.stream_eol_custom)
+                }));
+            }
+            if form::flow(ui, port, p, cells) {
+                change.dirty = true;
             }
         }
 
@@ -5162,11 +5325,14 @@ fn edit_streams_port_binds(
         let mut add_out = false;
         {
             let port = port_field(model, hub_id, port_id);
-            inspect_field(ui, "Point", &mut port.draft_stream_out_point, p);
-            inspect_field(ui, "Field #", &mut port.draft_stream_out_field, p);
-            if text_button(ui, "Add emit", false, p).clicked() {
-                add_out = true;
-            }
+            form::flow(ui, port, p, vec![
+                form::Cell::grow("Point", 90.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_stream_out_point)),
+                form::Cell::grow_to("Field #", 60.0, 120.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_stream_out_field)),
+                form::Cell::fixed("", 70.0, |ui, _w, _port: &mut HubPort| {
+                    add_out = text_button(ui, "Add emit", false, p).clicked();
+                    false
+                }),
+            ]);
         }
         if add_out {
             let port = port_field(model, hub_id, port_id);
@@ -6078,6 +6244,7 @@ fn edit_las_port_binds(
     port_id: u64,
     incoming: bool,
     las_connections: &[(String, String)],
+    host: &HostSnapshot,
     p: &ThemePalette,
 ) -> HubChange {
     let mut change = HubChange::quiet();
@@ -6115,14 +6282,19 @@ fn edit_las_port_binds(
 
     {
         let port = port_field(model, hub_id, port_id);
-        change.dirty |= combo_owned(
-            ui,
-            "Index",
-            &mut port.las_index,
-            &[("depth", "Depth"), ("time", "Time")],
-            ("pb_las_index", port_id),
-            p,
-        );
+        if form::flow(ui, port, p, vec![form::Cell::fixed("Index", 90.0, |ui, w, port: &mut HubPort| {
+            form::combo(ui, ("pb_las_index", port_id), w, &mut port.las_index, &[("depth", "Depth"), ("time", "Time")])
+        })]) {
+            change.dirty = true;
+        }
+    }
+
+    let (las_live, las_pack_loaded) = crate::las_panel::live_from_host(host);
+    {
+        let cur = port_field(model, hub_id, port_id).las_endpoint.clone();
+        if !cur.is_empty() {
+            crate::las_panel::show_status(ui, p, las_live.iter().find(|l| l.id == cur), las_pack_loaded);
+        }
     }
 
     if incoming {
@@ -6133,11 +6305,27 @@ fn edit_las_port_binds(
                 .color(p.muted),
         );
         ui.add_space(space::AFTER_HEADING);
-        ui.label(
-            egui::RichText::new("Curve preview needs pb-las — enter mnemonics from ~C for now.")
-                .font(font_ui(11.0))
-                .color(p.muted),
-        );
+        // Curve picker: the pack lists the file's ~Curve mnemonics (also with no binds yet).
+        let cur_ep = port_field(model, hub_id, port_id).las_endpoint.clone();
+        let curves: Vec<(String, String)> = las_live
+            .iter()
+            .find(|l| l.id == cur_ep)
+            .map(|l| l.curves.iter().map(|c| (c.clone(), String::new())).collect())
+            .unwrap_or_default();
+        if curves.is_empty() {
+            ui.label(
+                egui::RichText::new("No curves yet — pick an endpoint whose file exists on the service machine, or type a mnemonic below.")
+                    .font(font_ui(11.0))
+                    .color(p.muted),
+            );
+        } else {
+            let bound: Vec<String> = port_field(model, hub_id, port_id).las_inputs.iter().map(|b| b.curve.clone()).collect();
+            if let Some(name) = crate::connection_list::picker_chips(ui, p, &curves, &|n| bound.iter().any(|b| b.eq_ignore_ascii_case(n))) {
+                port_field(model, hub_id, port_id).las_inputs.push(LasInputBind { curve: name, point: String::new() });
+                change.dirty = true;
+            }
+            ui.add_space(space::AFTER_HEADING);
+        }
         let mut remove = None;
         let n = port_field(model, hub_id, port_id).las_inputs.len();
         for i in 0..n {
@@ -6154,6 +6342,7 @@ fn edit_las_port_binds(
                         .font(font_ui(12.0))
                         .color(p.text),
                 );
+                crate::modbus_panel::live_value_label(ui, host, &bind.point, p);
                 if text_button(ui, "×", false, p).clicked() {
                     remove = Some(i);
                 }
@@ -6166,10 +6355,13 @@ fn edit_las_port_binds(
         let mut add = false;
         {
             let port = port_field(model, hub_id, port_id);
-            inspect_field(ui, "Curve", &mut port.draft_las_curve, p);
-            if text_button(ui, "Add bind", false, p).clicked() {
-                add = true;
-            }
+            form::flow(ui, port, p, vec![
+                form::Cell::grow("Curve", 100.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_las_curve)),
+                form::Cell::fixed("", 70.0, |ui, _w, _port: &mut HubPort| {
+                    add = text_button(ui, "Add bind", false, p).clicked();
+                    false
+                }),
+            ]);
         }
         if add {
             let port = port_field(model, hub_id, port_id);
@@ -6214,11 +6406,14 @@ fn edit_las_port_binds(
         let mut add = false;
         {
             let port = port_field(model, hub_id, port_id);
-            inspect_field(ui, "Point", &mut port.draft_las_out_point, p);
-            inspect_field(ui, "Curve", &mut port.draft_las_out_curve, p);
-            if text_button(ui, "Add bind", false, p).clicked() {
-                add = true;
-            }
+            form::flow(ui, port, p, vec![
+                form::Cell::grow("Point", 90.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_las_out_point)),
+                form::Cell::grow("Curve", 90.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_las_out_curve)),
+                form::Cell::fixed("", 70.0, |ui, _w, _port: &mut HubPort| {
+                    add = text_button(ui, "Add bind", false, p).clicked();
+                    false
+                }),
+            ]);
         }
         if add {
             let port = port_field(model, hub_id, port_id);
@@ -6235,6 +6430,368 @@ fn edit_las_port_binds(
     change
 }
 
+/// Modbus hub: which Server connection (Modbus panel) the hub listens on.
+fn edit_modbus_hub_server(ui: &mut Ui, model: &mut HubModel, hub_id: u64, host: &HostSnapshot, p: &ThemePalette) -> HubChange {
+    let mut change = HubChange::quiet();
+    ui.label(
+        egui::RichText::new("MODBUS SERVER")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(space::AFTER_HEADING);
+    let servers = model.choices.modbus_servers.clone();
+    let current = model.hub(hub_id).map(|h| h.modbus_server.clone()).unwrap_or_default();
+    let shown = servers
+        .iter()
+        .find(|(id, _)| *id == current)
+        .map(|(_, l)| l.clone())
+        .unwrap_or_else(|| {
+            if current.is_empty() {
+                "(pick server connection)".into()
+            } else {
+                format!("{current} (missing)")
+            }
+        });
+    let mut next = current.clone();
+    egui::ComboBox::from_id_salt(("pb_hub_modbus_server", hub_id))
+        .selected_text(shown)
+        .width(ui.available_width().min(280.0).max(140.0))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut next, String::new(), "(none)");
+            for (id, label) in &servers {
+                ui.selectable_value(&mut next, id.clone(), label);
+            }
+        });
+    if next != current {
+        if let Some(h) = model.hub_mut(hub_id) {
+            h.modbus_server = next;
+        }
+        change.dirty = true;
+    }
+    let cur_server = model.hub(hub_id).map(|h| h.modbus_server.clone()).unwrap_or_default();
+    if !cur_server.is_empty() {
+        let (live, pack_loaded) = crate::modbus_panel::live_from_host(host);
+        let cur = cur_server;
+        let mine = live.iter().find(|l| l.id == cur);
+        crate::modbus_panel::status_line(ui, mine, pack_loaded, crate::modbus_panel::ModbusRole::Server, p);
+    }
+    if servers.is_empty() {
+        ui.label(
+            egui::RichText::new("Add a Server connection in the Modbus panel.")
+                .font(font_ui(11.0))
+                .color(p.muted),
+        );
+    }
+    change
+}
+
+fn conn_combo(
+    ui: &mut Ui,
+    salt: (&str, u64),
+    current: &str,
+    choices: &[(String, String)],
+    empty_hint: &str,
+) -> Option<String> {
+    let shown = choices
+        .iter()
+        .find(|(id, _)| id == current)
+        .map(|(_, l)| l.as_str())
+        .unwrap_or(if current.is_empty() { empty_hint } else { current });
+    let mut next = current.to_string();
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(shown)
+        .width(ui.available_width().min(280.0).max(140.0))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut next, String::new(), "(none)");
+            for (id, label) in choices {
+                ui.selectable_value(&mut next, id.clone(), label);
+            }
+        });
+    (next != current).then_some(next)
+}
+
+/// Modbus Input (poll registers → `modbus_N`) / Output (write host points to registers).
+fn edit_modbus_port_binds(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    hub_id: u64,
+    port_id: u64,
+    incoming: bool,
+    host: &HostSnapshot,
+    p: &ThemePalette,
+) -> HubChange {
+    let mut change = HubChange::quiet();
+    apply_form_spacing(ui);
+    ui.label(
+        egui::RichText::new("MODBUS CLIENT")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(space::AFTER_HEADING);
+    let clients = model.choices.modbus_clients.clone();
+    {
+        let mut cells: Vec<form::Cell<HubPort>> = vec![form::Cell::grow_to("Client", 150.0, 300.0, |ui, w, port: &mut HubPort| {
+            let current = port.modbus_connection.clone();
+            let shown = clients
+                .iter()
+                .find(|(id, _)| *id == current)
+                .map(|(_, l)| l.as_str())
+                .unwrap_or(if current.is_empty() { "(pick client)" } else { current.as_str() });
+            let mut next = current.clone();
+            egui::ComboBox::from_id_salt(("pb_hub_modbus_conn", port_id))
+                .selected_text(shown)
+                .width(w)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut next, String::new(), "(none)");
+                    for (id, label) in &clients {
+                        ui.selectable_value(&mut next, id.clone(), label);
+                    }
+                });
+            let changed = next != current;
+            port.modbus_connection = next;
+            changed
+        })];
+        if incoming {
+            cells.push(form::Cell::fixed("Poll (s)", 64.0, |ui, w, port: &mut HubPort| {
+                form::drag_f32(ui, w, &mut port.modbus_interval_secs, 0.1, 0.05..=3600.0)
+            }));
+        }
+        if form::flow(ui, port_field(model, hub_id, port_id), p, cells) {
+            change.dirty = true;
+        }
+    }
+    {
+        let (live, pack_loaded) = crate::modbus_panel::live_from_host(host);
+        let cur = port_field(model, hub_id, port_id).modbus_connection.clone();
+        if !cur.is_empty() {
+            let mine = live.iter().find(|l| l.id == cur);
+            crate::modbus_panel::status_line(ui, mine, pack_loaded, crate::modbus_panel::ModbusRole::Client, p);
+        }
+    }
+    if clients.is_empty() {
+        ui.label(
+            egui::RichText::new("Add a Client connection in the Modbus panel.")
+                .font(font_ui(11.0))
+                .color(p.muted),
+        );
+    }
+    ui.add_space(space::SECTION - 2.0);
+    ui.label(
+        egui::RichText::new(if incoming {
+            "REGISTERS → modbus_N"
+        } else {
+            "POINTS → REGISTERS"
+        })
+        .font(font_ui(10.5))
+        .color(p.muted),
+    );
+    ui.add_space(space::AFTER_HEADING);
+
+    let mut remove = None;
+    let n = if incoming {
+        port_field(model, hub_id, port_id).modbus_inputs.len()
+    } else {
+        port_field(model, hub_id, port_id).modbus_outputs.len()
+    };
+    for i in 0..n {
+        let port = port_field(model, hub_id, port_id);
+        let bind = if incoming {
+            port.modbus_inputs[i].clone()
+        } else {
+            port.modbus_outputs[i].clone()
+        };
+        let point = if bind.point.trim().is_empty() {
+            if incoming { "modbus_N".to_string() } else { "(point?)".to_string() }
+        } else {
+            bind.point.clone()
+        };
+        let unit = if bind.unit == 0 { String::new() } else { format!("  ·  unit {}", bind.unit) };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = space::ITEM_X;
+            ui.label(
+                egui::RichText::new(format!("{point}  ·  {}{unit}", bind.describe()))
+                    .font(font_ui(12.0))
+                    .color(p.text),
+            );
+            // × pinned to the right edge, live value just left of it.
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                if text_button(ui, "×", false, p).clicked() {
+                    remove = Some(i);
+                }
+                crate::modbus_panel::live_value_label(ui, host, &bind.point, p);
+            });
+        });
+    }
+    if let Some(i) = remove {
+        let port = port_field(model, hub_id, port_id);
+        if incoming {
+            port.modbus_inputs.remove(i);
+        } else {
+            port.modbus_outputs.remove(i);
+        }
+        change.dirty = true;
+    }
+
+    // Shared register editor (same widget as the Modbus panel server map).
+    let mut draft = port_field(model, hub_id, port_id)
+        .draft_modbus
+        .take()
+        .unwrap_or_default();
+    if crate::modbus_panel::bind_editor(ui, ("hub", port_id), &mut draft, !incoming, !incoming, p) {
+        let port = port_field(model, hub_id, port_id);
+        let list = if incoming { &mut port.modbus_inputs } else { &mut port.modbus_outputs };
+        let dup = incoming
+            && list
+                .iter()
+                .any(|b| b.area == draft.area && b.address == draft.address && b.unit == draft.unit);
+        if !dup {
+            let mut b = draft.clone();
+            b.point = b.point.trim().to_string();
+            let next = draft.address.saturating_add(draft.width());
+            list.push(b);
+            draft.address = next;
+            draft.point.clear();
+            change.dirty = true;
+        }
+    }
+    port_field(model, hub_id, port_id).draft_modbus = Some(draft);
+    ui.add_space(space::AFTER_FIELD);
+    ui.label(
+        egui::RichText::new(
+            "Type-preserving copy. Pick the byte / word order the device documents; \
+             no scaling in this build.",
+        )
+        .font(font_ui(11.0))
+        .color(p.muted),
+    );
+    change
+}
+
+/// File-follow Input: source + column / JSON-path binds → `file_N`.
+fn edit_file_port_binds(
+    ui: &mut Ui,
+    model: &mut HubModel,
+    hub_id: u64,
+    port_id: u64,
+    incoming: bool,
+    host: &HostSnapshot,
+    p: &ThemePalette,
+) -> HubChange {
+    let mut change = HubChange::quiet();
+    apply_form_spacing(ui);
+    if !incoming {
+        ui.label(
+            egui::RichText::new("File follow is read-only — use it as an Input.")
+                .font(font_ui(12.0))
+                .color(p.muted),
+        );
+        return change;
+    }
+    ui.label(
+        egui::RichText::new("FILE SOURCE")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(space::AFTER_HEADING);
+    let sources = model.choices.file_sources.clone();
+    let current = port_field(model, hub_id, port_id).file_source.clone();
+    if let Some(next) = conn_combo(ui, ("pb_hub_file_src", port_id), &current, &sources, "(pick source)") {
+        port_field(model, hub_id, port_id).file_source = next;
+        change.dirty = true;
+    }
+    {
+        let cur = port_field(model, hub_id, port_id).file_source.clone();
+        if !cur.is_empty() {
+            let (live, pack_loaded) = crate::files_panel::live_from_host(host);
+            crate::files_panel::status_line(ui, live.iter().find(|l| l.id == cur), pack_loaded, p);
+        }
+    }
+    ui.add_space(space::SECTION - 2.0);
+    ui.label(
+        egui::RichText::new("COLUMNS / PATHS → file_N")
+            .font(font_ui(10.5))
+            .color(p.muted),
+    );
+    ui.add_space(space::AFTER_HEADING);
+    // Column picker: the pack reports the header (or JSON paths) with the latest row's values,
+    // even before any column is bound.
+    {
+        let cur = port_field(model, hub_id, port_id).file_source.clone();
+        let (live, _) = crate::files_panel::live_from_host(host);
+        let cols: Vec<(String, String)> = live.iter().find(|l| l.id == cur).map(|l| l.columns.clone()).unwrap_or_default();
+        if cols.is_empty() {
+            ui.label(
+                egui::RichText::new(if cur.is_empty() {
+                    "Pick a source to see its columns."
+                } else {
+                    "No columns yet — the file must exist on the service machine and have a header or a first row."
+                })
+                .font(font_ui(11.0))
+                .color(p.muted),
+            );
+        } else {
+            let bound: Vec<String> = port_field(model, hub_id, port_id).file_inputs.iter().map(|b| b.column.clone()).collect();
+            if let Some(name) = crate::connection_list::picker_chips(ui, p, &cols, &|n| bound.iter().any(|b| b == n)) {
+                port_field(model, hub_id, port_id).file_inputs.push(FileInputBind { column: name, point: String::new() });
+                change.dirty = true;
+            }
+            ui.add_space(space::AFTER_HEADING);
+        }
+    }
+    let mut remove = None;
+    let n = port_field(model, hub_id, port_id).file_inputs.len();
+    for i in 0..n {
+        let bind = port_field(model, hub_id, port_id).file_inputs[i].clone();
+        let point = if bind.point.is_empty() { "file_N".to_string() } else { bind.point.clone() };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = space::ITEM_X;
+            ui.label(
+                egui::RichText::new(format!("{point}  ·  {}", bind.column))
+                    .font(font_ui(12.0))
+                    .color(p.text),
+            );
+            // × pinned to the right edge, live value just left of it.
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                if text_button(ui, "×", false, p).clicked() {
+                    remove = Some(i);
+                }
+                crate::modbus_panel::live_value_label(ui, host, &bind.point, p);
+            });
+        });
+    }
+    if let Some(i) = remove {
+        port_field(model, hub_id, port_id).file_inputs.remove(i);
+        change.dirty = true;
+    }
+    let mut add = false;
+    {
+        let port = port_field(model, hub_id, port_id);
+        form::flow(ui, port, p, vec![
+            form::Cell::grow("Column", 120.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_file_column)),
+            form::Cell::fixed("", 70.0, |ui, _w, _port: &mut HubPort| {
+                add = text_button(ui, "Add bind", false, p).clicked();
+                false
+            }),
+        ]);
+    }
+    if add {
+        let port = port_field(model, hub_id, port_id);
+        let column = port.draft_file_column.trim().to_string();
+        if !column.is_empty() && !port.file_inputs.iter().any(|b| b.column == column) {
+            port.file_inputs.push(FileInputBind { column, point: String::new() });
+            port.draft_file_column.clear();
+            change.dirty = true;
+        }
+    }
+    ui.add_space(space::AFTER_FIELD);
+    ui.label(
+        egui::RichText::new("CSV: header name (or 0-based index). JSON lines: dotted path, e.g. data.temp.")
+            .font(font_ui(11.0))
+            .color(p.muted),
+    );
+    change
+}
+
 fn edit_snmp_port_binds(
     ui: &mut Ui,
     model: &mut HubModel,
@@ -6242,6 +6799,7 @@ fn edit_snmp_port_binds(
     port_id: u64,
     incoming: bool,
     snmp_connections: &[(String, String)],
+    host: &HostSnapshot,
     p: &ThemePalette,
 ) -> HubChange {
     let mut change = HubChange::quiet();
@@ -6261,47 +6819,44 @@ fn edit_snmp_port_binds(
             .color(p.muted),
     );
     ui.add_space(space::AFTER_HEADING);
-    let current = port_field(model, hub_id, port_id).snmp_target.clone();
-    let current_label = snmp_connections
-        .iter()
-        .find(|(id, _)| id == &current)
-        .map(|(_, label)| label.as_str())
-        .unwrap_or(if current.is_empty() {
-            "(pick target)"
-        } else {
-            current.as_str()
-        });
-    let mut next = current.clone();
-    egui::ComboBox::from_id_salt(("pb_hub_snmp_tgt", port_id))
-        .selected_text(current_label)
-        .width((ui.available_width()).min(280.0).max(140.0))
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut next, String::new(), "(none)");
-            for (id, label) in snmp_connections {
-                ui.selectable_value(&mut next, id.clone(), label);
-            }
-        });
-    if next != current {
-        port_field(model, hub_id, port_id).snmp_target = next;
-        change.dirty = true;
-    }
-
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = space::ITEM_X;
-        ui.label(
-            egui::RichText::new("Poll (s)")
-                .font(font_ui(12.0))
-                .color(p.muted),
-        );
-        let mut interval = port_field(model, hub_id, port_id).snmp_interval_secs;
-        if ui
-            .add(egui::DragValue::new(&mut interval).speed(0.5).range(0.5..=3600.0))
-            .changed()
-        {
-            port_field(model, hub_id, port_id).snmp_interval_secs = interval;
+    {
+        let cells: Vec<form::Cell<HubPort>> = vec![
+            form::Cell::grow_to("Target", 150.0, 300.0, |ui, w, port: &mut HubPort| {
+                let current = port.snmp_target.clone();
+                let shown = snmp_connections
+                    .iter()
+                    .find(|(id, _)| id == &current)
+                    .map(|(_, label)| label.as_str())
+                    .unwrap_or(if current.is_empty() { "(pick target)" } else { current.as_str() });
+                let mut next = current.clone();
+                egui::ComboBox::from_id_salt(("pb_hub_snmp_tgt", port_id))
+                    .selected_text(shown)
+                    .width(w)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut next, String::new(), "(none)");
+                        for (id, label) in snmp_connections {
+                            ui.selectable_value(&mut next, id.clone(), label);
+                        }
+                    });
+                let changed = next != current;
+                port.snmp_target = next;
+                changed
+            }),
+            form::Cell::fixed("Poll (s)", 64.0, |ui, w, port: &mut HubPort| {
+                form::drag_f32(ui, w, &mut port.snmp_interval_secs, 0.5, 0.5..=3600.0)
+            }),
+        ];
+        if form::flow(ui, port_field(model, hub_id, port_id), p, cells) {
             change.dirty = true;
         }
-    });
+    }
+    {
+        let cur = port_field(model, hub_id, port_id).snmp_target.clone();
+        if !cur.is_empty() {
+            let (live, pack_loaded) = crate::snmp_panel::live_from_host(host);
+            crate::snmp_panel::show_status(ui, p, live.iter().find(|l| l.id == cur), pack_loaded);
+        }
+    }
 
     ui.add_space(space::SECTION - 2.0);
     ui.label(
@@ -6326,9 +6881,13 @@ fn edit_snmp_port_binds(
                     .font(font_ui(12.0))
                     .color(p.text),
             );
-            if text_button(ui, "×", false, p).clicked() {
-                remove = Some(i);
-            }
+            // × pinned to the right edge, live value just left of it.
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                if text_button(ui, "×", false, p).clicked() {
+                    remove = Some(i);
+                }
+                crate::modbus_panel::live_value_label(ui, host, &bind.point, p);
+            });
         });
     }
     if let Some(i) = remove {
@@ -6338,10 +6897,13 @@ fn edit_snmp_port_binds(
     let mut add = false;
     {
         let port = port_field(model, hub_id, port_id);
-        inspect_field(ui, "OID", &mut port.draft_snmp_oid, p);
-        if text_button(ui, "Add bind", false, p).clicked() {
-            add = true;
-        }
+        form::flow(ui, port, p, vec![
+            form::Cell::grow("OID", 120.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_snmp_oid)),
+            form::Cell::fixed("", 70.0, |ui, _w, _port: &mut HubPort| {
+                add = text_button(ui, "Add bind", false, p).clicked();
+                false
+            }),
+        ]);
     }
     if add {
         let port = port_field(model, hub_id, port_id);
@@ -6356,44 +6918,6 @@ fn edit_snmp_port_binds(
         }
     }
     change
-}
-
-fn combo_owned(
-    ui: &mut Ui,
-    label: &str,
-    value: &mut String,
-    options: &[(&str, &str)],
-    id: (impl std::hash::Hash, u64),
-    p: &ThemePalette,
-) -> bool {
-    let mut changed = false;
-    let shown = options
-        .iter()
-        .find(|(k, _)| *k == value.as_str())
-        .map(|(_, l)| (*l).to_string())
-        .unwrap_or_else(|| value.clone());
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = space::ITEM_X;
-        ui.label(
-            egui::RichText::new(label)
-                .font(font_ui(12.0))
-                .color(p.muted),
-        );
-        let mut next = value.clone();
-        egui::ComboBox::from_id_salt(id)
-            .selected_text(&shown)
-            .width(160.0)
-            .show_ui(ui, |ui| {
-                for (k, l) in options {
-                    ui.selectable_value(&mut next, (*k).to_string(), *l);
-                }
-            });
-        if next != *value {
-            *value = next;
-            changed = true;
-        }
-    });
-    changed
 }
 
 fn edit_mqtt_port_binds(
@@ -6568,18 +7092,22 @@ fn edit_mqtt_port_binds(
             ui.add_space(2.0);
             {
                 let port = port_field(model, hub_id, port_id);
-                inspect_field(ui, "Topic", &mut port.draft_mqtt_topic, p);
-                inspect_field(ui, "JSON path", &mut port.draft_mqtt_path, p);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    let label = if editing { "Update bind" } else { "Add bind" };
-                    if text_button(ui, label, false, p).clicked() {
-                        save_manual = true;
-                    }
-                    if editing && text_button(ui, "Clear", false, p).clicked() {
-                        clear_edit = true;
-                    }
-                });
+                let label = if editing { "Update bind" } else { "Add bind" };
+                let mut cells: Vec<form::Cell<HubPort>> = vec![
+                    form::Cell::grow("Topic", 120.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_mqtt_topic)),
+                    form::Cell::grow("JSON path", 100.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_mqtt_path)),
+                    form::Cell::fixed("", 84.0, |ui, _w, _port: &mut HubPort| {
+                        save_manual = text_button(ui, label, false, p).clicked();
+                        false
+                    }),
+                ];
+                if editing {
+                    cells.push(form::Cell::fixed("", 50.0, |ui, _w, _port: &mut HubPort| {
+                        clear_edit = text_button(ui, "Clear", false, p).clicked();
+                        false
+                    }));
+                }
+                form::flow(ui, port, p, cells);
             }
         }
 
@@ -6804,11 +7332,14 @@ fn edit_mqtt_port_binds(
                 }
             });
             ui.add_space(2.0);
-            inspect_field(ui, "Point", &mut port.draft_mqtt_out_point, p);
-            inspect_field(ui, "Topic", &mut port.draft_mqtt_out_topic, p);
-            if text_button(ui, "Add bind", true, p).clicked() {
-                add = true;
-            }
+            form::flow(ui, port, p, vec![
+                form::Cell::grow("Point", 90.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_mqtt_out_point)),
+                form::Cell::grow("Topic", 100.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_mqtt_out_topic)),
+                form::Cell::fixed("", 70.0, |ui, _w, _port: &mut HubPort| {
+                    add = text_button(ui, "Add bind", true, p).clicked();
+                    false
+                }),
+            ]);
         }
         if let Some(i) = remove {
             port_field(model, hub_id, port_id).mqtt_outputs.remove(i);
@@ -6840,21 +7371,6 @@ fn edit_mqtt_port_binds(
         }
     }
     change
-}
-
-fn inspect_field(ui: &mut Ui, label: &str, value: &mut String, p: &ThemePalette) {
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [72.0, 20.0],
-            egui::Label::new(
-                egui::RichText::new(label)
-                    .font(font_ui(12.0))
-                    .color(p.muted),
-            ),
-        );
-        ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
-    });
-    ui.add_space(2.0);
 }
 
 /// Single-line edit that keeps keystrokes in a focus buffer and returns the
@@ -6892,7 +7408,7 @@ fn buffered_line_edit(
     None
 }
 
-fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
+fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette, host: &HostSnapshot) -> HubChange {
     let Some(id) = model.selected else {
         ui.label(
             egui::RichText::new("Click a node to see it here.")
@@ -6921,7 +7437,7 @@ fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
     ui.add_space(4.0);
     let current = model.hub(id).unwrap().protocol;
     // Protocol + open panel on one row (MQTT opens the broker/clients panel).
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
         let mut next = current;
         egui::ComboBox::from_id_salt(("pb_hub_protocol", id))
@@ -6946,6 +7462,10 @@ fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette) -> HubChange {
             change.open = Some(current.pane());
         }
     });
+    if model.hub(id).is_some_and(|h| h.protocol == HubProto::Modbus) {
+        ui.add_space(8.0);
+        change = change.join(edit_modbus_hub_server(ui, model, id, host, p));
+    }
     ui.add_space(10.0);
     if port_section(ui, model, id, true, p) {
         change.dirty = true;
@@ -6999,8 +7519,9 @@ fn port_section(
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = PORT_ROW_GAP;
             ui.set_min_height(PORT_ROW_H);
+            let combo_w = proto_combo_width(ui, p);
             let field_w =
-                (ui.available_width() - PORT_PROTO_W - PORT_ROW_H - 2.0 * PORT_ROW_GAP).max(36.0);
+                (ui.available_width() - combo_w - PORT_ROW_H - 2.0 * PORT_ROW_GAP - 2.0).max(36.0);
             let label = &mut port_field(model, hub_id, port_id).label;
             if ui
                 .add_sized(
@@ -7017,10 +7538,10 @@ fn port_section(
             let mut next = current;
             // ComboBox button height follows interact_size.y.
             ui.scope(|ui| {
-                ui.spacing_mut().interact_size = vec2(PORT_PROTO_W, PORT_ROW_H);
+                ui.spacing_mut().interact_size = vec2(combo_w, PORT_ROW_H);
                 egui::ComboBox::from_id_salt(("pb_hub_proto", port_id))
                     .selected_text(current.label())
-                    .width(PORT_PROTO_W)
+                    .width(combo_w)
                     .show_ui(ui, |ui| {
                         for proto in HubProto::ALL {
                             ui.selectable_value(&mut next, proto, proto.label());
@@ -7038,6 +7559,19 @@ fn port_section(
         });
     }
     dirty
+}
+
+/// Width of the protocol dropdown: wide enough for the longest protocol name, so the
+/// selected value never pushes the row (and the × beside it) past the right edge.
+fn proto_combo_width(ui: &Ui, p: &ThemePalette) -> f32 {
+    let text = ui.fonts(|f| {
+        HubProto::ALL
+            .iter()
+            .map(|proto| f.layout_no_wrap(proto.label().to_owned(), font_ui(13.0), p.text).size().x)
+            .fold(0.0_f32, f32::max)
+    });
+    // text + the combo's arrow and inner padding
+    (text + 40.0).max(PORT_PROTO_W)
 }
 
 /// Square remove control matching `PORT_ROW_H`, with × centered in the button.
@@ -7258,6 +7792,7 @@ fn navigation_help_chip(ui: &mut Ui, p: &ThemePalette) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pb_engine::SlotSnapshot;
 
     #[test]
     fn repair_mqtt_orphans_prefer_sole_external_not_hub() {
@@ -7433,6 +7968,7 @@ mod tests {
         // Point from MQTT input bind.
         if let Some(port) = model.hub_mut(hub).and_then(|h| h.sources.iter_mut().find(|p| p.id == src))
         {
+            port.mqtt_inputs.clear(); // drop the sample's pump-command bind
             port.mqtt_inputs.push(MqttInputBind {
                 topic: "plant/t".into(),
                 path: String::new(),
@@ -7558,6 +8094,57 @@ mod tests {
             binds.iter().any(|b| b.point == "mqtt_1" && b.auto),
             "calc point should auto-bind: {binds:?}"
         );
+    }
+
+    #[test]
+    fn arranged_nodes_never_overlap_and_keep_arrow_room() {
+        let mut model = HubModel::sample();
+        let hub_id = model.hubs[0].id;
+        for _ in 0..3 {
+            model.add_port(hub_id, true);
+            model.add_port(hub_id, false);
+        }
+        let ports: Vec<u64> = model.hubs[0]
+            .sources
+            .iter()
+            .chain(model.hubs[0].outputs.iter())
+            .map(|p| p.id)
+            .collect();
+        for (n, port) in ports.iter().enumerate() {
+            model.add_step(hub_id, n % 2 == 0, *port);
+            if n % 3 == 0 {
+                model.add_step(hub_id, false, *port);
+            }
+        }
+        model.add_hub();
+        model.clear_arrangement();
+        let nodes = layout_nodes(&model.hubs);
+        for (i, a) in nodes.iter().enumerate() {
+            for b in nodes.iter().skip(i + 1) {
+                assert!(
+                    !a.rect.expand(1.0).intersects(b.rect),
+                    "{:?} overlaps {:?}",
+                    a.rect,
+                    b.rect
+                );
+            }
+        }
+        // Horizontal arrow room between a port and the hub it feeds.
+        for hub in &model.hubs {
+            let hub_rect = nodes
+                .iter()
+                .find(|n| n.hub_id == hub.id && n.role == Role::Hub)
+                .unwrap()
+                .rect;
+            for n in nodes.iter().filter(|n| n.hub_id == hub.id && n.role != Role::Hub) {
+                let gap = if n.rect.center().x < hub_rect.center().x {
+                    hub_rect.min.x - n.rect.max.x
+                } else {
+                    n.rect.min.x - hub_rect.max.x
+                };
+                assert!(gap >= COL_GAP - 0.5, "gap {gap} to hub too small");
+            }
+        }
     }
 
     #[test]

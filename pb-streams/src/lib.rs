@@ -9,14 +9,10 @@ mod parse;
 use frame::FrameConfig;
 use io::{EndpointConfig, EndpointWorker, WorkerEvent};
 use parse::{join_fields, sample_fields, trailer_bytes};
-use pb_abi::{
-    write_cstr, PbHostApi, PbPackApi, PB_ABI_VERSION, PB_LOG_ERROR, PB_LOG_INFO, PB_QUALITY_GOOD,
-    PB_VALUE_STRING,
-};
+use pb_abi::{value_text, HostRef, Pack, PB_LOG_ERROR, PB_LOG_INFO, PB_QUALITY_GOOD};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::ffi::CStr;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::c_int;
 use std::time::{Duration, Instant};
 
 const PACK_ID: &[u8] = b"streams\0";
@@ -166,7 +162,7 @@ struct EndpointRt {
 }
 
 struct PackState {
-    host: PbHostApi,
+    host: HostRef,
     config: PackConfig,
     endpoints: BTreeMap<String, EndpointRt>,
     /// point name → last value (for emit assembly)
@@ -175,7 +171,7 @@ struct PackState {
 }
 
 impl PackState {
-    fn new(host: PbHostApi) -> Self {
+    fn new(host: HostRef) -> Self {
         Self {
             host,
             config: PackConfig::default(),
@@ -186,35 +182,11 @@ impl PackState {
     }
 
     fn log(&self, level: i32, msg: &str) {
-        if let Some(log) = self.host.log_message {
-            if let Ok(c) = std::ffi::CString::new(msg) {
-                unsafe { log(self.host.ctx, level, c.as_ptr()) };
-            }
-        }
+        self.host.log(level, msg);
     }
 
     fn upsert_string(&self, name: &str, source: &str, value: &str) {
-        let Some(upsert) = self.host.upsert_point else {
-            return;
-        };
-        let Ok(c_name) = std::ffi::CString::new(name) else {
-            return;
-        };
-        let Ok(c_src) = std::ffi::CString::new(source) else {
-            return;
-        };
-        let bytes = value.as_bytes();
-        unsafe {
-            upsert(
-                self.host.ctx,
-                c_name.as_ptr(),
-                PB_VALUE_STRING,
-                bytes.as_ptr() as *const c_void,
-                bytes.len(),
-                PB_QUALITY_GOOD,
-                c_src.as_ptr(),
-            );
-        }
+        self.host.upsert_text(name, source, value, PB_QUALITY_GOOD);
     }
 
     fn configure_json(&mut self, text: &str) -> Result<(), String> {
@@ -338,7 +310,7 @@ impl PackState {
         }
     }
 
-    fn poll(&mut self) {
+    fn poll_endpoints(&mut self) {
         let ids: Vec<String> = self.endpoints.keys().cloned().collect();
         for id in ids {
             let events = {
@@ -402,7 +374,7 @@ impl PackState {
             .cloned()
             .collect();
         for map in maps {
-            let fields = sample_fields(&line, &map.parser, &map.fixed_widths, &map.regex);
+            let fields = sample_fields(line, &map.parser, &map.fixed_widths, &map.regex);
             for bind in &map.binds {
                 let value = if bind.field.is_empty() || map.parser == "whole_line" {
                     line.to_string()
@@ -432,7 +404,7 @@ impl PackState {
         }
     }
 
-    fn write_point(&mut self, name: &str, value: &str) {
+    fn write_text(&mut self, name: &str, value: &str) {
         self.point_values.insert(name.to_string(), value.to_string());
         // Emit any output maps that include this point (on-change).
         let outs: Vec<OutputMap> = self.config.outputs.clone();
@@ -457,11 +429,10 @@ impl PackState {
                 Some(t) => t.elapsed() >= Duration::from_millis(out.interval_ms),
                 None => true,
             };
-            if due {
-                if self.emit_output(&out).is_ok() {
+            if due
+                && self.emit_output(&out).is_ok() {
                     self.last_emit.insert(key, Instant::now());
                 }
-            }
         }
     }
 
@@ -531,191 +502,81 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pb_pack_abi_version() -> u32 {
-    PB_ABI_VERSION
-}
+impl Pack for PackState {
+    const ID: &'static [u8] = PACK_ID;
+    const TITLE: &'static [u8] = PACK_TITLE;
 
-#[no_mangle]
-pub unsafe extern "C" fn pb_pack_register(out: *mut PbPackApi) -> c_int {
-    if out.is_null() {
-        return -1;
+    fn new(host: HostRef) -> Self {
+        PackState::new(host)
     }
-    *out = PbPackApi {
-        abi_version: PB_ABI_VERSION,
-        id: PACK_ID.as_ptr() as *const c_char,
-        title: PACK_TITLE.as_ptr() as *const c_char,
-        create: Some(create),
-        destroy: Some(destroy),
-        configure: Some(configure),
-        connect: Some(connect),
-        disconnect: Some(disconnect),
-        subscribe: None,
-        publish: None,
-        write_point: Some(write_point),
-        poll: Some(poll),
-        state_label: Some(state_label),
-        last_error: Some(last_error),
-        is_connected: Some(is_connected),
-        topics_json: Some(topics_json),
-    };
-    0
-}
 
-unsafe extern "C" fn create(host: *const PbHostApi) -> *mut c_void {
-    if host.is_null() {
-        return std::ptr::null_mut();
+    fn configure(&mut self, json: &str) -> Result<(), String> {
+        self.configure_json(json)
     }
-    let host = *host;
-    if host.abi_version != PB_ABI_VERSION {
-        return std::ptr::null_mut();
-    }
-    Box::into_raw(Box::new(PackState::new(host))) as *mut c_void
-}
 
-unsafe extern "C" fn destroy(handle: *mut c_void) {
-    if handle.is_null() {
-        return;
+    fn config_failed(&mut self, err: String) {
+        self.log(PB_LOG_ERROR, &err);
     }
-    let mut state = Box::from_raw(handle as *mut PackState);
-    state.stop_all();
-}
 
-unsafe extern "C" fn configure(handle: *mut c_void, json: *const c_char, len: usize) -> c_int {
-    if handle.is_null() || json.is_null() {
-        return -1;
-    }
-    let state = &mut *(handle as *mut PackState);
-    let slice = std::slice::from_raw_parts(json as *const u8, len);
-    let text = match std::str::from_utf8(slice) {
-        Ok(t) => t,
-        Err(_) => return -1,
-    };
-    match state.configure_json(text) {
-        Ok(()) => 0,
-        Err(e) => {
-            state.log(PB_LOG_ERROR, &e);
-            -1
+    /// Start every configured endpoint; `-1` when any failed (the error is logged per endpoint).
+    fn connect(&mut self) -> c_int {
+        let ids: Vec<String> = self.endpoints.keys().cloned().collect();
+        let mut ok = true;
+        for id in ids {
+            if let Err(e) = self.start_endpoint(&id) {
+                self.log(PB_LOG_ERROR, &e);
+                ok = false;
+            }
         }
+        if ok { 0 } else { -1 }
     }
-}
 
-unsafe extern "C" fn connect(handle: *mut c_void) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &mut *(handle as *mut PackState);
-    let ids: Vec<String> = state.endpoints.keys().cloned().collect();
-    let mut ok = true;
-    for id in ids {
-        if let Err(e) = state.start_endpoint(&id) {
-            state.log(PB_LOG_ERROR, &e);
-            ok = false;
-        }
-    }
-    if ok {
-        0
-    } else {
-        -1
-    }
-}
-
-unsafe extern "C" fn disconnect(handle: *mut c_void) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &mut *(handle as *mut PackState);
-    state.stop_all();
-    0
-}
-
-unsafe extern "C" fn write_point(
-    handle: *mut c_void,
-    name: *const c_char,
-    _value_kind: i32,
-    value: *const c_void,
-    value_len: usize,
-) -> c_int {
-    if handle.is_null() || name.is_null() {
-        return -1;
-    }
-    let state = &mut *(handle as *mut PackState);
-    let name = match CStr::from_ptr(name).to_str() {
-        Ok(s) => s,
-        Err(_) => return -1,
-    };
-    let bytes = if value.is_null() || value_len == 0 {
-        &[][..]
-    } else {
-        std::slice::from_raw_parts(value as *const u8, value_len)
-    };
-    let text = String::from_utf8_lossy(bytes).into_owned();
-    state.write_point(name, &text);
-    0
-}
-
-unsafe extern "C" fn poll(handle: *mut c_void) {
-    if handle.is_null() {
-        return;
-    }
-    let state = &mut *(handle as *mut PackState);
-    state.poll();
-}
-
-unsafe extern "C" fn state_label(handle: *mut c_void, out: *mut c_char, out_len: usize) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &*(handle as *mut PackState);
-    let n = state.endpoints.values().filter(|e| e.connected).count();
-    let total = state.endpoints.len();
-    let label = if total == 0 {
-        "idle".into()
-    } else {
-        format!("{n}/{total} up")
-    };
-    unsafe { write_cstr(out, out_len, &label) }
-}
-
-unsafe extern "C" fn last_error(handle: *mut c_void, out: *mut c_char, out_len: usize) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &*(handle as *mut PackState);
-    let err = state
-        .endpoints
-        .values()
-        .find(|e| !e.last_error.is_empty())
-        .map(|e| e.last_error.as_str())
-        .unwrap_or("");
-    unsafe { write_cstr(out, out_len, err) }
-}
-
-unsafe extern "C" fn is_connected(handle: *mut c_void) -> c_int {
-    if handle.is_null() {
-        return 0;
-    }
-    let state = &*(handle as *mut PackState);
-    if state.endpoints.values().any(|e| e.connected) {
-        1
-    } else {
+    fn disconnect(&mut self) -> c_int {
+        self.stop_all();
         0
     }
+
+    fn shutdown(&mut self) {
+        self.stop_all();
+    }
+
+    fn write_point(&mut self, name: &str, _kind: i32, bytes: &[u8]) -> c_int {
+        self.write_text(name, &value_text(bytes));
+        0
+    }
+
+    fn poll(&mut self) {
+        self.poll_endpoints();
+    }
+
+    fn state_label(&self) -> String {
+        let total = self.endpoints.len();
+        if total == 0 {
+            return "idle".into();
+        }
+        format!("{}/{total} up", self.endpoints.values().filter(|e| e.connected).count())
+    }
+
+    fn last_error(&self) -> String {
+        self.endpoints.values().find(|e| !e.last_error.is_empty()).map(|e| e.last_error.clone()).unwrap_or_default()
+    }
+
+    fn is_connected(&self) -> bool {
+        self.endpoints.values().any(|e| e.connected)
+    }
+
+    /// Per-endpoint status for the UI (rides the `topics_json` slot of the ABI).
+    fn detail_json(&self) -> String {
+        PackState::detail_json(self)
+    }
 }
 
-/// Reuse topics_json slot for endpoint detail JSON (UI may ignore until wired).
-unsafe extern "C" fn topics_json(handle: *mut c_void, out: *mut c_char, out_len: usize) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &*(handle as *mut PackState);
-    let json = state.detail_json();
-    unsafe { write_cstr(out, out_len, &json) }
-}
+pb_abi::export_pack!(PackState);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pb_abi::PB_ABI_VERSION;
 
     #[test]
     fn register_ok() {

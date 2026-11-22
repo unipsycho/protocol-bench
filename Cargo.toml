@@ -3,12 +3,18 @@ resolver = "2"
 members = [
     "pb-abi",
     "pb-points",
+    "pb-json",
     "pb-engine",
     "pb-ipc",
     "pb-mqtt",
     "pb-opcua",
     "pb-streams",
     "pb-http",
+    "pb-modbus",
+    "pb-tail",
+    "pb-files",
+    "pb-snmp",
+    "pb-las",
     "pb-service",
     "pb-ui",
 ]
@@ -24,12 +30,17 @@ publish = false
 [workspace.dependencies]
 pb-abi = { path = "pb-abi" }
 pb-points = { path = "pb-points" }
+pb-json = { path = "pb-json" }
 pb-engine = { path = "pb-engine" }
 pb-ipc = { path = "pb-ipc" }
 pb-mqtt = { path = "pb-mqtt" }
 pb-opcua = { path = "pb-opcua" }
 pb-streams = { path = "pb-streams" }
 pb-http = { path = "pb-http" }
+pb-modbus = { path = "pb-modbus" }
+pb-tail = { path = "pb-tail" }
+pb-snmp = { path = "pb-snmp" }
+pb-las = { path = "pb-las" }
 serialport = { version = "4", default-features = false }
 regex = "1"
 ureq = { version = "2.12", features = ["json"] }

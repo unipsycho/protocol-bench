@@ -2,6 +2,7 @@
 
 use egui::{Align, Layout, RichText, Vec2};
 use crate::engine_api::EngineHandle;
+use crate::form;
 use pb_engine::{agg_point_name, peek_agg, AggConfig, PointSnapshot};
 use pb_points::{PointValue, Quality};
 
@@ -116,48 +117,39 @@ pub fn paint_node_props(
     );
     ui.add_space(10.0);
 
-    // Mode + window row (matches Calc type/source rhythm).
-    let gap = 12.0;
-    let half = ((ui.available_width() - gap) * 0.5).max(120.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        ui.vertical(|ui| {
-            ui.set_width(half);
-            ui.label(RichText::new("MODE").font(font_ui(10.5)).color(p.muted));
-            ui.add_space(2.0);
+    // Mode + window share a wrapping row (stack when the inspector is narrow).
+    if form::flow(ui, step, p, vec![
+        form::Cell::grow_to("Mode", 100.0, 220.0, |ui, w, step: &mut HubStep| {
             let mut mode = step.agg_mode.clone();
             egui::ComboBox::from_id_salt(("pb_agg_mode", step_id))
                 .selected_text(mode_label(&mode))
-                .width(ui.available_width().max(100.0))
+                .width(w)
                 .show_ui(ui, |ui| {
                     for (id, label) in AGG_MODES {
                         ui.selectable_value(&mut mode, (*id).to_string(), *label);
                     }
                 });
-            if mode != step.agg_mode {
-                step.agg_mode = mode;
-                dirty = true;
-            }
-        });
-        ui.vertical(|ui| {
-            ui.set_width(half);
-            ui.label(RichText::new("WINDOW").font(font_ui(10.5)).color(p.muted));
-            ui.add_space(2.0);
+            let changed = mode != step.agg_mode;
+            step.agg_mode = mode;
+            changed
+        }),
+        form::Cell::grow_to("Window", 100.0, 220.0, |ui, w, step: &mut HubStep| {
             let mut win = step.agg_window.clone();
             egui::ComboBox::from_id_salt(("pb_agg_window", step_id))
                 .selected_text(window_label(&win))
-                .width(ui.available_width().max(100.0))
+                .width(w)
                 .show_ui(ui, |ui| {
                     for (id, label) in AGG_WINDOWS {
                         ui.selectable_value(&mut win, (*id).to_string(), *label);
                     }
                 });
-            if win != step.agg_window {
-                step.agg_window = win;
-                dirty = true;
-            }
-        });
-    });
+            let changed = win != step.agg_window;
+            step.agg_window = win;
+            changed
+        }),
+    ]) {
+        dirty = true;
+    }
 
     ui.add_space(12.0);
     ui.label(RichText::new("MEMBERS").font(font_ui(10.5)).color(p.muted));
