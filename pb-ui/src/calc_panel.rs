@@ -5,6 +5,7 @@
 
 use egui::{Align, Align2, Color32, Id, Layout, RichText, Sense, Vec2};
 use crate::engine_api::EngineHandle;
+use crate::form;
 use pb_engine::{peek_for_point, CalcConfig, PointSnapshot};
 
 use crate::hubs::{HubModel, HubStep};
@@ -796,191 +797,120 @@ fn detail_editor(
     );
     ui.add_space(10.0);
 
-    match kind.id {
-        "scale_offset" => {
-            if field_row(ui, "Scale", &mut step.param_a, p) {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            if field_row(ui, "Offset", &mut step.param_b, p) {
-                dirty = true;
-            }
+    use Fld::{Window, A, B};
+    use Param::{Choice, Text};
+    // Parameters per type; they share wrapping rows (see `form::flow`), so a wide inspector
+    // shows e.g. Scale and Offset side by side.
+    let params: Vec<Param> = match kind.id {
+        "scale_offset" => vec![Text("Scale", A), Text("Offset", B)],
+        "unit_convert" => vec![
+            Choice("From", A, UNIT_CHOICES, "pb_calc_unit_from"),
+            Choice("To", B, UNIT_CHOICES, "pb_calc_unit_to"),
+        ],
+        "clamp" => vec![Text("Min", A), Text("Max", B)],
+        "deadband" => vec![Text("Band ±", A)],
+        "rolling_avg" => vec![
+            Text("Window (s)", Window),
+            Choice("Samples", A, SAMPLE_MODES, "pb_calc_roll_samples"),
+        ],
+        "ema" => vec![Text("Tau (s)", Window), Text("Alpha", A)],
+        "rate_of_change" => vec![
+            Choice("Units", A, ROC_UNITS, "pb_calc_roc_units"),
+            Choice("Sign", B, ROC_SIGN, "pb_calc_roc_sign"),
+        ],
+        "min_max_hold" => vec![
+            Choice("Mode", A, HOLD_MODES, "pb_calc_hold_mode"),
+            Text("Hold (s)", Window),
+        ],
+        "hysteresis" => vec![Text("On ≥", A), Text("Off ≤", B)],
+        "boolean_compare" => vec![
+            Choice("Operator", A, COMPARE_OPS, "pb_calc_cmp_op"),
+            Text("Setpoint", B),
+        ],
+        "time_window" => vec![
+            Text("Window (s)", Window),
+            Choice("Mode", A, TIME_WINDOW_MODES, "pb_calc_tw_mode"),
+        ],
+        "formula" => Vec::new(),
+        _ => vec![Text("Param A", A), Text("Param B", B)],
+    };
+    if kind.id == "formula" {
+        ui.label(RichText::new("FORMULA").font(font_ui(10.5)).color(p.muted));
+        ui.add_space(4.0);
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut step.formula)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(3),
+            )
+            .changed()
+        {
+            dirty = true;
         }
-        "unit_convert" => {
-            if enum_row(
-                ui,
-                "From",
-                &mut step.param_a,
-                UNIT_CHOICES,
-                ("pb_calc_unit_from", step_id),
-                p,
-            ) {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            if enum_row(
-                ui,
-                "To",
-                &mut step.param_b,
-                UNIT_CHOICES,
-                ("pb_calc_unit_to", step_id),
-                p,
-            ) {
-                dirty = true;
-            }
-        }
-        "clamp" => {
-            if field_row(ui, "Min", &mut step.param_a, p) {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            if field_row(ui, "Max", &mut step.param_b, p) {
-                dirty = true;
-            }
-        }
-        "deadband" => {
-            if field_row(ui, "Band ±", &mut step.param_a, p) {
-                dirty = true;
-            }
-        }
-        "rolling_avg" => {
-            if field_row(ui, "Window (s)", &mut step.window_secs, p) {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            if enum_row(
-                ui,
-                "Samples",
-                &mut step.param_a,
-                SAMPLE_MODES,
-                ("pb_calc_roll_samples", step_id),
-                p,
-            ) {
-                dirty = true;
-            }
-        }
-        "ema" => {
-            if field_row(ui, "Tau (s)", &mut step.window_secs, p) {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            if field_row(ui, "Alpha", &mut step.param_a, p) {
-                dirty = true;
-            }
-        }
-        "rate_of_change" => {
-            if enum_row(
-                ui,
-                "Units",
-                &mut step.param_a,
-                ROC_UNITS,
-                ("pb_calc_roc_units", step_id),
-                p,
-            ) {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            if enum_row(
-                ui,
-                "Sign",
-                &mut step.param_b,
-                ROC_SIGN,
-                ("pb_calc_roc_sign", step_id),
-                p,
-            ) {
-                dirty = true;
-            }
-        }
-        "min_max_hold" => {
-            if enum_row(
-                ui,
-                "Mode",
-                &mut step.param_a,
-                HOLD_MODES,
-                ("pb_calc_hold_mode", step_id),
-                p,
-            ) {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            if field_row(ui, "Hold (s)", &mut step.window_secs, p) {
-                dirty = true;
-            }
-        }
-        "hysteresis" => {
-            if field_row(ui, "On ≥", &mut step.param_a, p) {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            if field_row(ui, "Off ≤", &mut step.param_b, p) {
-                dirty = true;
-            }
-        }
-        "boolean_compare" => {
-            if enum_row(
-                ui,
-                "Operator",
-                &mut step.param_a,
-                COMPARE_OPS,
-                ("pb_calc_cmp_op", step_id),
-                p,
-            ) {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            if field_row(ui, "Setpoint", &mut step.param_b, p) {
-                dirty = true;
-            }
-        }
-        "formula" => {
-            ui.label(RichText::new("FORMULA").font(font_ui(10.5)).color(p.muted));
-            ui.add_space(4.0);
-            if ui
-                .add(
-                    egui::TextEdit::multiline(&mut step.formula)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(3),
-                )
-                .changed()
-            {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(
-                    "Use point ids or x for the edge value. Functions: min, max, abs, clamp, sqrt.",
-                )
-                .font(font_ui(11.0))
-                .color(p.muted),
-            );
-        }
-        "time_window" => {
-            if field_row(ui, "Window (s)", &mut step.window_secs, p) {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            if enum_row(
-                ui,
-                "Mode",
-                &mut step.param_a,
-                TIME_WINDOW_MODES,
-                ("pb_calc_tw_mode", step_id),
-                p,
-            ) {
-                dirty = true;
-            }
-        }
-        _ => {
-            if field_row(ui, "Param A", &mut step.param_a, p) {
-                dirty = true;
-            }
-            ui.add_space(4.0);
-            if field_row(ui, "Param B", &mut step.param_b, p) {
-                dirty = true;
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Use point ids or x for the edge value. Functions: min, max, abs, clamp, sqrt.",
+            )
+            .font(font_ui(11.0))
+            .color(p.muted),
+        );
+    }
+    // Unknown stored choices fall back to the first option.
+    for param in &params {
+        if let Param::Choice(_, fld, choices, _) = param {
+            let value = fld.of(step);
+            if !choices.iter().any(|(id, _)| *id == value.as_str()) {
+                if let Some((id, _)) = choices.first() {
+                    *value = (*id).into();
+                    dirty = true;
+                }
             }
         }
     }
+    let cells: Vec<form::Cell<HubStep>> = params
+        .into_iter()
+        .map(|param| match param {
+            Param::Text(label, fld) => form::Cell::grow(label, 70.0, move |ui, w, step: &mut HubStep| {
+                form::text(ui, w, fld.of(step))
+            }),
+            Param::Choice(label, fld, choices, salt) => {
+                form::Cell::grow_to(label, 90.0, 190.0, move |ui, w, step: &mut HubStep| {
+                    form::combo(ui, (salt, step_id), w, fld.of(step), choices)
+                })
+            }
+        })
+        .collect();
+    if form::flow(ui, step, p, cells) {
+        dirty = true;
+    }
     dirty
+}
+
+/// Which string field of a [`HubStep`] a parameter edits.
+#[derive(Clone, Copy)]
+enum Fld {
+    A,
+    B,
+    Window,
+}
+
+impl Fld {
+    fn of(self, step: &mut HubStep) -> &mut String {
+        match self {
+            Fld::A => &mut step.param_a,
+            Fld::B => &mut step.param_b,
+            Fld::Window => &mut step.window_secs,
+        }
+    }
+}
+
+type Choices = &'static [(&'static str, &'static str)];
+
+/// One calculation parameter: a text field or a choice list.
+enum Param {
+    Text(&'static str, Fld),
+    Choice(&'static str, Fld, Choices, &'static str),
 }
 
 const COMPARE_OPS: &[(&str, &str)] = &[
@@ -1026,62 +956,3 @@ const SAMPLE_MODES: &[(&str, &str)] = &[
     ("50", "50"),
 ];
 
-fn field_row(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [88.0, 20.0],
-            egui::Label::new(RichText::new(label).font(font_ui(12.0)).color(p.muted)),
-        );
-        if ui
-            .add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY))
-            .changed()
-        {
-            changed = true;
-        }
-    });
-    changed
-}
-
-fn enum_row(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: &mut String,
-    choices: &[(&str, &str)],
-    salt: impl std::hash::Hash,
-    p: &ThemePalette,
-) -> bool {
-    let mut changed = false;
-    // Normalize unknown stored values to the first choice.
-    if !choices.iter().any(|(id, _)| *id == value.as_str()) {
-        if let Some((id, _)) = choices.first() {
-            *value = (*id).into();
-            changed = true;
-        }
-    }
-    let shown = choices
-        .iter()
-        .find(|(id, _)| *id == value.as_str())
-        .map(|(_, label)| (*label).to_string())
-        .unwrap_or_else(|| value.clone());
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [88.0, 20.0],
-            egui::Label::new(RichText::new(label).font(font_ui(12.0)).color(p.muted)),
-        );
-        let mut pick = value.clone();
-        egui::ComboBox::from_id_salt(salt)
-            .selected_text(shown)
-            .width(ui.available_width().max(80.0))
-            .show_ui(ui, |ui| {
-                for (id, name) in choices {
-                    ui.selectable_value(&mut pick, (*id).to_string(), *name);
-                }
-            });
-        if pick != *value {
-            *value = pick;
-            changed = true;
-        }
-    });
-    changed
-}

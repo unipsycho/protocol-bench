@@ -13,6 +13,7 @@ name = "pb_mqtt"
 
 [dependencies]
 pb-abi = { workspace = true }
+pb-json = { workspace = true }
 rumqttc = { workspace = true }
 rumqttd = { workspace = true }
 tokio = { workspace = true }

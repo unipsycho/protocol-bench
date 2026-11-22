@@ -220,3 +220,97 @@ pub fn confirm_delete(
     }
     confirmed
 }
+
+/// Traffic-light for a status line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dot {
+    Ok,
+    Warn,
+    Err,
+    Idle,
+}
+
+/// Coloured dot + state text, and the last error underneath.
+pub fn status_line(ui: &mut egui::Ui, p: &ThemePalette, dot: Dot, text: &str, error: &str) {
+    let color = match dot {
+        Dot::Ok => p.live,
+        Dot::Warn => p.warn,
+        Dot::Err => p.err,
+        Dot::Idle => p.muted,
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
+        ui.label(egui::RichText::new("●").font(font_ui(12.0)).color(color));
+        ui.label(egui::RichText::new(text).font(font_ui(12.0)).color(p.text));
+    });
+    if !error.is_empty() {
+        ui.label(egui::RichText::new(error).font(font_ui(11.5)).color(p.warn));
+    }
+}
+
+/// Clickable `(name, sample)` chips for column / curve pickers. Names for which `taken` is true
+/// are shown but disabled. Returns the name that was clicked.
+pub fn picker_chips(ui: &mut egui::Ui, p: &ThemePalette, items: &[(String, String)], taken: &dyn Fn(&str) -> bool) -> Option<String> {
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+        for (name, sample) in items {
+            let used = taken(name);
+            let label = if sample.is_empty() { name.clone() } else { format!("{name}  {}", sample.chars().take(14).collect::<String>()) };
+            let resp = ui.add_enabled(
+                !used,
+                egui::Button::new(egui::RichText::new(label).font(font_ui(11.5)).color(if used { p.muted } else { p.text }))
+                    .fill(p.control)
+                    .stroke(egui::Stroke::new(1.0, p.line)),
+            );
+            let tip = if sample.is_empty() { name.to_string() } else { format!("{name} = {sample}") };
+            let resp = resp.on_hover_text(if used { format!("{tip}  (already bound)") } else { format!("{tip}  — click to bind") });
+            if resp.clicked() {
+                clicked = Some(name.clone());
+            }
+        }
+    });
+    clicked
+}
+
+/// A free id for a new connection: `base`, else `base-2`, `base-3`, … — the first one `taken` rejects.
+/// Every connection panel (HTTP, Streams, Modbus, SNMP, LAS, Files, …) numbers new rows this way.
+pub fn unique_id(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    let mut id = base.to_string();
+    let mut n = 2;
+    while taken(&id) {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    id
+}
+
+/// Small form button; `selected` paints it in the accent colour (toggle look).
+pub fn text_btn(ui: &mut egui::Ui, label: &str, selected: bool, p: &ThemePalette) -> egui::Response {
+    let fill = if selected { p.accent } else { p.control };
+    let text = if selected { Color32::from_rgb(0x12, 0x14, 0x18) } else { p.text };
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).font(font_ui(12.0)).color(text))
+            .fill(fill)
+            .stroke(Stroke::new(1.0, p.line)),
+    )
+}
+
+/// `label  [single-line edit]` form row; returns true when the text changed. `label_w` is the
+/// label column width so a panel's rows line up.
+pub fn labeled_field(ui: &mut egui::Ui, label_w: f32, label: &str, value: &mut String, p: &ThemePalette) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
+        ui.add_sized([label_w, 20.0], egui::Label::new(egui::RichText::new(label).font(font_ui(12.0)).color(p.muted)));
+        let w = (ui.available_width() - 8.0).clamp(140.0, 420.0);
+        if ui
+            .add(egui::TextEdit::singleline(value).desired_width(w).margin(egui::Margin::symmetric(6.0, 3.0)))
+            .changed()
+        {
+            changed = true;
+        }
+    });
+    ui.add_space(2.0);
+    changed
+}

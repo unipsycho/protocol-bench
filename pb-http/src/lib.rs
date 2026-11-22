@@ -2,15 +2,10 @@
 //!
 //! Outbound clients: poll JSON paths → points; Output binds assemble JSON body push.
 
-use pb_abi::{
-    write_cstr, PbHostApi, PbPackApi, PB_ABI_VERSION, PB_LOG_ERROR, PB_LOG_INFO, PB_QUALITY_GOOD,
-    PB_VALUE_STRING,
-};
+use pb_abi::{value_text, HostRef, Pack, PB_LOG_ERROR, PB_LOG_INFO, PB_QUALITY_GOOD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::ffi::CStr;
-use std::os::raw::{c_char, c_int, c_void};
 use std::time::{Duration, Instant};
 
 const PACK_ID: &[u8] = b"http\0";
@@ -105,7 +100,7 @@ fn default_post() -> String {
 }
 
 struct PackState {
-    host: PbHostApi,
+    host: HostRef,
     config: PackConfig,
     last_poll: BTreeMap<String, Instant>,
     last_error: String,
@@ -116,7 +111,7 @@ struct PackState {
 }
 
 impl PackState {
-    fn new(host: PbHostApi) -> Self {
+    fn new(host: HostRef) -> Self {
         Self {
             host,
             config: PackConfig::default(),
@@ -130,35 +125,11 @@ impl PackState {
     }
 
     fn log(&self, level: i32, msg: &str) {
-        if let Some(log) = self.host.log_message {
-            if let Ok(c) = std::ffi::CString::new(msg) {
-                unsafe { log(self.host.ctx, level, c.as_ptr()) };
-            }
-        }
+        self.host.log(level, msg);
     }
 
     fn upsert_string(&self, name: &str, source: &str, value: &str) {
-        let Some(upsert) = self.host.upsert_point else {
-            return;
-        };
-        let Ok(c_name) = std::ffi::CString::new(name) else {
-            return;
-        };
-        let Ok(c_src) = std::ffi::CString::new(source) else {
-            return;
-        };
-        let bytes = value.as_bytes();
-        unsafe {
-            upsert(
-                self.host.ctx,
-                c_name.as_ptr(),
-                PB_VALUE_STRING,
-                bytes.as_ptr() as *const c_void,
-                bytes.len(),
-                PB_QUALITY_GOOD,
-                c_src.as_ptr(),
-            );
-        }
+        self.host.upsert_text(name, source, value, PB_QUALITY_GOOD);
     }
 
     fn configure_json(&mut self, text: &str) -> Result<(), String> {
@@ -187,7 +158,7 @@ impl PackState {
         self.config.clients.iter().find(|c| c.id == id)
     }
 
-    fn poll(&mut self) {
+    fn poll_inputs(&mut self) {
         let inputs = self.config.inputs.clone();
         for inp in inputs {
             let key = format!("{}:{}:{}", inp.client, inp.method, inp.path);
@@ -246,7 +217,7 @@ impl PackState {
         Ok(())
     }
 
-    fn write_point(&mut self, name: &str, value: &str) {
+    fn write_text(&mut self, name: &str, value: &str) {
         self.point_values.insert(name.to_string(), value.to_string());
         let outs = self.config.outputs.clone();
         for out in outs {
@@ -366,37 +337,9 @@ fn join_url(base: &str, path: &str) -> String {
     }
 }
 
+/// Value at `path` (see `pb_json` for the syntax); a missing path is `null`.
 fn extract_json_path(value: &Value, path: &str) -> Value {
-    let path = path.trim().trim_start_matches('.');
-    if path.is_empty() {
-        return value.clone();
-    }
-    let mut cur = value;
-    for part in path.split('.') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        match cur {
-            Value::Object(map) => {
-                cur = match map.get(part) {
-                    Some(v) => v,
-                    None => return Value::Null,
-                };
-            }
-            Value::Array(arr) => {
-                let Ok(idx) = part.parse::<usize>() else {
-                    return Value::Null;
-                };
-                cur = match arr.get(idx) {
-                    Some(v) => v,
-                    None => return Value::Null,
-                };
-            }
-            _ => return Value::Null,
-        }
-    }
-    cur.clone()
+    pb_json::get_path(value, path).cloned().unwrap_or(Value::Null)
 }
 
 fn value_to_string(v: &Value) -> String {
@@ -453,161 +396,53 @@ fn set_json_path(root: &mut serde_json::Map<String, Value>, path: &str, value: V
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pb_pack_abi_version() -> u32 {
-    PB_ABI_VERSION
-}
+impl Pack for PackState {
+    const ID: &'static [u8] = PACK_ID;
+    const TITLE: &'static [u8] = PACK_TITLE;
 
-#[no_mangle]
-pub unsafe extern "C" fn pb_pack_register(out: *mut PbPackApi) -> c_int {
-    if out.is_null() {
-        return -1;
+    fn new(host: HostRef) -> Self {
+        PackState::new(host)
     }
-    *out = PbPackApi {
-        abi_version: PB_ABI_VERSION,
-        id: PACK_ID.as_ptr() as *const c_char,
-        title: PACK_TITLE.as_ptr() as *const c_char,
-        create: Some(create),
-        destroy: Some(destroy),
-        configure: Some(configure),
-        connect: Some(connect),
-        disconnect: Some(disconnect),
-        subscribe: None,
-        publish: None,
-        write_point: Some(write_point),
-        poll: Some(poll),
-        state_label: Some(state_label),
-        last_error: Some(last_error),
-        is_connected: Some(is_connected),
-        topics_json: Some(topics_json),
-    };
-    0
-}
 
-unsafe extern "C" fn create(host: *const PbHostApi) -> *mut c_void {
-    if host.is_null() {
-        return std::ptr::null_mut();
+    fn configure(&mut self, json: &str) -> Result<(), String> {
+        self.configure_json(json)
     }
-    let host = *host;
-    if host.abi_version != PB_ABI_VERSION {
-        return std::ptr::null_mut();
-    }
-    Box::into_raw(Box::new(PackState::new(host))) as *mut c_void
-}
 
-unsafe extern "C" fn destroy(handle: *mut c_void) {
-    if handle.is_null() {
-        return;
+    fn config_failed(&mut self, err: String) {
+        self.log(PB_LOG_ERROR, &err);
     }
-    drop(Box::from_raw(handle as *mut PackState));
-}
 
-unsafe extern "C" fn configure(handle: *mut c_void, json: *const c_char, len: usize) -> c_int {
-    if handle.is_null() || json.is_null() {
-        return -1;
+    fn set_enabled(&mut self, on: bool) {
+        self.state = if on { "ready" } else { "idle" }.into();
     }
-    let state = &mut *(handle as *mut PackState);
-    let slice = std::slice::from_raw_parts(json as *const u8, len);
-    let text = match std::str::from_utf8(slice) {
-        Ok(t) => t,
-        Err(_) => return -1,
-    };
-    match state.configure_json(text) {
-        Ok(()) => 0,
-        Err(e) => {
-            state.log(PB_LOG_ERROR, &e);
-            -1
-        }
-    }
-}
 
-unsafe extern "C" fn connect(handle: *mut c_void) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &mut *(handle as *mut PackState);
-    state.state = "ready".into();
-    0
-}
-
-unsafe extern "C" fn disconnect(handle: *mut c_void) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &mut *(handle as *mut PackState);
-    state.state = "idle".into();
-    0
-}
-
-unsafe extern "C" fn write_point(
-    handle: *mut c_void,
-    name: *const c_char,
-    _value_kind: i32,
-    value: *const c_void,
-    value_len: usize,
-) -> c_int {
-    if handle.is_null() || name.is_null() {
-        return -1;
-    }
-    let state = &mut *(handle as *mut PackState);
-    let name = match CStr::from_ptr(name).to_str() {
-        Ok(s) => s,
-        Err(_) => return -1,
-    };
-    let bytes = if value.is_null() || value_len == 0 {
-        &[][..]
-    } else {
-        std::slice::from_raw_parts(value as *const u8, value_len)
-    };
-    let text = String::from_utf8_lossy(bytes).into_owned();
-    state.write_point(name, &text);
-    0
-}
-
-unsafe extern "C" fn poll(handle: *mut c_void) {
-    if handle.is_null() {
-        return;
-    }
-    let state = &mut *(handle as *mut PackState);
-    state.poll();
-}
-
-unsafe extern "C" fn state_label(handle: *mut c_void, out: *mut c_char, out_len: usize) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &*(handle as *mut PackState);
-    unsafe { write_cstr(out, out_len, &state.state) }
-}
-
-unsafe extern "C" fn last_error(handle: *mut c_void, out: *mut c_char, out_len: usize) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &*(handle as *mut PackState);
-    unsafe { write_cstr(out, out_len, &state.last_error) }
-}
-
-unsafe extern "C" fn is_connected(handle: *mut c_void) -> c_int {
-    if handle.is_null() {
-        return 0;
-    }
-    let state = &*(handle as *mut PackState);
-    if state.config.clients.is_empty() {
+    fn write_point(&mut self, name: &str, _kind: i32, bytes: &[u8]) -> std::os::raw::c_int {
+        self.write_text(name, &value_text(bytes));
         0
-    } else {
-        1
+    }
+
+    fn poll(&mut self) {
+        self.poll_inputs();
+    }
+
+    fn state_label(&self) -> String {
+        self.state.clone()
+    }
+
+    fn last_error(&self) -> String {
+        self.last_error.clone()
+    }
+
+    fn is_connected(&self) -> bool {
+        !self.config.clients.is_empty()
+    }
+
+    fn detail_json(&self) -> String {
+        PackState::detail_json(self)
     }
 }
 
-unsafe extern "C" fn topics_json(handle: *mut c_void, out: *mut c_char, out_len: usize) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &*(handle as *mut PackState);
-    let json = state.detail_json();
-    unsafe { write_cstr(out, out_len, &json) }
-}
+pb_abi::export_pack!(PackState);
 
 #[cfg(test)]
 mod tests {

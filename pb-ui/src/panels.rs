@@ -12,8 +12,11 @@ use crate::http_panel::{self, HttpPanelState};
 use crate::las_panel::{self, LasPanelState};
 use crate::mqtt_panel::{self, MqttPanelState};
 use crate::opcua_panel::{self, OpcUaPanelState};
-use crate::point_rows::{self, PointsTableRow, PointsTableState};
+use crate::point_rows::{self, PointsTableState};
 use crate::project::ProjectSettings;
+use crate::mappings_panel;
+use crate::files_panel::{self, FilesPanelState};
+use crate::modbus_panel::{self, ModbusPanelState, ModbusRole};
 use crate::snmp_panel::{self, SnmpPanelState};
 use crate::streams_panel::{self, StreamsPanelState};
 use crate::theme::{
@@ -24,18 +27,10 @@ use crate::traffic_panel::{self, TrafficPanelState};
 
 /// Points panel filter + sort (session UI state).
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct PointsPanelState {
     pub filter: String,
     pub table: PointsTableState,
-}
-
-impl Default for PointsPanelState {
-    fn default() -> Self {
-        Self {
-            filter: String::new(),
-            table: PointsTableState::default(),
-        }
-    }
 }
 
 /// Fill the pane body for one dock leaf.
@@ -52,6 +47,8 @@ pub fn paint(
     streams: &mut StreamsPanelState,
     las: &mut LasPanelState,
     snmp: &mut SnmpPanelState,
+    modbus: &mut ModbusPanelState,
+    files: &mut FilesPanelState,
     points: &mut PointsPanelState,
     traffic: &mut TrafficPanelState,
     settings: &mut ProjectSettings,
@@ -64,6 +61,9 @@ pub fn paint(
             mqtt.sync_trees_from_host(host);
             opcua.sync_from_host(host);
             let conns = mqtt.connection_choices();
+            hubs.choices.modbus_clients = modbus.choices(ModbusRole::Client);
+            hubs.choices.modbus_servers = modbus.choices(ModbusRole::Server);
+            hubs.choices.file_sources = files.choices();
             crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, http, streams, las, snmp, host, engine)
         }
         DockPane::Mqtt => {
@@ -88,14 +88,26 @@ pub fn paint(
             change.dirty = dirty;
             change
         }
+        DockPane::Modbus => {
+            let dirty = modbus_panel::paint(ui, p, modbus, host);
+            let mut change = crate::hubs::HubChange::quiet();
+            change.dirty = dirty;
+            change
+        }
+        DockPane::Files => {
+            let dirty = files_panel::paint(ui, p, files, host);
+            let mut change = crate::hubs::HubChange::quiet();
+            change.dirty = dirty;
+            change
+        }
         DockPane::Las => {
-            let dirty = las_panel::paint(ui, p, las);
+            let dirty = las_panel::paint(ui, p, las, host);
             let mut change = crate::hubs::HubChange::quiet();
             change.dirty = dirty;
             change
         }
         DockPane::Snmp => {
-            let dirty = snmp_panel::paint(ui, p, snmp);
+            let dirty = snmp_panel::paint(ui, p, snmp, host);
             let mut change = crate::hubs::HubChange::quiet();
             change.dirty = dirty;
             change
@@ -108,12 +120,12 @@ pub fn paint(
             traffic_panel::paint(ui, host, mqtt, opcua, traffic, p);
             crate::hubs::HubChange::quiet()
         }
-        DockPane::Calculations => {
-            // Legacy leaf — sanitized out of the tree; keep match exhaustive.
-            scaffold_panel(ui, pane, host, p);
+        DockPane::Mappings => {
+            mappings_panel::paint(ui, host, hubs, p);
             crate::hubs::HubChange::quiet()
         }
-        _ => {
+        DockPane::Calculations => {
+            // Legacy leaf — sanitized out of the tree; keep match exhaustive.
             scaffold_panel(ui, pane, host, p);
             crate::hubs::HubChange::quiet()
         }

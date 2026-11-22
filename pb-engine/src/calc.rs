@@ -2,7 +2,6 @@
 //! UI preview peeks the same runtime so stateful kinds match publish.
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One calculation step synced from the hub diagram.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -55,13 +54,6 @@ pub fn deadband_step(held: Option<f64>, x: f64, band: f64) -> (f64, f64) {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 fn parse_f64(s: &str) -> Option<f64> {
     let t = s.trim();
     if t.is_empty() {
@@ -74,7 +66,8 @@ fn parse_f64(s: &str) -> Option<f64> {
     }
 }
 
-fn fmt_num(v: f64) -> String {
+/// Number → point text: integers without a fraction, otherwise up to 10 decimals, `nan` if not finite.
+pub(crate) fn fmt_num(v: f64) -> String {
     if !v.is_finite() {
         return "nan".into();
     }
@@ -262,7 +255,7 @@ pub fn apply_for_egress(
     point_name: &str,
     raw: &str,
 ) -> String {
-    apply_at(configs, rt, point_name, raw, now_ms())
+    apply_at(configs, rt, point_name, raw, pb_points::now_ms())
 }
 
 /// Same as [`apply_for_egress`] with an explicit sample timestamp (tests + host).
@@ -288,7 +281,7 @@ pub fn peek_for_point(
     raw: &str,
 ) -> String {
     let mut out = raw.to_string();
-    let t = now_ms();
+    let t = pb_points::now_ms();
     for cfg in configs.iter().filter(|c| c.source_point == point_name) {
         out = peek_one(cfg, rt, &out, t);
     }

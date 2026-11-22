@@ -1,0 +1,17 @@
+[package]
+name = "pb-snmp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "SNMP protocol pack — v1 / v2c GET poll of agent OIDs for Protocol Bench"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "pb_snmp"
+
+[dependencies]
+pb-abi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

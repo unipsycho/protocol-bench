@@ -7,9 +7,12 @@ pub fn write_json<W: Write, T: serde::Serialize>(w: &mut W, value: &T) -> Result
     if body.len() > u32::MAX as usize {
         return Err("IPC frame too large".into());
     }
-    let len = (body.len() as u32).to_le_bytes();
-    w.write_all(&len).map_err(|e| e.to_string())?;
-    w.write_all(&body).map_err(|e| e.to_string())?;
+    // One write per frame: a separate 4-byte header write lets Nagle hold the body back
+    // until the peer's delayed ACK, which costs ~40 ms per request on localhost.
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&body);
+    w.write_all(&frame).map_err(|e| e.to_string())?;
     w.flush().map_err(|e| e.to_string())
 }
 

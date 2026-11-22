@@ -581,7 +581,7 @@ fn paint_body(
     );
     ui.add_space(space::AFTER_BLURB);
 
-    clients_list(ui, state, engine, hubs, p);
+    clients_list(ui, state, p);
     if let Some(i) = connection_list::confirm_delete(ui.ctx(), &mut state.pending_delete, p) {
         dirty |= remove_mqtt_client(state, engine, hubs, i);
     }
@@ -656,13 +656,7 @@ fn paint_body(
     dirty
 }
 
-fn clients_list(
-    ui: &mut egui::Ui,
-    state: &mut MqttPanelState,
-    engine: &EngineHandle,
-    hubs: &mut HubModel,
-    p: &ThemePalette,
-) {
+fn clients_list(ui: &mut egui::Ui, state: &mut MqttPanelState, p: &ThemePalette) {
     let mut select = None;
     let show_delete = state.clients.len() > 1;
     for (i, client) in state.clients.iter().enumerate() {
@@ -1215,19 +1209,6 @@ fn text_btn(ui: &mut egui::Ui, label: &str, accent: bool, p: &ThemePalette) -> e
             .fill(fill)
             .stroke(Stroke::new(1.0, p.line))
             .min_size(Vec2::new(72.0, 26.0)),
-    )
-}
-
-fn secondary_btn(ui: &mut egui::Ui, label: &str, p: &ThemePalette) -> egui::Response {
-    ui.add(
-        egui::Button::new(
-            egui::RichText::new(label)
-                .font(font_ui(12.5))
-                .color(Color32::from_rgb(0x12, 0x14, 0x18)),
-        )
-        .fill(p.live)
-        .stroke(Stroke::new(1.0, p.line))
-        .min_size(Vec2::new(72.0, 26.0)),
     )
 }
 

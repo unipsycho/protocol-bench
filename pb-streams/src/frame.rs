@@ -20,6 +20,7 @@ impl Default for FrameConfig {
 }
 
 impl FrameConfig {
+    /// Terminator bytes for the configured end-of-line mode.
     pub fn eol_bytes(&self) -> Vec<u8> {
         match self.eol.as_str() {
             "crlf" => b"\r\n".to_vec(),
@@ -34,11 +35,13 @@ impl FrameConfig {
         }
     }
 
+    /// True when frames are also split on a silent gap.
     pub fn use_idle(&self) -> bool {
         matches!(self.eol.as_str(), "idle" | "eol_idle")
             || (self.mode != "transparent" && self.idle_ms > 0 && self.eol == "idle")
     }
 
+    /// The idle gap, when idle splitting is on.
     pub fn idle_timeout(&self) -> Option<std::time::Duration> {
         if self.mode == "transparent" {
             return None;
@@ -60,6 +63,7 @@ pub struct Framer {
 }
 
 impl Framer {
+    /// Framer for `cfg`.
     pub fn new(cfg: FrameConfig) -> Self {
         Self {
             cfg,
@@ -68,6 +72,7 @@ impl Framer {
         }
     }
 
+    /// Feed received bytes; returns the complete frames now available (partial data is kept).
     pub fn push(&mut self, data: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         if data.is_empty() {

@@ -46,6 +46,8 @@ pub fn serve(runtime: Arc<Mutex<Runtime>>, bind_port: u16) -> Result<(), String>
 }
 
 fn handle_client(stream: TcpStream, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
+    // Replies are small and latency-bound: don't let Nagle delay them.
+    stream.set_nodelay(true).ok();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(120)))
         .ok();

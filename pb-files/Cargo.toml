@@ -1,0 +1,19 @@
+[package]
+name = "pb-files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "File follow protocol pack — growing CSV / JSON-lines files to points"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "pb_files"
+
+[dependencies]
+pb-abi = { workspace = true }
+pb-json = { workspace = true }
+pb-tail = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

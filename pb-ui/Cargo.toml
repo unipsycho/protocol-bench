@@ -15,6 +15,7 @@ path = "src/main.rs"
 pb-engine = { workspace = true }
 pb-ipc = { workspace = true }
 pb-points = { workspace = true }
+pb-modbus = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 serde = { workspace = true }

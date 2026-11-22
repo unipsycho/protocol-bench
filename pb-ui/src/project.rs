@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::dock::DockPane;
-use crate::hubs::{HubModel, HubProto, HttpInputBind, MqttInputBind, MqttOutputBind};
+use crate::hubs::{HubModel, HubProto, MqttInputBind, MqttOutputBind};
 use crate::point_rows;
 use crate::layout::LayoutNode;
 use crate::mqtt_panel::{
@@ -19,7 +19,7 @@ use crate::persist::UiState;
 use pb_points::{is_address_path, is_short_point_id, PointBinding, PointStore};
 
 /// v8: dock layout (tree / hidden / maximized) lives in the project (PB-95).
-pub const PROJECT_VERSION: u32 = 8;
+pub const PROJECT_VERSION: u32 = 10;
 
 /// Project identity + options (Project panel / project.json).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -62,6 +62,12 @@ pub struct ProjectFile {
     /// SNMP agent targets. Absent on older files → defaults.
     #[serde(default)]
     pub snmp: SnmpProject,
+    /// Modbus connections (TCP / RTU, client / server). Absent on older files → defaults.
+    #[serde(default)]
+    pub modbus: ModbusProject,
+    /// File-follow sources (CSV / JSON lines). Absent on older files → defaults.
+    #[serde(default)]
+    pub files: FilesProject,
     /// Hub diagram + Input/Output MQTT binds. Absent on older files → keep ui.toml hubs.
     #[serde(default)]
     pub hubs: Option<HubModel>,
@@ -133,6 +139,8 @@ impl Default for ProjectFile {
             streams: StreamsProject::default(),
             las: LasProject::default(),
             snmp: SnmpProject::default(),
+            modbus: ModbusProject::default(),
+            files: FilesProject::default(),
             hubs: None,
             settings: ProjectSettings::default(),
             layout: None,
@@ -258,6 +266,142 @@ impl LasProject {
                 .endpoints
                 .iter()
                 .position(|e| e.id == self.selected_id)
+        };
+        state.pending_delete = None;
+    }
+}
+
+/// Modbus connections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModbusProject {
+    #[serde(default)]
+    pub connections: Vec<crate::modbus_panel::ModbusConn>,
+    #[serde(default)]
+    pub selected_id: String,
+}
+
+impl Default for ModbusProject {
+    /// Plant sample: a tank PLC (TCP), a power meter (RTU) and the hub's own Modbus server.
+    /// Shipped **disabled** so a fresh project never dials out; the demo project enables them.
+    fn default() -> Self {
+        use crate::hubs::ModbusBind;
+        use crate::modbus_panel::{ModbusConn, ModbusParity, ModbusTransport};
+        let b = |area: &str, address: u16, dtype: &str, point: &str| ModbusBind {
+            area: area.into(),
+            address,
+            dtype: dtype.into(),
+            order: "abcd".into(),
+            unit: 0,
+            point: point.into(),
+        };
+        let plc = ModbusConn {
+            id: "plc".into(),
+            label: "Tank PLC".into(),
+            port: 5020,
+            enabled: false,
+            ..ModbusConn::default_client()
+        };
+        let meter = ModbusConn {
+            id: "meter".into(),
+            label: "Power meter (RTU)".into(),
+            transport: ModbusTransport::Rtu,
+            serial_port: "/dev/ttyUSB0".into(),
+            parity: ModbusParity::Even,
+            unit_id: 3,
+            enabled: false,
+            ..ModbusConn::default_client()
+        };
+        let hub = ModbusConn {
+            id: "hub".into(),
+            label: "Plant Modbus server".into(),
+            port: 1502,
+            enabled: false,
+            map: vec![
+                b("holding", 0, "f32", "modbus_1"),
+                b("holding", 2, "f32", "modbus_2"),
+                b("holding", 4, "u32", "modbus_3"),
+                b("holding", 6, "bit3", "modbus_6"),
+                b("coil", 0, "bool", "modbus_4"),
+                b("coil", 1, "bool", "mqtt_1"),
+                b("discrete", 0, "bool", "modbus_5"),
+                b("input", 0, "u16", "modbus_7"),
+                b("input", 2, "f32", "modbus_8"),
+            ],
+            ..ModbusConn::default_server()
+        };
+        Self {
+            selected_id: String::new(),
+            connections: vec![plc, meter, hub],
+        }
+    }
+}
+
+impl ModbusProject {
+    pub fn from_panel(state: &crate::modbus_panel::ModbusPanelState) -> Self {
+        Self {
+            connections: state.conns.clone(),
+            selected_id: state
+                .selected
+                .and_then(|i| state.conns.get(i))
+                .map(|c| c.id.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn apply_to_panel(&self, state: &mut crate::modbus_panel::ModbusPanelState) {
+        state.conns = self.connections.clone();
+        if state.conns.is_empty() {
+            state.conns.push(crate::modbus_panel::ModbusConn::default_client());
+        }
+        state.selected = if self.selected_id.is_empty() {
+            None
+        } else {
+            state.conns.iter().position(|c| c.id == self.selected_id)
+        };
+        state.pending_delete = None;
+    }
+}
+
+/// File-follow sources.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FilesProject {
+    #[serde(default)]
+    pub sources: Vec<crate::files_panel::FileSource>,
+    #[serde(default)]
+    pub selected_id: String,
+}
+
+impl Default for FilesProject {
+    fn default() -> Self {
+        let f = crate::files_panel::FileSource::default_csv();
+        Self {
+            selected_id: f.id.clone(),
+            sources: vec![f],
+        }
+    }
+}
+
+impl FilesProject {
+    pub fn from_panel(state: &crate::files_panel::FilesPanelState) -> Self {
+        Self {
+            sources: state.sources.clone(),
+            selected_id: state
+                .selected
+                .and_then(|i| state.sources.get(i))
+                .map(|c| c.id.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn apply_to_panel(&self, state: &mut crate::files_panel::FilesPanelState) {
+        state.sources = self.sources.clone();
+        if state.sources.is_empty() {
+            state.sources.push(crate::files_panel::FileSource::default_csv());
+        }
+        state.selected = if self.selected_id.is_empty() {
+            None
+        } else {
+            state.sources.iter().position(|c| c.id == self.selected_id)
         };
         state.pending_delete = None;
     }
@@ -1237,6 +1381,8 @@ pub fn load(path: &Path) -> Result<ProjectFile, String> {
             streams: StreamsProject::default(),
             las: LasProject::default(),
             snmp: SnmpProject::default(),
+            modbus: ModbusProject::default(),
+            files: FilesProject::default(),
             hubs: None,
             settings: ProjectSettings::default(),
             layout: None,
@@ -1402,7 +1548,37 @@ pub fn materialize_hub_point_binds(hubs: &mut HubModel, store: &mut PointStore) 
                         }
                     }
                 }
-HubProto::Snmp => {
+HubProto::Modbus => {
+                    let conn = port.modbus_connection.clone();
+                    for bind in &mut port.modbus_inputs {
+                        let source = point_rows::modbus_bind_source(&conn, bind);
+                        if bind.point.trim().is_empty() {
+                            let id = store.ensure_id("modbus", &source);
+                            bind.point = id;
+                            dirty = true;
+                        } else {
+                            store.bind(bind.point.trim(), &source);
+                        }
+                    }
+                }
+                HubProto::Files => {
+                    let src = port.file_source.clone();
+                    for bind in &mut port.file_inputs {
+                        let column = bind.column.trim();
+                        if column.is_empty() {
+                            continue;
+                        }
+                        let source = point_rows::file_bind_source(&src, column);
+                        if bind.point.trim().is_empty() {
+                            let id = store.ensure_id("file", &source);
+                            bind.point = id;
+                            dirty = true;
+                        } else {
+                            store.bind(bind.point.trim(), &source);
+                        }
+                    }
+                }
+                HubProto::Snmp => {
                     let target = port.snmp_target.clone();
                     for bind in &mut port.snmp_inputs {
                         let oid = bind.oid.trim();
@@ -1419,7 +1595,6 @@ HubProto::Snmp => {
                         }
                     }
                 }
-                _ => {}
             }
         }
         // Aggregator outputs are host points (`agg_N`) published by Outputs.
@@ -1435,10 +1610,17 @@ HubProto::Snmp => {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hubs::HttpInputBind;
 
     #[test]
     fn materialize_hub_binds_allocates_and_lists() {
         let mut hubs = HubModel::default();
+        // Start from an empty bind slate: the sample ships a pump-command bind on `mqtt_1`.
+        for hub in &mut hubs.hubs {
+            for port in hub.sources.iter_mut().chain(hub.outputs.iter_mut()) {
+                port.mqtt_inputs.clear();
+            }
+        }
         hubs.add_hub();
         let hub = hubs.hubs[0].id;
         let src = hubs.hub(hub).unwrap().sources[0].id;
@@ -1448,6 +1630,7 @@ mod tests {
         {
             port.protocol = HubProto::Mqtt;
             port.mqtt_connection = "Mosquitto".into();
+            port.mqtt_inputs.clear(); // drop the sample's pump-command bind
             port.mqtt_inputs.push(MqttInputBind {
                 topic: "plant/t".into(),
                 path: String::new(),
@@ -1545,6 +1728,8 @@ mod tests {
             streams: StreamsProject::default(),
             las: LasProject::default(),
             snmp: SnmpProject::default(),
+            modbus: ModbusProject::default(),
+            files: FilesProject::default(),
             hubs: None,
             settings: ProjectSettings {
                 name: "Plant".into(),
@@ -1642,5 +1827,436 @@ mod tests {
         let id = &panel.clients[0].outputs[0].point;
         assert!(is_short_point_id(id), "{id}");
         assert_eq!(store.source_for_id(id), Some("mqtt/local/pb/out"));
+    }
+
+    #[test]
+    fn modbus_and_files_roundtrip_and_materialize() {
+        use crate::hubs::{FileInputBind, ModbusBind};
+        let mut file = ProjectFile::default();
+        assert_eq!(file.modbus.connections.len(), 3);
+        file.modbus.connections[0].port = 1502;
+        let json = serde_json::to_string(&file).unwrap();
+        let back: ProjectFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.modbus, file.modbus);
+        // Older files without the new sections still load.
+        let old: ProjectFile = serde_json::from_str(r#"{"version":8}"#).unwrap();
+        assert!(!old.files.sources.is_empty());
+
+        let mut hubs = HubModel::default();
+        let port = &mut hubs.hubs[0].sources[0];
+        port.protocol = HubProto::Modbus;
+        port.modbus_connection = "plc".into();
+        port.modbus_inputs.clear();
+        port.modbus_inputs.push(ModbusBind {
+            area: "holding".into(),
+            address: 100,
+            dtype: "f32".into(),
+            order: "cdab".into(),
+            unit: 0,
+            point: String::new(),
+        });
+        let port = &mut hubs.hubs[0].sources[1];
+        port.protocol = HubProto::Files;
+        port.file_source = "meter".into();
+        port.file_inputs.push(FileInputBind { column: "temp".into(), point: String::new() });
+        let mut store = PointStore::default();
+        assert!(materialize_hub_point_binds(&mut hubs, &mut store));
+        assert_eq!(hubs.hubs[0].sources[0].modbus_inputs[0].point, "modbus_1");
+        assert!(hubs.hubs[0].sources[1].file_inputs[0].point.starts_with("file_"));
+    }
+
+    #[test]
+    fn modbus_source_strings_match_the_service() {
+        use crate::hubs::ModbusBind;
+        use crate::point_rows::modbus_bind_source;
+        let b = |area: &str, addr: u16, dt: &str, order: &str, unit: u8| ModbusBind {
+            area: area.into(),
+            address: addr,
+            dtype: dt.into(),
+            order: order.into(),
+            unit,
+            point: String::new(),
+        };
+        // Same literals asserted in pb-service `source_strings_match_the_ui_format`.
+        assert_eq!(modbus_bind_source("plc", &b("holding", 100, "f32", "abcd", 0)), "modbus/plc::holding:100:f32");
+        assert_eq!(modbus_bind_source("plc", &b("holding", 100, "f32", "cdab", 0)), "modbus/plc::holding:100:f32:cdab");
+        assert_eq!(modbus_bind_source("plc", &b("coil", 3, "bool", "abcd", 7)), "modbus/plc/u7::coil:3:bool");
+        assert_eq!(modbus_bind_source("", &b("input", 0, "u16", "abcd", 0)), "modbus::input:0:u16");
+    }
+
+    #[test]
+    fn plant_sample_is_internally_consistent() {
+        use crate::modbus_panel::{map_problems, ModbusRole};
+        let hubs = HubModel::default();
+        let modbus = ModbusProject::default();
+        let conn = |id: &str| modbus.connections.iter().find(|c| c.id == id);
+        // Every Modbus port names a real client connection; the Modbus hub names a real server.
+        for hub in &hubs.hubs {
+            for port in hub.sources.iter().chain(hub.outputs.iter()) {
+                if port.protocol == HubProto::Modbus {
+                    let c = conn(&port.modbus_connection).expect("modbus port connection exists");
+                    assert_eq!(c.role, ModbusRole::Client, "{}", port.label);
+                    for b in port.modbus_inputs.iter().chain(port.modbus_outputs.iter()) {
+                        assert_eq!(b.problem(false), None, "{} {}", port.label, b.describe());
+                    }
+                }
+            }
+            if hub.protocol == HubProto::Modbus {
+                let c = conn(&hub.modbus_server).expect("hub server exists");
+                assert_eq!(c.role, ModbusRole::Server);
+                assert!(map_problems(&c.map).is_empty(), "{:?}", map_problems(&c.map));
+            }
+        }
+        // Every point the server map serves is produced by a bind somewhere in the sample.
+        let mut hubs = hubs;
+        let mut store = PointStore::new();
+        materialize_hub_point_binds(&mut hubs, &mut store);
+        let server = modbus.connections.iter().find(|c| c.role == ModbusRole::Server).unwrap();
+        for entry in &server.map {
+            assert!(store.source_for_id(&entry.point).is_some(), "served point {} has no source bind", entry.point);
+        }
+        // Sample connections ship disabled so a fresh project never dials out.
+        assert!(modbus.connections.iter().all(|c| !c.enabled));
+    }
+
+    /// `PB_EXPORT_DEMO=/path/modbus-plant.json cargo test -p pb-ui export_demo -- --ignored`
+    /// writes the Plant sample as a runnable project (connections enabled, TCP to the simulator).
+    #[test]
+    #[ignore]
+    fn export_demo_project() {
+        let Some(path) = std::env::var_os("PB_EXPORT_DEMO") else { return };
+        let mut file = ProjectFile::default();
+        file.hubs = Some(HubModel::default());
+        for c in &mut file.modbus.connections {
+            // The RTU meter needs a real serial line — leave it off in the demo.
+            c.enabled = c.id != "meter";
+        }
+        file.settings.name = "Modbus plant demo".into();
+        file.settings.description =
+            "Tank PLC (Modbus TCP, run scripts/modbus-plant-sim.py) bridged to MQTT and a hub Modbus server on :1502".into();
+        let text = serde_json::to_string_pretty(&file).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Writes the two field-demo projects (`modbus-hub.json`, `edge-logger.json`) into the
+    /// directory named by `PB_EXPORT_DEMOS`. Data files live in `<dir>/data` (see scripts/field-sim.py).
+    #[test]
+    #[ignore]
+    fn export_field_demos() {
+        use crate::files_panel::{FileParser, FileSource, FileStart};
+        use crate::hubs::{FileInputBind, HubPort, LasInputBind, LasOutputBind, ModbusBind, MqttOutputBind, SnmpInputBind};
+        use crate::modbus_panel::ModbusConn;
+
+        let Some(dir) = std::env::var_os("PB_EXPORT_DEMOS") else { return };
+        let dir = std::path::PathBuf::from(dir);
+        let data = dir.join("data");
+        let data_path = |f: &str| data.join(f).to_string_lossy().into_owned();
+        let mb = |area: &str, address: u16, dtype: &str, order: &str, point: &str| {
+            let mut b = ModbusBind {
+                area: area.into(),
+                address,
+                dtype: dtype.into(),
+                order: order.into(),
+                unit: 0,
+                point: point.into(),
+            };
+            if order.is_empty() {
+                b.order = "abcd".into();
+            }
+            b
+        };
+        let meter_csv = FileSource {
+            id: "meter".into(),
+            label: "Meter log (CSV)".into(),
+            path: data_path("meter.csv"),
+            parser: FileParser::Csv,
+            start_at: FileStart::End,
+            ..FileSource::default_csv()
+        };
+        let switch = SnmpTargetSerde {
+            id: "sw".into(),
+            label: "Core switch (field-sim)".into(),
+            host: "127.0.0.1".into(),
+            port: 1161,
+            version: "v2c".into(),
+            community: "public".into(),
+            timeout_secs: 2,
+        };
+
+        // ---------------- Modbus-hub ----------------
+        let mut a = ProjectFile::default();
+        a.settings.name = "Modbus-hub".into();
+        a.settings.description = "Modbus hub: Tank PLC (Modbus TCP :5020) + meter CSV + SNMP switch in; \
+            the hub serves every point as a Modbus server on :1502; a master write to coil 1 on :1502 \
+            drives the PLC pump; the plant picture is logged to a time-indexed LAS file. \
+            Run scripts/modbus-plant-sim.py and scripts/field-sim.py first."
+            .into();
+        a.next_point_seq = 30;
+        a.modbus.connections = vec![
+            ModbusConn { id: "plc".into(), label: "Tank PLC".into(), port: 5020, enabled: true, ..ModbusConn::default_client() },
+            ModbusConn {
+                id: "hub".into(),
+                label: "Modbus-hub server".into(),
+                port: 1502,
+                enabled: true,
+                map: vec![
+                    mb("holding", 0, "f32", "cdab", "modbus_1"),
+                    mb("holding", 2, "f32", "cdab", "modbus_2"),
+                    mb("holding", 4, "u32", "abcd", "modbus_3"),
+                    mb("holding", 6, "bit3", "abcd", "modbus_6"),
+                    mb("holding", 8, "f32", "abcd", "file_1"),
+                    mb("holding", 10, "f32", "abcd", "file_2"),
+                    mb("holding", 12, "u32", "abcd", "snmp_1"),
+                    mb("holding", 14, "u32", "abcd", "snmp_2"),
+                    mb("coil", 0, "bool", "abcd", "modbus_4"),
+                    mb("coil", 1, "bool", "abcd", "modbus_9"),
+                    mb("discrete", 0, "bool", "abcd", "modbus_5"),
+                ],
+                ..ModbusConn::default_server()
+            },
+        ];
+        a.modbus.selected_id = "plc".into();
+        a.files.sources = vec![meter_csv.clone()];
+        a.files.selected_id = "meter".into();
+        a.snmp.targets = vec![switch.clone()];
+        a.snmp.selected_id = "sw".into();
+        a.las.endpoints = vec![LasEndpointSerde {
+            id: "plant-log".into(),
+            label: "Plant log (written)".into(),
+            role: "outgoing".into(),
+            path: data_path("plant-log.las"),
+            version: "2.0".into(),
+            follow: false,
+        }];
+        a.las.selected_id = "plant-log".into();
+        let mut hubs = HubModel::sample();
+        hubs.selected = Some(1);
+        hubs.selection = vec![(1, None)];
+        hubs.hubs = vec![crate::hubs::Hub {
+            id: 1,
+            name: "Modbus-hub".into(),
+            protocol: HubProto::Modbus,
+            sources: vec![
+                {
+                    let mut p = HubPort::new(2, HubProto::Modbus, "Tank PLC");
+                    p.modbus_connection = "plc".into();
+                    p.modbus_interval_secs = 1.0;
+                    p.modbus_inputs = vec![
+                        mb("holding", 100, "f32", "cdab", "modbus_1"),
+                        mb("holding", 102, "f32", "cdab", "modbus_2"),
+                        mb("holding", 110, "u32", "abcd", "modbus_3"),
+                        mb("coil", 0, "bool", "abcd", "modbus_4"),
+                        mb("discrete", 0, "bool", "abcd", "modbus_5"),
+                        mb("holding", 120, "bit3", "abcd", "modbus_6"),
+                    ];
+                    p
+                },
+                {
+                    let mut p = HubPort::new(3, HubProto::Files, "Meter CSV");
+                    p.file_source = "meter".into();
+                    p.file_inputs = vec![
+                        FileInputBind { column: "volts".into(), point: "file_1".into() },
+                        FileInputBind { column: "kw".into(), point: "file_2".into() },
+                    ];
+                    p
+                },
+                {
+                    let mut p = HubPort::new(4, HubProto::Snmp, "Core switch");
+                    p.snmp_target = "sw".into();
+                    p.snmp_interval_secs = 2.0;
+                    p.snmp_inputs = vec![
+                        SnmpInputBind { oid: "1.3.6.1.2.1.1.3.0".into(), point: "snmp_1".into() },
+                        SnmpInputBind { oid: "1.3.6.1.2.1.2.2.1.10.1".into(), point: "snmp_2".into() },
+                    ];
+                    p
+                },
+            ],
+            outputs: vec![
+                {
+                    // Written by a master on :1502 (coil 1) → forwarded to the PLC pump coil.
+                    let mut p = HubPort::new(5, HubProto::Modbus, "Pump command");
+                    p.modbus_connection = "plc".into();
+                    p.modbus_outputs = vec![mb("coil", 1, "bool", "abcd", "modbus_9")];
+                    p
+                },
+                {
+                    let mut p = HubPort::new(6, HubProto::Las, "Plant log");
+                    p.las_endpoint = "plant-log".into();
+                    p.las_index = "time".into();
+                    p.las_outputs = vec![
+                        LasOutputBind { point: "modbus_1".into(), curve: "LEVEL".into() },
+                        LasOutputBind { point: "modbus_2".into(), curve: "TEMP".into() },
+                        LasOutputBind { point: "file_2".into(), curve: "KW".into() },
+                    ];
+                    p
+                },
+            ],
+            aggregators: vec![],
+            calculations: vec![],
+            at: None,
+            modbus_server: "hub".into(),
+        }];
+        a.hubs = Some(hubs);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(dir.join("modbus-hub.json"), serde_json::to_string_pretty(&a).unwrap()).unwrap();
+
+        // ---------------- Edge-logger ----------------
+        let mut b = ProjectFile::default();
+        b.settings.name = "Edge-logger".into();
+        b.settings.description = "MQTT hub (embedded broker :1885): a growing LAS well log + SNMP switch + meter CSV \
+            in; MQTT topics out and a Modbus write to the Tank PLC. Run scripts/field-sim.py (and \
+            scripts/modbus-plant-sim.py for the Modbus output)."
+            .into();
+        b.next_point_seq = 30;
+        b.mqtt.embedded.enabled = true;
+        b.mqtt.embedded.port = 1885;
+        // Outputs publish through a client session; this one loops back into the hub's own broker.
+        b.mqtt.clients = vec![MqttClientSerde {
+            id: "local".into(),
+            label: "Edge loopback".into(),
+            port: 1885,
+            client_id: "pb-edge-logger".into(),
+            subscriptions: Vec::new(),
+            auto_connect: true,
+            ..MqttClientSerde::default_local()
+        }];
+        b.mqtt.selected_id = "local".into();
+        b.modbus.connections = vec![ModbusConn {
+            id: "plc".into(),
+            label: "Tank PLC".into(),
+            port: 5020,
+            enabled: true,
+            ..ModbusConn::default_client()
+        }];
+        b.modbus.selected_id = "plc".into();
+        b.files.sources = vec![meter_csv];
+        b.files.selected_id = "meter".into();
+        b.snmp.targets = vec![switch];
+        b.snmp.selected_id = "sw".into();
+        b.las.endpoints = vec![
+            LasEndpointSerde {
+                id: "well-a".into(),
+                label: "Well A (growing)".into(),
+                role: "incoming".into(),
+                path: data_path("well-a.las"),
+                version: "2.0".into(),
+                follow: true,
+            },
+            LasEndpointSerde {
+                id: "well-copy".into(),
+                label: "Well A copy (written)".into(),
+                role: "outgoing".into(),
+                path: data_path("well-a-copy.las"),
+                version: "2.0".into(),
+                follow: false,
+            },
+        ];
+        b.las.selected_id = "well-a".into();
+        let broker = "local".to_string();
+        let mut hubs = HubModel::sample();
+        hubs.selected = Some(1);
+        hubs.selection = vec![(1, None)];
+        let out = |point: &str, topic: &str| MqttOutputBind {
+            point: point.into(),
+            topic: topic.into(),
+            qos: 0,
+            retain: true,
+            auto: false,
+        };
+        hubs.hubs = vec![crate::hubs::Hub {
+            id: 1,
+            name: "Edge-logger".into(),
+            protocol: HubProto::Mqtt,
+            sources: vec![
+                {
+                    let mut p = HubPort::new(2, HubProto::Las, "Well A log");
+                    p.las_endpoint = "well-a".into();
+                    p.las_inputs = vec![
+                        LasInputBind { curve: "DEPT".into(), point: "las_1".into() },
+                        LasInputBind { curve: "GR".into(), point: "las_2".into() },
+                        LasInputBind { curve: "DT".into(), point: "las_3".into() },
+                    ];
+                    p
+                },
+                {
+                    let mut p = HubPort::new(3, HubProto::Snmp, "Core switch");
+                    p.snmp_target = "sw".into();
+                    p.snmp_interval_secs = 2.0;
+                    p.snmp_inputs = vec![SnmpInputBind { oid: "1.3.6.1.2.1.2.2.1.10.1".into(), point: "snmp_1".into() }];
+                    p
+                },
+                {
+                    let mut p = HubPort::new(4, HubProto::Files, "Meter CSV");
+                    p.file_source = "meter".into();
+                    p.file_inputs = vec![
+                        FileInputBind { column: "volts".into(), point: "file_1".into() },
+                        FileInputBind { column: "temp".into(), point: "file_2".into() },
+                    ];
+                    p
+                },
+            ],
+            outputs: vec![
+                {
+                    let mut p = HubPort::new(5, HubProto::Mqtt, "Edge topics");
+                    p.mqtt_connection = broker;
+                    p.mqtt_outputs = vec![
+                        out("las_1", "edge/well-a/depth"),
+                        out("las_2", "edge/well-a/gr"),
+                        out("las_3", "edge/well-a/dt"),
+                        out("snmp_1", "edge/switch/in_octets"),
+                        out("file_1", "edge/meter/volts"),
+                    ];
+                    p
+                },
+                {
+                    let mut p = HubPort::new(6, HubProto::Las, "Log copy");
+                    p.las_endpoint = "well-copy".into();
+                    p.las_index = "depth".into();
+                    p.las_outputs = vec![
+                        LasOutputBind { point: "las_1".into(), curve: "DEPT".into() },
+                        LasOutputBind { point: "las_2".into(), curve: "GR".into() },
+                    ];
+                    p
+                },
+                {
+                    // Meter temperature → PLC holding register (e.g. an external setpoint).
+                    let mut p = HubPort::new(7, HubProto::Modbus, "PLC setpoint");
+                    p.modbus_connection = "plc".into();
+                    p.modbus_outputs = vec![mb("holding", 130, "f32", "cdab", "file_2")];
+                    p
+                },
+            ],
+            aggregators: vec![],
+            calculations: vec![],
+            at: None,
+            modbus_server: String::new(),
+        }];
+        b.hubs = Some(hubs);
+        std::fs::write(dir.join("edge-logger.json"), serde_json::to_string_pretty(&b).unwrap()).unwrap();
+    }
+
+}
+
+#[cfg(test)]
+mod sample_files_tests {
+    use super::*;
+
+    /// Every project in the sibling samples folder must parse as a `ProjectFile`.
+    #[test]
+    fn sample_projects_parse() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol-bench-projects");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return; // samples live outside this repo; skip when absent
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let parsed: Result<ProjectFile, _> = serde_json::from_value(value);
+            assert!(parsed.is_ok(), "{}: {:?}", path.display(), parsed.err());
+        }
     }
 }

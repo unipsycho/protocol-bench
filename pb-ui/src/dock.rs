@@ -94,20 +94,9 @@ impl DockPane {
             Self::OpcUa => Some(EngineId::OpcUa),
             Self::Files => Some(EngineId::FileFollow),
             Self::Http => Some(EngineId::Http),
-            Self::Las => None,
-            Self::Snmp => None,
+            Self::Las => Some(EngineId::Las),
+            Self::Snmp => Some(EngineId::Snmp),
             _ => None,
-        }
-    }
-
-    pub fn from_engine(id: EngineId) -> Self {
-        match id {
-            EngineId::Streams => Self::Streams,
-            EngineId::Modbus => Self::Modbus,
-            EngineId::Mqtt => Self::Mqtt,
-            EngineId::OpcUa => Self::OpcUa,
-            EngineId::FileFollow => Self::Files,
-            EngineId::Http => Self::Http,
         }
     }
 

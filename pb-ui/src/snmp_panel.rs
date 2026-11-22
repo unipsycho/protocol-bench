@@ -2,10 +2,66 @@
 
 use egui::{Layout, RichText, Sense, UiBuilder};
 
-use crate::connection_list::{self, RowAction};
+use crate::connection_list::{self, Dot, RowAction};
+use pb_engine::{EngineId, HostSnapshot};
 use crate::theme::{apply_form_spacing, font_ui, form_inset, space, ThemePalette};
 
 const LABEL_W: f32 = 110.0;
+
+/// One target as the SNMP pack reports it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LiveTarget {
+    pub id: String,
+    pub endpoint: String,
+    pub state: String,
+    pub connected: bool,
+    pub error: String,
+    pub polls: u64,
+    pub errors: u64,
+}
+
+pub fn parse_live(detail_json: &str) -> Vec<LiveTarget> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(detail_json) else { return Vec::new() };
+    let st = |c: &serde_json::Value, k: &str| c.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let n = |c: &serde_json::Value, k: &str| c.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    v.get("targets")
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+        .map(|c| LiveTarget {
+            id: st(c, "id"),
+            endpoint: st(c, "endpoint"),
+            state: st(c, "state"),
+            connected: c.get("connected").and_then(|x| x.as_bool()).unwrap_or(false),
+            error: st(c, "error"),
+            polls: n(c, "polls"),
+            errors: n(c, "errors"),
+        })
+        .collect()
+}
+
+/// Live targets from the host snapshot, plus whether the SNMP pack is loaded.
+pub fn live_from_host(host: &HostSnapshot) -> (Vec<LiveTarget>, bool) {
+    match host.slot(EngineId::Snmp) {
+        Some(slot) => (parse_live(&slot.detail_json), slot.pack_loaded),
+        None => (Vec::new(), false),
+    }
+}
+
+/// Dot + text for a target (also used by the hub SNMP Input inspector).
+pub fn show_status(ui: &mut egui::Ui, p: &ThemePalette, live: Option<&LiveTarget>, pack_loaded: bool) {
+    let (dot, text, err) = if !pack_loaded {
+        (Dot::Warn, "SNMP pack not loaded — copy libpb_snmp into the service modules/ folder".to_string(), String::new())
+    } else {
+        match live {
+            None => (Dot::Idle, "Idle — no hub SNMP Input uses this target".to_string(), String::new()),
+            Some(l) if l.connected => (Dot::Ok, "Agent answering".to_string(), l.error.clone()),
+            Some(l) if l.state == "no response" => (Dot::Err, "No response".to_string(), l.error.clone()),
+            Some(l) => (Dot::Warn, l.state.clone(), l.error.clone()),
+        }
+    };
+    connection_list::status_line(ui, p, dot, &text, &err);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnmpVersion {
@@ -135,17 +191,11 @@ impl SnmpPanelState {
     }
 
     fn unique_id(&self, base: &str) -> String {
-        let mut id = base.to_string();
-        let mut n = 2;
-        while self.targets.iter().any(|t| t.id == id) {
-            id = format!("{base}-{n}");
-            n += 1;
-        }
-        id
+        connection_list::unique_id(base, |id| self.targets.iter().any(|t| t.id == id))
     }
 }
 
-pub fn paint(ui: &mut egui::Ui, p: &ThemePalette, state: &mut SnmpPanelState) -> bool {
+pub fn paint(ui: &mut egui::Ui, p: &ThemePalette, state: &mut SnmpPanelState, host: &HostSnapshot) -> bool {
     state.ensure_targets();
     let mut dirty = false;
     let full = ui.available_rect_before_wrap();
@@ -155,15 +205,16 @@ pub fn paint(ui: &mut egui::Ui, p: &ThemePalette, state: &mut SnmpPanelState) ->
             .max_rect(inner)
             .layout(Layout::top_down(egui::Align::Min)),
         |ui| {
-            dirty = paint_body(ui, p, state);
+            dirty = paint_body(ui, p, state, host);
         },
     );
     ui.allocate_rect(full, Sense::hover());
     dirty
 }
 
-fn paint_body(ui: &mut egui::Ui, p: &ThemePalette, state: &mut SnmpPanelState) -> bool {
+fn paint_body(ui: &mut egui::Ui, p: &ThemePalette, state: &mut SnmpPanelState, host: &HostSnapshot) -> bool {
     apply_form_spacing(ui);
+    let (live, pack_loaded) = live_from_host(host);
     let mut dirty = false;
     ui.label(
         RichText::new(
@@ -199,7 +250,14 @@ fn paint_body(ui: &mut egui::Ui, p: &ThemePalette, state: &mut SnmpPanelState) -
         } else {
             t.label.clone()
         };
-        match connection_list::selectable_row(ui, &label, &t.summary(), selected, show_delete, p) {
+        let status = match live.iter().find(|l| l.id == t.id) {
+            Some(l) if l.connected => "answering".to_string(),
+            Some(l) => l.state.clone(),
+            None if !pack_loaded => "pack not loaded".to_string(),
+            None => "idle".to_string(),
+        };
+        let subtitle = format!("{}  ·  {status}", t.summary());
+        match connection_list::selectable_row(ui, &label, &subtitle, selected, show_delete, p) {
             Some(RowAction::Select) => select = Some(i),
             Some(RowAction::Delete) => {
                 state.pending_delete = Some((i, label));
@@ -239,13 +297,21 @@ fn paint_body(ui: &mut egui::Ui, p: &ThemePalette, state: &mut SnmpPanelState) -
         return dirty;
     }
 
-    dirty |= edit_target(ui, state, p);
+    dirty |= edit_target(ui, state, p, &live, pack_loaded);
     dirty
 }
 
-fn edit_target(ui: &mut egui::Ui, state: &mut SnmpPanelState, p: &ThemePalette) -> bool {
+fn edit_target(ui: &mut egui::Ui, state: &mut SnmpPanelState, p: &ThemePalette, live: &[LiveTarget], pack_loaded: bool) -> bool {
     let mut dirty = false;
     let t = state.selected_mut().unwrap();
+    ui.label(RichText::new("STATUS").font(font_ui(10.5)).color(p.muted));
+    ui.add_space(space::AFTER_HEADING);
+    let mine = live.iter().find(|l| l.id == t.id);
+    show_status(ui, p, mine, pack_loaded);
+    if let Some(l) = mine {
+        ui.label(RichText::new(format!("{} polls  ·  {} errors", l.polls, l.errors)).font(font_ui(11.0)).color(p.muted));
+    }
+    ui.add_space(space::SECTION);
     dirty |= field(ui, "Id", &mut t.id, p);
     dirty |= field(ui, "Label", &mut t.label, p);
     dirty |= field(ui, "Host", &mut t.host, p);
@@ -294,24 +360,19 @@ fn edit_target(ui: &mut egui::Ui, state: &mut SnmpPanelState, p: &ThemePalette) 
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = space::ITEM_X;
-        ui.add_sized(
-            [LABEL_W, 20.0],
-            egui::Label::new(RichText::new(label).font(font_ui(12.0)).color(p.muted)),
-        );
-        let w = (ui.available_width() - 8.0).clamp(140.0, 420.0);
-        if ui
-            .add(
-                egui::TextEdit::singleline(value)
-                    .desired_width(w)
-                    .margin(egui::Margin::symmetric(6.0, 3.0)),
-            )
-            .changed()
-        {
-            changed = true;
-        }
-    });
-    changed
+    connection_list::labeled_field(ui, LABEL_W, label, value, p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_targets_parse_from_pack_json() {
+        let j = r#"{"targets":[{"id":"sw","endpoint":"10.0.0.2:161","state":"ok","connected":true,"error":"","polls":4,"errors":1}]}"#;
+        let l = parse_live(j);
+        assert_eq!(l.len(), 1);
+        assert_eq!((l[0].polls, l[0].errors, l[0].connected), (4, 1, true));
+        assert!(parse_live("").is_empty());
+    }
 }

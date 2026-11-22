@@ -1,6 +1,6 @@
 //! Protocol Bench shell: menu bar, icon rail, docked panes, themes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -22,13 +22,15 @@ use crate::las_panel::LasPanelState;
 use crate::mqtt_panel::{self, MqttPanelState};
 use crate::opcua_panel::{self, OpcUaPanelState};
 use crate::panels::PointsPanelState;
+use crate::files_panel::FilesPanelState;
+use crate::modbus_panel::ModbusPanelState;
 use crate::snmp_panel::SnmpPanelState;
 use crate::streams_panel::StreamsPanelState;
 use crate::traffic_panel::TrafficPanelState;
 use crate::panels;
 use crate::persist::{self, UiState};
 use crate::project::{
-    self, DockLayout, HttpProject, LasProject, MqttProject, ProjectFile, ProjectSettings, SnmpProject,
+    self, DockLayout, FilesProject, HttpProject, LasProject, ModbusProject, MqttProject, ProjectFile, ProjectSettings, SnmpProject,
     StreamsProject,
 };
 use pb_ipc::PointBindingWire;
@@ -65,6 +67,8 @@ pub struct ProtocolBenchApp {
     streams: StreamsPanelState,
     las: LasPanelState,
     snmp: SnmpPanelState,
+    modbus: ModbusPanelState,
+    files: FilesPanelState,
     points: PointsPanelState,
     traffic: TrafficPanelState,
     /// Project-level options (Project panel / project.json).
@@ -82,6 +86,8 @@ pub struct ProtocolBenchApp {
     /// Last SNMP targets snapshot written to the project file.
     las_saved: LasProject,
     snmp_saved: SnmpProject,
+    modbus_saved: ModbusProject,
+    files_saved: FilesProject,
     /// Last hubs snapshot written to the project file.
     hubs_saved: crate::hubs::HubModel,
     /// Last dock layout written to project.json (PB-95).
@@ -121,6 +127,7 @@ enum MenuAction {
     SaveProject,
     SaveAsProject,
     OpenRecent(PathBuf),
+    ClearRecent,
     ResetLayout,
     Quit,
     About,
@@ -152,11 +159,15 @@ impl ProtocolBenchApp {
         let mut streams = StreamsPanelState::default();
         let mut las = LasPanelState::default();
         let mut snmp = SnmpPanelState::default();
+        let mut modbus = ModbusPanelState::default();
+        let mut files = FilesPanelState::default();
         let mut mqtt_saved = MqttProject::default();
         let mut http_saved = HttpProject::default();
         let mut streams_saved = StreamsProject::default();
         let mut las_saved = LasProject::default();
         let mut snmp_saved = SnmpProject::default();
+        let mut modbus_saved = ModbusProject::default();
+        let mut files_saved = FilesProject::default();
         let mut project_settings = ProjectSettings::default();
         // Quiet offline: chip shows disconnected; left status stays calm (PB-101).
         let mut status = "Ready".into();
@@ -189,6 +200,8 @@ impl ProtocolBenchApp {
                         file.streams.apply_to_panel(&mut streams);
                         file.las.apply_to_panel(&mut las);
                         file.snmp.apply_to_panel(&mut snmp);
+                        file.modbus.apply_to_panel(&mut modbus);
+                        file.files.apply_to_panel(&mut files);
                         project_settings = file.settings.clone();
                         // PB-58: legacy project auto-run → app setting (ui.toml).
                         if file.settings.auto_run_embedded_broker && !ui_state.auto_run_embedded_hubs
@@ -218,6 +231,8 @@ impl ProtocolBenchApp {
                         streams_saved = StreamsProject::from_panel(&streams);
                         las_saved = LasProject::from_panel(&las);
                         snmp_saved = SnmpProject::from_panel(&snmp);
+                        modbus_saved = ModbusProject::from_panel(&modbus);
+                        files_saved = FilesProject::from_panel(&files);
                         // Repair orphan hub mqtt_connection ids before materializing points.
                         if mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &mut ui_state.hubs) {
                             seed_layout = true;
@@ -270,6 +285,8 @@ impl ProtocolBenchApp {
             streams,
             las,
             snmp,
+            modbus,
+            files,
             points: PointsPanelState::default(),
             traffic: TrafficPanelState::default(),
             project_settings,
@@ -280,6 +297,8 @@ impl ProtocolBenchApp {
             streams_saved,
             las_saved,
             snmp_saved,
+            modbus_saved,
+            files_saved,
             hubs_saved,
             layout_saved,
             last_project_save: Instant::now(),
@@ -390,6 +409,8 @@ impl ProtocolBenchApp {
         let streams_dirty = StreamsProject::from_panel(&self.streams) != self.streams_saved;
         let las_dirty = LasProject::from_panel(&self.las) != self.las_saved;
         let snmp_dirty = SnmpProject::from_panel(&self.snmp) != self.snmp_saved;
+        let modbus_dirty = ModbusProject::from_panel(&self.modbus) != self.modbus_saved;
+        let files_dirty = FilesProject::from_panel(&self.files) != self.files_saved;
         let hubs_dirty = self.ui_state.hubs != self.hubs_saved;
         let settings_dirty = self.project_settings != self.settings_saved;
         let layout_dirty = DockLayout::from_ui(&self.ui_state) != self.layout_saved;
@@ -399,6 +420,8 @@ impl ProtocolBenchApp {
             || streams_dirty
             || las_dirty
             || snmp_dirty
+            || modbus_dirty
+            || files_dirty
             || hubs_dirty
             || settings_dirty
             || layout_dirty)
@@ -460,6 +483,8 @@ impl ProtocolBenchApp {
         let streams = StreamsProject::from_panel(&self.streams);
         let las = LasProject::from_panel(&self.las);
         let snmp = SnmpProject::from_panel(&self.snmp);
+        let modbus = ModbusProject::from_panel(&self.modbus);
+        let files = FilesProject::from_panel(&self.files);
         let file = ProjectFile {
             version: project::PROJECT_VERSION,
             points,
@@ -470,6 +495,8 @@ impl ProtocolBenchApp {
             streams: streams.clone(),
             las: las.clone(),
             snmp: snmp.clone(),
+            modbus: modbus.clone(),
+            files: files.clone(),
             hubs: Some(self.ui_state.hubs.clone()),
             settings: self.project_settings.clone(),
             layout: Some(layout.clone()),
@@ -487,6 +514,8 @@ impl ProtocolBenchApp {
         self.streams_saved = streams;
         self.las_saved = las;
         self.snmp_saved = snmp;
+        self.modbus_saved = modbus;
+        self.files_saved = files;
         self.hubs_saved = self.ui_state.hubs.clone();
         self.settings_saved = self.project_settings.clone();
         self.layout_saved = layout;
@@ -514,6 +543,8 @@ impl ProtocolBenchApp {
         file.streams.apply_to_panel(&mut self.streams);
         file.las.apply_to_panel(&mut self.las);
         file.snmp.apply_to_panel(&mut self.snmp);
+        file.modbus.apply_to_panel(&mut self.modbus);
+        file.files.apply_to_panel(&mut self.files);
         self.project_settings = file.settings.clone();
         if file.settings.auto_run_embedded_broker && !self.ui_state.auto_run_embedded_hubs {
             self.ui_state.auto_run_embedded_hubs = true;
@@ -535,6 +566,8 @@ impl ProtocolBenchApp {
         self.streams_saved = StreamsProject::from_panel(&self.streams);
         self.las_saved = LasProject::from_panel(&self.las);
         self.snmp_saved = SnmpProject::from_panel(&self.snmp);
+        self.modbus_saved = ModbusProject::from_panel(&self.modbus);
+        self.files_saved = FilesProject::from_panel(&self.files);
         self.hubs_saved = self.ui_state.hubs.clone();
         self.settings_saved = self.project_settings.clone();
         self.layout_saved = DockLayout::from_ui(&self.ui_state);
@@ -566,6 +599,14 @@ impl ProtocolBenchApp {
     }
 
     /// Append `.json` when the save dialog left the extension off.
+    /// `ipc.json` / `ipc.token` are how the UI finds the service — saving a project over one
+    /// (the file dialog opens in that folder) leaves the UI permanently "disconnected".
+    fn is_service_file(path: &Path) -> bool {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        matches!(name, "ipc.json" | "ipc.token")
+            && path.parent().map(|d| d.to_path_buf()) == pb_ipc::config_dir()
+    }
+
     fn ensure_project_ext(path: PathBuf) -> PathBuf {
         match path.extension().and_then(|e| e.to_str()) {
             Some(ext) if !ext.is_empty() => path,
@@ -580,12 +621,12 @@ impl ProtocolBenchApp {
             return;
         }
         let (tx, rx) = mpsc::channel();
-        let start_dir = self
-            .project_path
-            .parent()
-            .filter(|p| p.as_os_str().len() > 0)
-            .map(|p| p.to_path_buf())
-            .or_else(|| directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()));
+        let start_dir = persist::dialog_start_dir(
+            &self.ui_state,
+            &self.project_path,
+            pb_ipc::config_dir().as_deref(),
+        )
+        .or_else(|| directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()));
         let default_name = self
             .project_path
             .file_name()
@@ -625,6 +666,10 @@ impl ProtocolBenchApp {
         match pending.rx.try_recv() {
             Ok(Some(path)) => {
                 self.file_pick = None;
+                if Self::is_service_file(&path) {
+                    self.status = "Not a project: ipc.json / ipc.token belong to the service".into();
+                    return;
+                }
                 match kind {
                     FilePickKind::Open => {
                         if let Err(err) = self.load_project_from_path(path) {
@@ -692,6 +737,12 @@ impl ProtocolBenchApp {
                     self.status = format!("Open failed: {err}");
                 }
             }
+            MenuAction::ClearRecent => {
+                if persist::clear_recent_projects(&mut self.ui_state) {
+                    self.mark_dirty();
+                }
+                self.status = "Cleared recent projects".into();
+            }
             MenuAction::ResetLayout => self.reset_layout(),
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             MenuAction::About => self.about_open = true,
@@ -723,6 +774,48 @@ impl ProtocolBenchApp {
 
 impl eframe::App for ProtocolBenchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Screenshot hook: `PB_SHOT_OUT=<file.png>` saves this window's own pixels after a
+        // few seconds (no screen capture, so other windows never appear) and exits.
+        if let Some(out) = std::env::var_os("PB_SHOT_OUT") {
+            static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ctx.request_repaint();
+            if n == 240 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+            }
+            let shot = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(img) = shot {
+                let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+                if let Some(buf) = image::RgbaImage::from_raw(img.size[0] as u32, img.size[1] as u32, rgba) {
+                    let _ = buf.save(&out);
+                }
+                std::process::exit(0);
+            }
+        }
+        // Screenshot hook: `PB_SHOT_SELECT=<hub id>[,<node id>]` selects a node once the
+        // project has loaded (like `PB_SHOT_CALC_TYPES` for the calculation guide).
+        static SHOT_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if let Some(spec) = std::env::var_os("PB_SHOT_SELECT").filter(|_| !SHOT_DONE.load(std::sync::atomic::Ordering::Relaxed)) {
+            if self.service_connected && !self.ui_state.hubs.hubs.is_empty() {
+                let mut ids = spec.to_string_lossy().split(',').filter_map(|s| s.trim().parse::<u64>().ok()).collect::<Vec<_>>().into_iter();
+                if let Some(hub) = ids.next() {
+                    self.ui_state.hubs.selected = Some(hub);
+                    self.ui_state.hubs.selected_port = ids.next();
+                    if let Some(w) = std::env::var("PB_SHOT_INSPECT").ok().and_then(|v| v.parse::<f32>().ok()) {
+                        self.ui_state.hubs.inspector_width = w;
+                    }
+                    if std::env::var_os("PB_SHOT_MAX").is_some() {
+                        self.ui_state.maximized = Some(DockPane::Hubs);
+                    }
+                    SHOT_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.menu.take().is_none() {
                 if self.about_open {
@@ -948,11 +1041,26 @@ impl ProtocolBenchApp {
         p: &ThemePalette,
         action: &mut Option<MenuAction>,
     ) {
-        let recent = self.ui_state.recent_projects.clone();
+        let recents = persist::existing_recent_projects(&self.ui_state);
+        let has_recent_entries = !self.ui_state.recent_projects.is_empty();
+        let current = self.project_path.clone();
         self.popup(ctx, anchor, BarMenu::File, p, action, |ui, action| {
             if menu_row(ui, "Open project…", None, p).clicked() {
                 *action = Some(MenuAction::OpenProject);
             }
+            let recent = menu_row_padded(ui, "Open recent", None, 18.0, p);
+            submenu_arrow(ui.painter(), recent.rect, p);
+            recent_submenu(
+                ui.ctx(),
+                recent.rect,
+                recent.hovered(),
+                &recents,
+                has_recent_entries,
+                &current,
+                p,
+                action,
+            );
+            menu_sep(ui, p);
             if menu_row(ui, "Save project", None, p).clicked() {
                 *action = Some(MenuAction::SaveProject);
             }
@@ -960,29 +1068,14 @@ impl ProtocolBenchApp {
                 *action = Some(MenuAction::SaveAsProject);
             }
             menu_sep(ui, p);
-            ui.label(
-                egui::RichText::new("RECENT PROJECTS")
-                    .font(font_ui(10.0))
-                    .color(p.muted),
-            );
-            ui.add_space(2.0);
-            if recent.is_empty() {
-                let _ = menu_row(ui, "(none yet)", None, p);
-            } else {
-                for path in &recent {
-                    let label = persist::recent_project_label(path);
-                    let resp = menu_row(ui, &label, None, p);
-                    resp.clone().on_hover_text(path);
-                    if resp.clicked() {
-                        *action = Some(MenuAction::OpenRecent(PathBuf::from(path)));
-                    }
-                }
-            }
-            menu_sep(ui, p);
             if menu_row(ui, "Quit", None, p).clicked() {
                 *action = Some(MenuAction::Quit);
             }
         });
+        // Choosing anything closes the menu, so the submenu must not reopen on the next visit.
+        if action.is_some() {
+            ctx.data_mut(|d| d.insert_temp(recent_open_key(), false));
+        }
     }
 
     fn view_menu(
@@ -1678,6 +1771,8 @@ impl ProtocolBenchApp {
                 &mut self.streams,
                 &mut self.las,
                 &mut self.snmp,
+                &mut self.modbus,
+                &mut self.files,
                 &mut self.points,
                 &mut self.traffic,
                 &mut self.project_settings,
@@ -2033,15 +2128,112 @@ fn menu_frame(p: &ThemePalette) -> egui::Frame {
         .inner_margin(egui::Margin::same(6.0))
 }
 
+/// True when both paths name the same file (symlinks / relative paths resolved).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+fn recent_open_key() -> Id {
+    Id::new("pb_file_recent_open")
+}
+
+/// Small right-pointing triangle marking a row that opens a submenu.
+fn submenu_arrow(painter: &egui::Painter, row: Rect, p: &ThemePalette) {
+    let c = Pos2::new(row.max.x - 12.0, row.center().y);
+    let pts = vec![
+        Pos2::new(c.x - 2.5, c.y - 4.0),
+        Pos2::new(c.x + 2.5, c.y),
+        Pos2::new(c.x - 2.5, c.y + 4.0),
+    ];
+    painter.add(egui::Shape::convex_polygon(pts, p.muted, Stroke::NONE));
+}
+
+/// Hover submenu listing recent projects, opened to the right of its parent row. It stays open
+/// while the pointer is over either the parent row or the submenu itself.
+#[allow(clippy::too_many_arguments)]
+fn recent_submenu(
+    ctx: &egui::Context,
+    row: Rect,
+    row_hovered: bool,
+    recents: &[PathBuf],
+    has_entries: bool,
+    current: &Path,
+    p: &ThemePalette,
+    action: &mut Option<MenuAction>,
+) {
+    let was_open = ctx.data(|d| d.get_temp::<bool>(recent_open_key())).unwrap_or(false);
+    if !row_hovered && !was_open {
+        return;
+    }
+    let pointer = ctx.input(|i| i.pointer.hover_pos());
+    let inner = egui::Area::new(Id::new("pb_menu_file_recent"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(Pos2::new(row.max.x + 4.0, row.min.y - 8.0))
+        .interactable(true)
+        .show(ctx, |ui| {
+            menu_frame(p).show(ui, |ui| {
+                if recents.is_empty() {
+                    let _ = menu_row(ui, "(no recent projects)", None, p);
+                }
+                // Two projects can share a file name (e.g. two folders each holding project.json):
+                // show the full path for those so the entries can be told apart.
+                let stem_of = |path: &Path| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("project")
+                        .to_string()
+                };
+                for path in recents {
+                    let stem = stem_of(path);
+                    let clashes = recents.iter().filter(|other| stem_of(other) == stem).count() > 1;
+                    let name = if clashes {
+                        format!("{stem} — {}", path.parent().map_or(String::new(), |d| d.display().to_string()))
+                    } else {
+                        stem
+                    };
+                    let is_current = same_file(path, current);
+                    let resp = menu_row(ui, &name, is_current.then_some(true), p);
+                    resp.clone().on_hover_text(path.display().to_string());
+                    if resp.clicked() && !is_current {
+                        *action = Some(MenuAction::OpenRecent(path.clone()));
+                    }
+                }
+                if has_entries {
+                    menu_sep(ui, p);
+                    if menu_row(ui, "Clear recent projects", None, p).clicked() {
+                        *action = Some(MenuAction::ClearRecent);
+                    }
+                }
+            });
+        });
+    let over_sub = pointer.is_some_and(|pos| inner.response.rect.contains(pos));
+    let open = row_hovered || (was_open && over_sub);
+    ctx.data_mut(|d| d.insert_temp(recent_open_key(), open));
+}
+
 fn menu_row(
     ui: &mut egui::Ui,
     label: &str,
     check: Option<bool>,
     p: &ThemePalette,
 ) -> egui::Response {
+    menu_row_padded(ui, label, check, 0.0, p)
+}
+
+/// A row with `extra_right` px kept free on the right (room for a submenu arrow).
+fn menu_row_padded(
+    ui: &mut egui::Ui,
+    label: &str,
+    check: Option<bool>,
+    extra_right: f32,
+    p: &ThemePalette,
+) -> egui::Response {
     // Content-sized rows — File/View were hard-coded too wide (PB-101).
     let text_x = if check.is_some() { 32.0 } else { 12.0 };
-    let pad_right = 14.0;
+    let pad_right = 14.0 + extra_right;
     let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font_ui(13.0), p.text));
     let width = (text_x + galley.size().x + pad_right).max(96.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());

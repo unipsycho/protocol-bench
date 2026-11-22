@@ -5,6 +5,8 @@
 //! sequential decimal, e.g. `mqtt_1`). Numbers are never reused within a
 //! project. The long wire address (broker/topic/field) lives in `source`.
 
+pub mod addr;
+
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,6 +21,7 @@ pub enum PointValue {
 }
 
 impl PointValue {
+    /// Value as shown in the Points table: plain text, no quoting; bytes show only their length.
     pub fn as_display(&self) -> String {
         match self {
             Self::Bool(v) => v.to_string(),
@@ -39,6 +42,7 @@ pub enum Quality {
 }
 
 impl Quality {
+    /// Display label for the quality (`good` / `bad` / `uncertain`).
     pub fn label(self) -> &'static str {
         match self {
             Self::Good => "good",
@@ -47,6 +51,7 @@ impl Quality {
         }
     }
 
+    /// Map a `PB_QUALITY_*` code; unknown codes become `Uncertain`.
     pub fn from_abi(code: i32) -> Self {
         match code {
             0 => Self::Good,
@@ -55,6 +60,7 @@ impl Quality {
         }
     }
 
+    /// Map back to a `PB_QUALITY_*` code.
     pub fn to_abi(self) -> i32 {
         match self {
             Self::Good => 0,
@@ -107,6 +113,7 @@ impl Default for PointStore {
 }
 
 impl PointStore {
+    /// Empty store. Sequence numbers start at 1.
     pub fn new() -> Self {
         Self::default()
     }
@@ -245,14 +252,17 @@ impl PointStore {
         }
     }
 
+    /// Short id bound to a source address, if any.
     pub fn id_for_source(&self, source: &str) -> Option<&str> {
         self.ids_by_source.get(source).map(|s| s.as_str())
     }
 
+    /// Source address bound to a short id, if any.
     pub fn source_for_id(&self, id: &str) -> Option<&str> {
         self.sources_by_id.get(id).map(|s| s.as_str())
     }
 
+    /// All id ↔ source pairs, for saving in the project file (`points[]`).
     pub fn export_bindings(&self) -> Vec<PointBinding> {
         self.sources_by_id
             .iter()
@@ -263,6 +273,7 @@ impl PointStore {
             .collect()
     }
 
+    /// Re-establish saved id ↔ source pairs on project load (see [`PointStore::bind`]).
     pub fn import_bindings(&mut self, bindings: &[PointBinding]) {
         for b in bindings {
             self.bind(&b.id, &b.source);
@@ -281,26 +292,32 @@ impl PointStore {
         }
     }
 
+    /// Point by short id (or whatever name it was upserted under).
     pub fn get(&self, name: &str) -> Option<&Point> {
         self.points.get(name)
     }
 
+    /// Drop a point row. Its id stays reserved — numbers are never reused.
     pub fn remove(&mut self, name: &str) -> Option<Point> {
         self.points.remove(name)
     }
 
+    /// Number of point rows (including placeholder rows created by `bind`).
     pub fn len(&self) -> usize {
         self.points.len()
     }
 
+    /// True when there are no point rows.
     pub fn is_empty(&self) -> bool {
         self.points.is_empty()
     }
 
+    /// Points in id order.
     pub fn iter(&self) -> impl Iterator<Item = &Point> {
         self.points.values()
     }
 
+    /// Owned copy of every point (what the IPC `snapshot` call sends to the UI).
     pub fn snapshot(&self) -> Vec<Point> {
         self.points.values().cloned().collect()
     }
@@ -380,7 +397,8 @@ fn parse_seq_suffix(id: &str) -> Option<u64> {
     suffix.parse().ok()
 }
 
-fn now_ms() -> u64 {
+/// Milliseconds since the Unix epoch (0 if the clock is before it).
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

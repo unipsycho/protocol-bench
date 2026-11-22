@@ -93,51 +93,37 @@ impl Default for LayoutNode {
 }
 
 impl LayoutNode {
-    /// Opening arrangement: hubs across the top, then project on the left and links to the right.
+    /// Opening arrangement: hubs across the top; project, points and mappings as tabs on the left;
+    /// every protocol pane as tabs in the middle; traffic on the right. Users can still drag tabs out.
     pub fn default_tree() -> Self {
+        fn tabs(panes: &[DockPane]) -> LayoutNode {
+            LayoutNode::Leaf(TabGroup {
+                tabs: panes.to_vec(),
+                active: 0,
+            })
+        }
         split(
             SplitDir::Col,
-            0.34,
+            0.42,
             leaf(DockPane::Hubs),
             split(
                 SplitDir::Row,
-                0.26,
-                split(
-                    SplitDir::Col,
-                    0.46,
-                    leaf(DockPane::Project),
-                    split(
-                        SplitDir::Col,
-                        0.50,
-                        leaf(DockPane::Points),
-                        leaf(DockPane::Mappings),
-                    ),
-                ),
+                0.30,
+                tabs(&[DockPane::Project, DockPane::Points, DockPane::Mappings]),
                 split(
                     SplitDir::Row,
-                    0.60,
-                    split(
-                        SplitDir::Col,
-                        0.50,
-                        split(
-                            SplitDir::Row,
-                            0.50,
-                            leaf(DockPane::Modbus),
-                            leaf(DockPane::Mqtt),
-                        ),
-                        split(
-                            SplitDir::Row,
-                            0.50,
-                            leaf(DockPane::OpcUa),
-                            leaf(DockPane::Streams),
-                        ),
-                    ),
-                    split(
-                        SplitDir::Col,
-                        0.58,
-                        leaf(DockPane::Traffic),
-                        leaf(DockPane::Files),
-                    ),
+                    0.76,
+                    tabs(&[
+                        DockPane::Streams,
+                        DockPane::Mqtt,
+                        DockPane::Http,
+                        DockPane::Modbus,
+                        DockPane::OpcUa,
+                        DockPane::Files,
+                        DockPane::Las,
+                        DockPane::Snmp,
+                    ]),
+                    leaf(DockPane::Traffic),
                 ),
             ),
         )
@@ -589,9 +575,24 @@ mod tests {
         }
     }
 
+    /// Plain split layout for the tab-movement tests (independent of the opening arrangement).
+    fn tab_test_tree() -> LayoutNode {
+        split(
+            SplitDir::Row,
+            0.5,
+            leaf(DockPane::Project),
+            split(
+                SplitDir::Row,
+                0.5,
+                leaf(DockPane::Modbus),
+                split(SplitDir::Col, 0.5, leaf(DockPane::Files), leaf(DockPane::Traffic)),
+            ),
+        )
+    }
+
     #[test]
     fn tab_onto_joins_an_area_and_selects_the_new_tab() {
-        let mut tree = LayoutNode::default_tree();
+        let mut tree = tab_test_tree();
         assert!(tree.tab_onto(DockPane::Files, DockPane::Project));
         let group = tree.group_of(DockPane::Project).expect("project area");
         assert_eq!(group.tabs, vec![DockPane::Project, DockPane::Files]);
@@ -608,7 +609,7 @@ mod tests {
 
     #[test]
     fn moving_a_tab_leaves_the_rest_of_the_strip() {
-        let mut tree = LayoutNode::default_tree();
+        let mut tree = tab_test_tree();
         assert!(tree.tab_onto(DockPane::Files, DockPane::Project));
         assert!(tree.tab_onto(DockPane::Traffic, DockPane::Project));
         assert!(tree.tab_onto(DockPane::Files, DockPane::Modbus));
@@ -621,7 +622,7 @@ mod tests {
 
     #[test]
     fn edge_dock_keeps_a_tab_group_together() {
-        let mut tree = LayoutNode::default_tree();
+        let mut tree = tab_test_tree();
         assert!(tree.tab_onto(DockPane::Files, DockPane::Project));
         assert!(tree.dock_into(DockPane::Modbus, DockPane::Project, TileEdge::South));
         let group = tree.group_of(DockPane::Project).expect("project area");
@@ -632,7 +633,7 @@ mod tests {
 
     #[test]
     fn pulling_one_tab_out_by_an_edge_leaves_the_others() {
-        let mut tree = LayoutNode::default_tree();
+        let mut tree = tab_test_tree();
         assert!(tree.tab_onto(DockPane::Files, DockPane::Project));
         assert!(tree.tab_onto(DockPane::Traffic, DockPane::Project));
         assert!(tree.dock_into(DockPane::Files, DockPane::Project, TileEdge::East));
@@ -653,7 +654,7 @@ mod tests {
 
     #[test]
     fn hidden_tab_drops_out_of_the_strip_only() {
-        let mut tree = LayoutNode::default_tree();
+        let mut tree = tab_test_tree();
         assert!(tree.tab_onto(DockPane::Files, DockPane::Project));
         let shown = tree
             .without_hidden(&[DockPane::Files])

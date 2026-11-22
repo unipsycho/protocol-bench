@@ -48,6 +48,7 @@ impl RemoteHandle {
         Ok(handle)
     }
 
+    /// Connect to an explicit endpoint (tests; normal code uses [`RemoteHandle::connect`]).
     pub fn connect_to(ep: &IpcEndpoint, token: &str) -> Result<Self, String> {
         let handle = Self::disconnected();
         handle.connect_stream(ep, token)?;
@@ -67,6 +68,7 @@ impl RemoteHandle {
         let stream = TcpStream::connect_timeout(&sock, CONNECT_TIMEOUT).map_err(|e| {
             format!("cannot connect to Protocol Bench service at {addr}: {e}")
         })?;
+        stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
         stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
         {
@@ -84,9 +86,8 @@ impl RemoteHandle {
             })
             .unwrap_or(serde_json::Value::Null),
         )
-        .map_err(|e| {
+        .inspect_err(|_e| {
             let _ = self.clear_stream();
-            e
         })?;
         Ok(())
     }
@@ -143,10 +144,12 @@ impl RemoteHandle {
         }
     }
 
+    /// Round-trip check; `Err` when the service is unreachable.
     pub fn ping(&self) -> Result<(), String> {
         self.call(METHOD_PING, serde_json::Value::Null).map(|_| ())
     }
 
+    /// Service status (uptime, packs, hub state). Caches it for [`RemoteHandle::status_or_reconnect`].
     pub fn status(&self) -> Result<ServiceStatus, String> {
         let v = self.call(METHOD_STATUS, serde_json::Value::Null)?;
         let st: ServiceStatus = serde_json::from_value(v).map_err(|e| e.to_string())?;
@@ -156,6 +159,7 @@ impl RemoteHandle {
         Ok(st)
     }
 
+    /// Current host snapshot. Never fails: an unreachable service yields an empty snapshot so the UI keeps painting.
     pub fn snapshot(&self) -> HostSnapshot {
         match self.call(METHOD_SNAPSHOT, serde_json::Value::Null) {
             Ok(v) => serde_json::from_value(v).unwrap_or_else(|_| empty_snap()),
@@ -163,6 +167,7 @@ impl RemoteHandle {
         }
     }
 
+    /// Send an engine command (Configure / Connect / Publish …). Fire-and-forget: errors surface in the next snapshot.
     pub fn submit(&self, id: EngineId, command: EngineCommand) {
         let _ = self.call(
             METHOD_SUBMIT,
@@ -174,6 +179,7 @@ impl RemoteHandle {
         );
     }
 
+    /// Replace the calculation set the service evaluates.
     pub fn set_calcs(&self, next: Vec<CalcConfig>) {
         let _ = self.call(
             METHOD_SET_CALCS,
@@ -182,6 +188,7 @@ impl RemoteHandle {
         );
     }
 
+    /// Replace the aggregator set the service evaluates.
     pub fn set_aggs(&self, next: Vec<AggConfig>) {
         let _ = self.call(
             METHOD_SET_AGGS,
@@ -189,22 +196,27 @@ impl RemoteHandle {
         );
     }
 
+    /// Local mirror of the service point store (refreshed from snapshots).
     pub fn points(&self) -> Arc<Mutex<PointStore>> {
         Arc::clone(&self.points)
     }
 
+    /// Local mirror of calculation runtime state.
     pub fn calc_runtime(&self) -> Arc<Mutex<CalcRuntime>> {
         Arc::clone(&self.calc_rt)
     }
 
+    /// Local mirror of aggregator runtime state.
     pub fn agg_runtime(&self) -> Arc<Mutex<AggRuntime>> {
         Arc::clone(&self.agg_rt)
     }
 
+    /// The service's current project document.
     pub fn get_project_json(&self) -> Result<serde_json::Value, String> {
         self.call(METHOD_GET_PROJECT, serde_json::Value::Null)
     }
 
+    /// Replace the service project. The service applies it (reconfigures every pack) and, when `path` is given, saves it there.
     pub fn put_project_json(
         &self,
         project: serde_json::Value,
@@ -223,6 +235,7 @@ impl RemoteHandle {
         .map(|_| ())
     }
 
+    /// Ask the service to load a project file from its own disk and apply it.
     pub fn open_project(&self, path: &str, auto_run_hubs: bool) -> Result<(), String> {
         self.call(
             METHOD_OPEN_PROJECT,
@@ -235,6 +248,7 @@ impl RemoteHandle {
         .map(|_| ())
     }
 
+    /// Seed the service point store with saved short-id bindings and the next sequence number.
     pub fn import_bindings(
         &self,
         points: Vec<PointBindingWire>,

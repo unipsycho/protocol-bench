@@ -20,35 +20,42 @@ impl Default for IpcEndpoint {
     }
 }
 
+/// Per-user config folder shared by the UI and the service (`~/.config/ProtocolBench` style). Tests redirect it with `XDG_CONFIG_HOME`.
 pub fn config_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("ca", "AgileAutomation", "ProtocolBench")
         .map(|d| d.config_dir().to_path_buf())
 }
 
+/// `ipc.json` — where the running service publishes its localhost port. Not a project file: never save over it.
 pub fn endpoint_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("ipc.json"))
 }
 
+/// `ipc.token` — shared secret the UI sends in `hello`. Not a project file.
 pub fn token_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("ipc.token"))
 }
 
+/// Project the service opens when `PB_PROJECT` is not set.
 pub fn default_project_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("project.json"))
 }
 
+/// Read the service endpoint (host + port).
 pub fn read_endpoint() -> Result<IpcEndpoint, String> {
     let path = endpoint_path().ok_or_else(|| "no config dir".to_string())?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
+/// Read the shared auth token.
 pub fn read_token() -> Result<String, String> {
     let path = token_path().ok_or_else(|| "no config dir".to_string())?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     Ok(text.trim().to_string())
 }
 
+/// Publish the endpoint. Called by the service once it is listening; the port changes on every start.
 pub fn write_endpoint(ep: &IpcEndpoint) -> Result<(), String> {
     let dir = config_dir().ok_or_else(|| "no config dir".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -57,6 +64,7 @@ pub fn write_endpoint(ep: &IpcEndpoint) -> Result<(), String> {
     std::fs::write(&path, text).map_err(|e| e.to_string())
 }
 
+/// Persist the auth token.
 pub fn write_token(token: &str) -> Result<(), String> {
     let dir = config_dir().ok_or_else(|| "no config dir".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;

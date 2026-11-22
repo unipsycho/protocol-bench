@@ -10,20 +10,16 @@ mod session;
 use broker::EmbeddedBroker;
 
 pub use json_path::{
-    extract_path_value, migrate_point_id, point_id_for_client_field, point_id_for_client_topic,
+    migrate_point_id, point_id_for_client_field, point_id_for_client_topic,
     split_point_id, topic_matches,
 };
 
-use pb_abi::{
-    write_cstr, PbHostApi, PbPackApi, PB_ABI_VERSION, PB_LOG_ERROR, PB_LOG_INFO, PB_QUALITY_BAD,
-    PB_QUALITY_GOOD, PB_VALUE_BYTES, PB_VALUE_STRING,
-};
+use pb_abi::{HostRef, Pack, PB_LOG_ERROR, PB_LOG_INFO, PB_QUALITY_BAD, PB_QUALITY_GOOD, PB_VALUE_BYTES, PB_VALUE_STRING};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use session::{MqttSession, SessionEvent, TransportKind};
 use std::collections::BTreeMap;
-use std::ffi::CStr;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::c_int;
 use std::sync::mpsc::TryRecvError;
 
 const PACK_ID: &[u8] = b"mqtt\0";
@@ -213,7 +209,7 @@ impl ClientRuntime {
 }
 
 struct PackState {
-    host: PbHostApi,
+    host: HostRef,
     clients: BTreeMap<String, ClientRuntime>,
     /// Embedded hub broker (at most one).
     embedded: Option<EmbeddedBroker>,
@@ -221,7 +217,7 @@ struct PackState {
 }
 
 impl PackState {
-    fn new(host: PbHostApi) -> Self {
+    fn new(host: HostRef) -> Self {
         Self {
             host,
             clients: BTreeMap::new(),
@@ -231,68 +227,17 @@ impl PackState {
     }
 
     fn log(&self, level: i32, msg: &str) {
-        if let Some(log) = self.host.log_message {
-            if let Ok(c) = std::ffi::CString::new(msg) {
-                unsafe { log(self.host.ctx, level, c.as_ptr()) };
-            }
-        }
+        self.host.log(level, msg);
     }
 
     /// Upsert a host point. `name` is a short id or long address; `source` is
     /// protocol (`mqtt`) when `name` is an address, or the address when `name` is short.
     fn upsert_string(&self, name: &str, source: &str, value: &str, good: bool) {
-        let Some(upsert) = self.host.upsert_point else {
-            return;
-        };
-        let Ok(c_name) = std::ffi::CString::new(name) else {
-            return;
-        };
-        let Ok(c_src) = std::ffi::CString::new(source) else {
-            return;
-        };
-        let bytes = value.as_bytes();
-        unsafe {
-            upsert(
-                self.host.ctx,
-                c_name.as_ptr(),
-                PB_VALUE_STRING,
-                bytes.as_ptr() as *const c_void,
-                bytes.len(),
-                if good {
-                    PB_QUALITY_GOOD
-                } else {
-                    PB_QUALITY_BAD
-                },
-                c_src.as_ptr(),
-            );
-        }
+        self.host.upsert_text(name, source, value, quality(good));
     }
 
     fn upsert_bytes(&self, name: &str, source: &str, value: &[u8], good: bool) {
-        let Some(upsert) = self.host.upsert_point else {
-            return;
-        };
-        let Ok(c_name) = std::ffi::CString::new(name) else {
-            return;
-        };
-        let Ok(c_src) = std::ffi::CString::new(source) else {
-            return;
-        };
-        unsafe {
-            upsert(
-                self.host.ctx,
-                c_name.as_ptr(),
-                PB_VALUE_BYTES,
-                value.as_ptr() as *const c_void,
-                value.len(),
-                if good {
-                    PB_QUALITY_GOOD
-                } else {
-                    PB_QUALITY_BAD
-                },
-                c_src.as_ptr(),
-            );
-        }
+        self.host.upsert(name, source, PB_VALUE_BYTES, value, quality(good));
     }
 
     fn stop_client(rt: &mut ClientRuntime) {
@@ -407,7 +352,7 @@ impl PackState {
                     let Some(text) = text.as_deref() else {
                         continue;
                     };
-                    if let Some(value) = extract_path_value(text, path) {
+                    if let Some(value) = pb_json::extract_text(text, path) {
                         let field_addr = point_id_for_client_field(&conn, &topic, path);
                         if rule.point.trim().is_empty() {
                             self.upsert_string(&field_addr, "mqtt", &value, !bad);
@@ -911,296 +856,152 @@ fn truncate_preview(value: &str, max: usize) -> String {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pb_pack_abi_version() -> u32 {
-    PB_ABI_VERSION
+fn quality(good: bool) -> i32 {
+    if good { PB_QUALITY_GOOD } else { PB_QUALITY_BAD }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pb_pack_register(out: *mut PbPackApi) -> c_int {
-    if out.is_null() {
-        return -1;
-    }
-    *out = PbPackApi {
-        abi_version: PB_ABI_VERSION,
-        id: PACK_ID.as_ptr() as *const c_char,
-        title: PACK_TITLE.as_ptr() as *const c_char,
-        create: Some(create),
-        destroy: Some(destroy),
-        configure: Some(configure),
-        connect: Some(connect),
-        disconnect: Some(disconnect),
-        subscribe: Some(subscribe),
-        publish: Some(publish),
-        write_point: Some(write_point),
-        poll: Some(poll),
-        state_label: Some(state_label),
-        last_error: Some(last_error),
-        is_connected: Some(is_connected),
-        topics_json: Some(topics_json),
-    };
-    0
-}
-
-unsafe extern "C" fn create(host: *const PbHostApi) -> *mut c_void {
-    if host.is_null() {
-        return std::ptr::null_mut();
-    }
-    let host = *host;
-    if host.abi_version != PB_ABI_VERSION {
-        return std::ptr::null_mut();
-    }
-    Box::into_raw(Box::new(PackState::new(host))) as *mut c_void
-}
-
-unsafe extern "C" fn destroy(handle: *mut c_void) {
-    if handle.is_null() {
-        return;
-    }
-    let mut state = Box::from_raw(handle as *mut PackState);
-    state.stop_embedded();
-    for rt in state.clients.values_mut() {
-        PackState::stop_client(rt);
-    }
-}
-
-unsafe extern "C" fn configure(handle: *mut c_void, json: *const c_char, len: usize) -> c_int {
-    if handle.is_null() || json.is_null() {
-        return -1;
-    }
-    let state = &mut *(handle as *mut PackState);
-    let slice = std::slice::from_raw_parts(json as *const u8, len);
-    let text = match std::str::from_utf8(slice) {
-        Ok(t) => t,
-        Err(_) => return -1,
-    };
-    match state.configure_json(text) {
-        Ok(()) => 0,
-        Err(e) => {
-            state.log(PB_LOG_ERROR, &e);
-            -1
+impl PackState {
+    /// Host topics may be `"<client id>\t<topic>"`; a bare topic goes to the first client.
+    fn split_client_topic(&self, raw: &str) -> (String, String) {
+        match raw.split_once('\t') {
+            Some((id, t)) => (id.to_string(), t.to_string()),
+            None => (self.clients.keys().next().cloned().unwrap_or_else(|| "default".into()), raw.to_string()),
         }
     }
 }
 
-/// Connect all clients marked auto_connect (or every client if none flagged).
-unsafe extern "C" fn connect(handle: *mut c_void) -> c_int {
-    if handle.is_null() {
-        return -1;
+impl Pack for PackState {
+    const ID: &'static [u8] = PACK_ID;
+    const TITLE: &'static [u8] = PACK_TITLE;
+    const SUBSCRIBE: bool = true;
+    const PUBLISH: bool = true;
+
+    fn new(host: HostRef) -> Self {
+        PackState::new(host)
     }
-    let state = &mut *(handle as *mut PackState);
-    let ids: Vec<String> = if state.clients.values().any(|c| c.config.auto_connect) {
-        state
+
+    fn configure(&mut self, json: &str) -> Result<(), String> {
+        self.configure_json(json)
+    }
+
+    fn config_failed(&mut self, err: String) {
+        self.log(PB_LOG_ERROR, &err);
+    }
+
+    /// Connect all clients marked auto_connect (or every client if none flagged).
+    fn connect(&mut self) -> c_int {
+        let flagged = self.clients.values().any(|c| c.config.auto_connect);
+        let ids: Vec<String> = self
             .clients
             .iter()
-            .filter(|(_, c)| c.config.auto_connect)
+            .filter(|(_, c)| !flagged || c.config.auto_connect)
             .map(|(id, _)| id.clone())
-            .collect()
-    } else {
-        state.clients.keys().cloned().collect()
-    };
-    let mut ok = true;
-    for id in ids {
-        if let Some(rt) = state.clients.get_mut(&id) {
-            rt.config.auto_connect = true;
-            if let Err(e) = PackState::start_client(rt) {
-                rt.last_error = e;
-                ok = false;
+            .collect();
+        let mut ok = true;
+        for id in ids {
+            if let Some(rt) = self.clients.get_mut(&id) {
+                rt.config.auto_connect = true;
+                if let Err(e) = PackState::start_client(rt) {
+                    rt.last_error = e;
+                    ok = false;
+                }
             }
         }
+        if ok { 0 } else { -1 }
     }
-    if ok {
-        0
-    } else {
-        -1
-    }
-}
 
-unsafe extern "C" fn disconnect(handle: *mut c_void) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &mut *(handle as *mut PackState);
-    for rt in state.clients.values_mut() {
-        rt.config.auto_connect = false;
-        PackState::stop_client(rt);
-    }
-    0
-}
-
-unsafe extern "C" fn subscribe(handle: *mut c_void, topic: *const c_char, qos: u8) -> c_int {
-    if handle.is_null() || topic.is_null() {
-        return -1;
-    }
-    let state = &mut *(handle as *mut PackState);
-    let topic = match CStr::from_ptr(topic).to_str() {
-        Ok(t) => t.to_string(),
-        Err(_) => return -1,
-    };
-    // Optional "client_id\ttopic" encoding from the host.
-    let (client_id, topic) = match topic.split_once('\t') {
-        Some((id, t)) => (id.to_string(), t.to_string()),
-        None => {
-            let id = state
-                .clients
-                .keys()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| "default".into());
-            (id, topic)
+    fn disconnect(&mut self) -> c_int {
+        for rt in self.clients.values_mut() {
+            rt.config.auto_connect = false;
+            PackState::stop_client(rt);
         }
-    };
-    let value = serde_json::json!({
-        "op": "subscribe",
-        "id": client_id,
-        "topic": topic,
-        "qos": qos,
-    });
-    match state.configure_op("subscribe", &value) {
-        Ok(()) => 0,
-        Err(e) => {
-            state.log(PB_LOG_ERROR, &e);
-            -1
-        }
-    }
-}
-
-unsafe extern "C" fn publish(
-    handle: *mut c_void,
-    topic: *const c_char,
-    payload: *const u8,
-    len: usize,
-    qos: u8,
-    retain: c_int,
-) -> c_int {
-    if handle.is_null() || topic.is_null() {
-        return -1;
-    }
-    let state = &mut *(handle as *mut PackState);
-    let topic = match CStr::from_ptr(topic).to_str() {
-        Ok(t) => t.to_string(),
-        Err(_) => return -1,
-    };
-    let (client_id, topic) = match topic.split_once('\t') {
-        Some((id, t)) => (id.to_string(), t.to_string()),
-        None => {
-            let id = state
-                .clients
-                .keys()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| "default".into());
-            (id, topic)
-        }
-    };
-    let bytes = if payload.is_null() || len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(payload, len).to_vec()
-    };
-    let payload_str = String::from_utf8_lossy(&bytes).into_owned();
-    let value = serde_json::json!({
-        "op": "publish",
-        "id": client_id,
-        "topic": topic,
-        "payload": payload_str,
-        "qos": qos,
-        "retain": retain != 0,
-    });
-    match state.configure_op("publish", &value) {
-        Ok(()) => 0,
-        Err(e) => {
-            state.log(PB_LOG_ERROR, &e);
-            -1
-        }
-    }
-}
-
-unsafe extern "C" fn write_point(
-    handle: *mut c_void,
-    name: *const c_char,
-    value_kind: i32,
-    value: *const c_void,
-    value_len: usize,
-) -> c_int {
-    if handle.is_null() || name.is_null() {
-        return -1;
-    }
-    let state = &mut *(handle as *mut PackState);
-    let name = match CStr::from_ptr(name).to_str() {
-        Ok(t) => t,
-        Err(_) => return -1,
-    };
-    let payload: Vec<u8> = match value_kind {
-        PB_VALUE_STRING | PB_VALUE_BYTES => {
-            if value.is_null() {
-                Vec::new()
-            } else {
-                std::slice::from_raw_parts(value as *const u8, value_len).to_vec()
-            }
-        }
-        _ => return -1,
-    };
-    match state.publish_for_point(name, &payload) {
-        Ok(()) => 0,
-        Err(e) => {
-            // Host egress retries until the Output client connects — avoid log spam.
-            if !e.contains("not connected") {
-                state.log(PB_LOG_ERROR, &e);
-            }
-            -1
-        }
-    }
-}
-
-unsafe extern "C" fn poll(handle: *mut c_void) {
-    if handle.is_null() {
-        return;
-    }
-    let state = &mut *(handle as *mut PackState);
-    state.drain();
-}
-
-unsafe extern "C" fn state_label(handle: *mut c_void, out: *mut c_char, out_len: usize) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &*(handle as *mut PackState);
-    write_cstr(out, out_len, &state.aggregate_state())
-}
-
-unsafe extern "C" fn last_error(handle: *mut c_void, out: *mut c_char, out_len: usize) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let state = &*(handle as *mut PackState);
-    write_cstr(out, out_len, &state.aggregate_error())
-}
-
-unsafe extern "C" fn is_connected(handle: *mut c_void) -> c_int {
-    if handle.is_null() {
-        return 0;
-    }
-    let state = &*(handle as *mut PackState);
-    if state.any_connected() {
-        1
-    } else {
         0
     }
+
+    fn shutdown(&mut self) {
+        self.stop_embedded();
+        for rt in self.clients.values_mut() {
+            PackState::stop_client(rt);
+        }
+    }
+
+    fn subscribe(&mut self, topic: &str, qos: u8) -> c_int {
+        let (id, topic) = self.split_client_topic(topic);
+        let value = serde_json::json!({ "op": "subscribe", "id": id, "topic": topic, "qos": qos });
+        match self.configure_op("subscribe", &value) {
+            Ok(()) => 0,
+            Err(e) => {
+                self.log(PB_LOG_ERROR, &e);
+                -1
+            }
+        }
+    }
+
+    fn publish(&mut self, topic: &str, payload: &[u8], qos: u8, retain: bool) -> c_int {
+        let (id, topic) = self.split_client_topic(topic);
+        let value = serde_json::json!({
+            "op": "publish", "id": id, "topic": topic,
+            "payload": String::from_utf8_lossy(payload), "qos": qos, "retain": retain,
+        });
+        match self.configure_op("publish", &value) {
+            Ok(()) => 0,
+            Err(e) => {
+                self.log(PB_LOG_ERROR, &e);
+                -1
+            }
+        }
+    }
+
+    /// Host egress: publish `payload` to the Output bind for point `name` (string / bytes only).
+    fn write_point(&mut self, name: &str, kind: i32, bytes: &[u8]) -> c_int {
+        if !matches!(kind, PB_VALUE_STRING | PB_VALUE_BYTES) {
+            return -1;
+        }
+        match self.publish_for_point(name, bytes) {
+            Ok(()) => 0,
+            Err(e) => {
+                // Host egress retries until the Output client connects — avoid log spam.
+                if !e.contains("not connected") {
+                    self.log(PB_LOG_ERROR, &e);
+                }
+                -1
+            }
+        }
+    }
+
+    fn poll(&mut self) {
+        self.drain();
+    }
+
+    fn state_label(&self) -> String {
+        self.aggregate_state()
+    }
+
+    fn last_error(&self) -> String {
+        self.aggregate_error()
+    }
+
+    fn is_connected(&self) -> bool {
+        self.any_connected()
+    }
+
+    /// Multi-client snapshot (state, observed topics, traffic) the UI parses.
+    fn detail_json(&self) -> String {
+        self.clients_snapshot_json()
+    }
 }
 
-unsafe extern "C" fn topics_json(handle: *mut c_void, out: *mut c_char, out_len: usize) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    // Host/UI reads the multi-client snapshot from this buffer.
-    let state = &*(handle as *mut PackState);
-    write_cstr(out, out_len, &state.clients_snapshot_json())
-}
+pb_abi::export_pack!(PackState);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pb_abi::{PbHostApi, PbPackApi, PB_ABI_VERSION};
+
+    /// Host with no callbacks: upserts and logs are dropped.
+    fn quiet_host() -> HostRef {
+        HostRef::new(PbHostApi { abi_version: PB_ABI_VERSION, ctx: std::ptr::null_mut(), upsert_point: None, log_message: None })
+    }
 
     #[test]
     fn register_fills_api() {
@@ -1226,13 +1027,7 @@ mod tests {
 
     #[test]
     fn traffic_snapshot_includes_observed_topics() {
-        let host = PbHostApi {
-            abi_version: PB_ABI_VERSION,
-            ctx: std::ptr::null_mut(),
-            upsert_point: None,
-            log_message: None,
-        };
-        let mut state = PackState::new(host);
+        let mut state = PackState::new(quiet_host());
         let mut cfg = ClientConfig::default();
         cfg.id = "local".into();
         cfg.subscriptions = vec!["pb/#".into(), "sensor/+/temp".into()];
@@ -1258,13 +1053,7 @@ mod tests {
 
     #[test]
     fn configure_broker_role_auto_starts() {
-        let host = PbHostApi {
-            abi_version: PB_ABI_VERSION,
-            ctx: std::ptr::null_mut(),
-            upsert_point: None,
-            log_message: None,
-        };
-        let mut state = PackState::new(host);
+        let mut state = PackState::new(quiet_host());
         let port = 1895u16;
         let json = format!(
             r#"{{"clients":[{{"id":"hub","role":"broker","auto_start":true,"anonymous":true,"bind":"127.0.0.1","port":{port}}}]}}"#
@@ -1278,13 +1067,7 @@ mod tests {
 
     #[test]
     fn reconcile_empty_ok() {
-        let host = PbHostApi {
-            abi_version: PB_ABI_VERSION,
-            ctx: std::ptr::null_mut(),
-            upsert_point: None,
-            log_message: None,
-        };
-        let mut state = PackState::new(host);
+        let mut state = PackState::new(quiet_host());
         assert!(state.reconcile_clients(Vec::new()).is_ok());
     }
 }

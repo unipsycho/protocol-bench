@@ -72,10 +72,6 @@ impl Default for BrowseTree {
 }
 
 impl BrowseTree {
-    pub fn clear(&mut self) {
-        *self = Self::default();
-    }
-
     pub fn is_empty(&self) -> bool {
         !self.objects.children_loaded && self.objects.children.is_empty()
     }
@@ -195,8 +191,6 @@ fn find_path(node: &BrowseNode, id: &str, path: &mut Vec<String>) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrowseMode {
-    /// Expand / browse only.
-    Preview,
     /// Click a Variable → select NodeId.
     PickNode,
 }

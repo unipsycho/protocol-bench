@@ -37,18 +37,23 @@ pub enum EngineId {
     OpcUa,
     FileFollow,
     Http,
+    Snmp,
+    Las,
 }
 
 impl EngineId {
-    pub const ALL: [EngineId; 6] = [
+    pub const ALL: [EngineId; 8] = [
         EngineId::Streams,
         EngineId::Modbus,
         EngineId::Mqtt,
         EngineId::OpcUa,
         EngineId::FileFollow,
         EngineId::Http,
+        EngineId::Snmp,
+        EngineId::Las,
     ];
 
+    /// Human title for the engine (matches the pack `TITLE`).
     pub fn title(self) -> &'static str {
         match self {
             Self::Streams => "Streams",
@@ -57,6 +62,8 @@ impl EngineId {
             Self::OpcUa => "OPC UA",
             Self::FileFollow => "File follow",
             Self::Http => "HTTP / REST",
+            Self::Snmp => "SNMP",
+            Self::Las => "LAS",
         }
     }
 
@@ -67,7 +74,10 @@ impl EngineId {
             Self::OpcUa => Some("opcua"),
             Self::Streams => Some("streams"),
             Self::Http => Some("http"),
-            Self::Modbus | Self::FileFollow => None,
+            Self::Modbus => Some("modbus"),
+            Self::FileFollow => Some("files"),
+            Self::Snmp => Some("snmp"),
+            Self::Las => Some("las"),
         }
     }
 
@@ -77,7 +87,7 @@ impl EngineId {
             Self::Streams => {
                 "Streams / TCP pack — serial + TCP client/listener text framing (scan / emit)."
             }
-            Self::Modbus => "Owns Modbus RTU and TCP sessions. No session is open in this build.",
+            Self::Modbus => "Modbus pack — TCP / RTU client poll (Input) and typed register writes (Output).",
             Self::Mqtt => {
                 "MQTT client pack (source/output) plus optional embedded rumqttd LAN broker."
             }
@@ -85,9 +95,11 @@ impl EngineId {
                 "OPC UA client pack plus optional embedded UA server hub (async-opcua)."
             }
             Self::FileFollow => {
-                "Owns file tails and CSV / JSON-lines parsers. No file is open in this build."
+                "File follow pack — growing CSV / JSON-lines files to points; byte offset kept across restart and rotation."
             }
             Self::Http => "HTTP / REST pack — outbound client poll (Input) and JSON body push (Output).",
+            Self::Snmp => "SNMP pack — v2c GET poll of agent OIDs (Input).",
+            Self::Las => "LAS pack — follow LAS 2.0 well-log files (Input) and write curve rows (Output).",
         }
     }
 
@@ -127,7 +139,7 @@ mod serde_bytes_vec {
     use serde::de::Error;
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
         // JSON-friendly base64-ish: array of numbers is fine for small payloads.
         s.collect_seq(bytes.iter().copied())
     }
@@ -268,6 +280,7 @@ pub struct HostSnapshot {
 }
 
 impl HostSnapshot {
+    /// Snapshot of one engine slot, if it is loaded.
     pub fn slot(&self, id: EngineId) -> Option<&SlotSnapshot> {
         self.slots.iter().find(|slot| slot.id == id)
     }
@@ -576,7 +589,17 @@ fn host_main(
             .find(|e| e.id() == EngineId::Http)
             .map(|e| e.snapshot().connected)
             .unwrap_or(false);
-        let any_egress = mqtt_connected || streams_connected || http_connected;
+        let modbus_connected = engines
+            .iter()
+            .find(|e| e.id() == EngineId::Modbus)
+            .map(|e| e.snapshot().connected)
+            .unwrap_or(false);
+        let las_connected = engines
+            .iter()
+            .find(|e| e.id() == EngineId::Las)
+            .map(|e| e.snapshot().connected)
+            .unwrap_or(false);
+        let any_egress = mqtt_connected || streams_connected || http_connected || modbus_connected || las_connected;
         if any_egress {
             let force_all = !mqtt_was_connected;
             mqtt_was_connected = true;
@@ -594,11 +617,13 @@ fn host_main(
                     continue;
                 }
                 let mut ok = false;
-                for id in [EngineId::Mqtt, EngineId::Streams, EngineId::Http] {
+                for id in [EngineId::Mqtt, EngineId::Streams, EngineId::Http, EngineId::Modbus, EngineId::Las] {
                     let connected = match id {
                         EngineId::Mqtt => mqtt_connected,
                         EngineId::Streams => streams_connected,
                         EngineId::Http => http_connected,
+                        EngineId::Modbus => modbus_connected,
+                        EngineId::Las => las_connected,
                         _ => false,
                     };
                     if !connected {
