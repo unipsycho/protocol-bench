@@ -121,7 +121,6 @@ pub struct OpcUaClient {
     pub subscription_interval_ms: u64,
     pub auto_connect: bool,
     pub draft_node_id: String,
-    pub draft_point: String,
 }
 
 impl OpcUaClient {
@@ -140,7 +139,6 @@ impl OpcUaClient {
             subscription_interval_ms: default_interval(),
             auto_connect: false,
             draft_node_id: String::new(),
-            draft_point: String::new(),
         }
     }
 }
@@ -322,22 +320,47 @@ fn client_configure_json(c: &OpcUaClient, hubs: &HubModel) -> serde_json::Value 
     })
 }
 
-/// Push host point snapshots so the embedded server can expose them.
-pub fn sync_points_to_server(engine: &EngineHandle, host: &HostSnapshot) {
-    let points: Vec<serde_json::Value> = host
-        .points
-        .iter()
-        .take(2000)
-        .map(|p| {
-            serde_json::json!({
-                "id": p.name,
-                "value": p.value,
-            })
-        })
-        .collect();
+/// Build the address-space snapshot: hub catalog rows (public names), then — if any
+/// OPC UA hub allows it — the remaining host points under their internal ids.
+/// With no OPC UA hub at all, every host point is exposed (previous behaviour).
+pub fn catalog_points(host: &HostSnapshot, hubs: &HubModel) -> Vec<serde_json::Value> {
+    use crate::hubs::HubProto;
+    let ua: Vec<_> = hubs.hubs.iter().filter(|h| h.protocol == HubProto::OpcUa).collect();
+    let expose_unmapped = ua.is_empty() || ua.iter().any(|h| h.opcua_expose_unmapped);
+    let mut out = Vec::new();
+    let mut used = std::collections::HashSet::new();
+    for hub in &ua {
+        for e in &hub.opcua_catalog {
+            if e.point.is_empty() || e.browse_name.trim().is_empty() || used.contains(&e.point) {
+                continue;
+            }
+            let Some(pt) = host.points.iter().find(|p| p.name == e.point) else { continue };
+            used.insert(e.point.clone());
+            out.push(serde_json::json!({
+                "id": pt.name,
+                "value": pt.value,
+                "browse_name": e.browse_name.trim(),
+                "display_name": "",
+                "folder": e.norm_path(),
+            }));
+        }
+    }
+    if expose_unmapped {
+        for p in &host.points {
+            if !used.contains(&p.name) {
+                out.push(serde_json::json!({ "id": p.name, "value": p.value }));
+            }
+        }
+    }
+    out.truncate(2000);
+    out
+}
+
+/// Push the catalog-aware snapshot so the embedded server can expose it.
+pub fn sync_points_to_server(engine: &EngineHandle, host: &HostSnapshot, hubs: &HubModel) {
     let json = serde_json::json!({
         "op": "sync_points",
-        "points": points,
+        "points": catalog_points(host, hubs),
     })
     .to_string();
     engine.submit(EngineId::OpcUa, EngineCommand::Configure { json });
@@ -365,7 +388,7 @@ pub fn paint(
     state.ensure_clients();
     state.sync_from_host(host);
     if state.server_running {
-        sync_points_to_server(engine, host);
+        sync_points_to_server(engine, host, hubs);
     }
     let full = ui.available_rect_before_wrap();
     let inner = form_inset(full);
@@ -417,7 +440,7 @@ fn paint_body(
             apply_form_spacing(ui);
             ui.label(
                 egui::RichText::new(
-                    "Protocol Bench listens as an OPC UA server and exposes all host points under Objects/Points.",
+                    "Protocol Bench listens as an OPC UA server and exposes the points named by the OPC UA hub catalog under Objects/Points.",
                 )
                 .font(font_ui(12.0))
                 .color(p.muted),
@@ -570,7 +593,7 @@ fn edit_embedded(
     ui.add_space(space::AFTER_HEADING);
     ui.label(
         egui::RichText::new(
-            "Protocol Bench listens as an OPC UA server and exposes all host points under Objects/Points.",
+            "Protocol Bench listens as an OPC UA server and exposes the points named by the OPC UA hub catalog under Objects/Points.",
         )
         .font(font_ui(12.0))
         .color(p.muted),
@@ -686,6 +709,16 @@ fn start_embedded(engine: &EngineHandle, state: &mut OpcUaPanelState) {
     .to_string();
     engine.submit(EngineId::OpcUa, EngineCommand::Configure { json });
     state.server_status = "Starting…".into();
+}
+
+/// Project-panel Start / Stop for the embedded OPC UA server.
+pub fn set_hub_running(engine: &EngineHandle, state: &mut OpcUaPanelState, run: bool) {
+    if run {
+        state.embedded.enabled = true;
+        start_embedded(engine, state);
+    } else {
+        stop_embedded(engine, state);
+    }
 }
 
 fn stop_embedded(engine: &EngineHandle, state: &mut OpcUaPanelState) {
@@ -1058,4 +1091,56 @@ fn secondary_btn(ui: &mut egui::Ui, label: &str, p: &ThemePalette) -> egui::Resp
             .fill(p.control)
             .stroke(egui::Stroke::new(1.0, p.line)),
     )
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use crate::hubs::{HubModel, HubProto, OpcUaCatalogEntry};
+    use pb_engine::{HostSnapshot, PointSnapshot};
+
+    fn host() -> HostSnapshot {
+        let points = [("mqtt_1", "5"), ("mqtt_2", "6")]
+            .iter()
+            .map(|(n, v)| PointSnapshot {
+                name: (*n).into(),
+                value: (*v).into(),
+                quality: "good".into(),
+                source: String::new(),
+                updated_ms: 0,
+            })
+            .collect::<Vec<_>>();
+        HostSnapshot {
+            thread_name: String::new(),
+            alive: true,
+            ticks: 0,
+            uptime_ms: 0,
+            slots: vec![],
+            modules_dir: String::new(),
+            packs_loaded: vec![],
+            point_count: points.len(),
+            points,
+        }
+    }
+
+    #[test]
+    fn catalog_renames_and_optionally_dumps_rest() {
+        let mut hubs = HubModel::default();
+        hubs.add_hub();
+        let id = hubs.hubs[0].id;
+        hubs.set_hub_protocol(id, HubProto::OpcUa);
+        hubs.hubs[0].opcua_catalog.push(OpcUaCatalogEntry {
+            point: "mqtt_1".into(),
+            path: "/WellA/Tank1/".into(),
+            browse_name: "Level".into(),
+            display_name: String::new(),
+        });
+        let pts = catalog_points(&host(), &hubs);
+        assert_eq!(pts.len(), 2);
+        assert_eq!(pts[0]["browse_name"], "Level");
+        assert_eq!(pts[0]["folder"], "WellA/Tank1");
+        assert_eq!(pts[1]["id"], "mqtt_2");
+        hubs.hubs[0].opcua_expose_unmapped = false;
+        assert_eq!(catalog_points(&host(), &hubs).len(), 1);
+    }
 }

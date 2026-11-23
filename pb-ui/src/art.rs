@@ -875,3 +875,76 @@ fn hero_las(painter: &Painter, r: Rect) {
         pill(painter, n(r, 0.82, 0.68), "~A", Proto::SAGE);
     }
 }
+
+/// Round warning badge: tinted disc, ring and an exclamation mark. Discs stay smooth at any
+/// scale (a triangle's thin strokes alias at small sizes).
+pub fn paint_warning_badge(painter: &Painter, rect: Rect, color: Color32) {
+    let side = rect.width().min(rect.height());
+    let c = rect.center();
+    let r = side * 0.5 - 1.0;
+    painter.circle_filled(c, r, tint(color, 38));
+    painter.circle_stroke(c, r, Stroke::new((side * 0.05).clamp(1.2, 2.0), color));
+    let w = (side * 0.09).clamp(2.0, 3.4);
+    let top = Pos2::new(c.x, c.y - side * 0.22);
+    let bot = Pos2::new(c.x, c.y + side * 0.06);
+    painter.line_segment([top, bot], Stroke::new(w, color));
+    painter.circle_filled(Pos2::new(c.x, c.y + side * 0.23), w * 0.62, color);
+}
+
+/// Small round Start / Stop control (▶ / ■). `running` shows Stop. Returns the response so the
+/// caller can read `clicked()`; disabled controls draw muted and never click.
+pub fn run_button(
+    ui: &mut egui::Ui,
+    running: bool,
+    enabled: bool,
+    tip: &str,
+    p: &ThemePalette,
+    size: f32,
+) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), sense);
+    let ink = if !enabled {
+        tint(p.muted, 120)
+    } else if running {
+        p.err
+    } else {
+        p.live
+    };
+    let hot = enabled && resp.hovered();
+    let painter = ui.painter();
+    painter.circle_filled(rect.center(), size * 0.5, tint(ink, if hot { 60 } else { 28 }));
+    painter.circle_stroke(
+        rect.center(),
+        size * 0.5 - 0.5,
+        Stroke::new(1.0, tint(ink, if hot { 220 } else { 150 })),
+    );
+    let c = rect.center();
+    let g = size * 0.21;
+    if running {
+        painter.rect_filled(
+            Rect::from_center_size(c, Vec2::splat(g * 1.7)),
+            Rounding::same(1.5),
+            ink,
+        );
+    } else {
+        // Optical centre: nudge the triangle right by a sliver.
+        let cx = c.x + g * 0.15;
+        painter.add(Shape::convex_polygon(
+            vec![
+                Pos2::new(cx - g * 0.8, c.y - g * 1.05),
+                Pos2::new(cx - g * 0.8, c.y + g * 1.05),
+                Pos2::new(cx + g * 1.1, c.y),
+            ],
+            ink,
+            Stroke::NONE,
+        ));
+    }
+    if enabled {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(tip)
+}

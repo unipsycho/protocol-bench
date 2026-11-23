@@ -11,7 +11,7 @@ use pb_ipc::{
     ensure_token, read_json, write_endpoint, write_json, HelloParams, ImportBindingsParams,
     OpenProjectParams, PutProjectParams, Request, Response, SetAggsParams, SetCalcsParams,
     SubmitParams, IpcEndpoint, METHOD_GET_PROJECT, METHOD_HELLO, METHOD_IMPORT_BINDINGS,
-    METHOD_OPEN_PROJECT, METHOD_PING, METHOD_PUT_PROJECT, METHOD_SET_AGGS, METHOD_SET_CALCS,
+    METHOD_OPEN_PROJECT, METHOD_PING, METHOD_STOP_ALL, METHOD_PUT_PROJECT, METHOD_SET_AGGS, METHOD_SET_CALCS,
     METHOD_SNAPSHOT, METHOD_STATUS, METHOD_SUBMIT,
 };
 
@@ -101,6 +101,10 @@ fn dispatch(
 
     match req.method.as_str() {
         METHOD_PING => Response::ok(id, serde_json::json!({ "pong": true })),
+        METHOD_STOP_ALL => {
+            rt.stop_all_hubs();
+            Response::ok(id, serde_json::json!({ "ok": true }))
+        }
         METHOD_STATUS => match serde_json::to_value(rt.status()) {
             Ok(v) => Response::ok(id, v),
             Err(e) => Response::err(id, e.to_string()),
@@ -160,6 +164,8 @@ fn dispatch(
             } else {
                 PathBuf::from(params.path)
             };
+            // Switching projects: stop what the old one started before the new one configures.
+            rt.stop_all_hubs();
             match rt.load_project_file(&path, params.auto_run_hubs) {
                 Ok(()) => Response::ok(
                     id,

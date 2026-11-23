@@ -73,6 +73,42 @@ impl Runtime {
         st
     }
 
+    /// Stop every embedded hub, client and endpoint the current project started.
+    ///
+    /// Each pack reconciles against an empty config (clients/endpoints/sources removed and
+    /// stopped); the embedded MQTT broker and OPC UA server need an explicit stop because
+    /// `Configure` never stops them. Commands queue per pack, so a following `Configure`
+    /// for the next project runs after the stop.
+    pub fn stop_all_hubs(&mut self) {
+        let empty = serde_json::json!({});
+        let configs = [
+            (EngineId::Mqtt, build_mqtt_configure(&empty, None, false)),
+            (EngineId::OpcUa, serde_json::json!({ "clients": [] }).to_string()),
+            (EngineId::Streams, build_streams_configure(&empty, None, false)),
+            (EngineId::Http, build_http_configure(&empty, None)),
+            (EngineId::Modbus, build_modbus_configure(&empty, None)),
+            (EngineId::FileFollow, build_files_configure(&empty, None, None)),
+            (EngineId::Snmp, build_snmp_configure(&empty, None)),
+            (EngineId::Las, build_las_configure(&empty, None, None)),
+        ];
+        for (id, json) in configs {
+            self.engine
+                .submit(id, pb_engine::EngineCommand::Configure { json });
+        }
+        self.engine.submit(
+            EngineId::Mqtt,
+            pb_engine::EngineCommand::Configure {
+                json: serde_json::json!({ "op": "broker_stop" }).to_string(),
+            },
+        );
+        self.engine.submit(
+            EngineId::OpcUa,
+            pb_engine::EngineCommand::Configure {
+                json: serde_json::json!({ "op": "server_stop" }).to_string(),
+            },
+        );
+    }
+
     /// Read, apply and remember a project file. `auto_run_hubs` starts embedded brokers / servers.
     pub fn load_project_file(&mut self, path: &Path, auto_run_hubs: bool) -> Result<(), String> {
         self.project_path = path.to_path_buf();
@@ -1307,5 +1343,17 @@ mod modbus_tests {
         let mut store = PointStore::default();
         materialize_hub_binds_json(&value, &mut store);
         assert_eq!(store.id_for_source("modbus/plc::holding:0:f32:cdab"), Some("modbus_1"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_all_hubs_on_empty_engine_is_safe() {
+        let mut rt = Runtime::start(None, std::env::temp_dir().join("pb-none.json"));
+        rt.stop_all_hubs();
+        assert!(rt.status().running_hubs().is_empty());
     }
 }

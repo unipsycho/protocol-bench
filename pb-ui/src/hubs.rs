@@ -601,6 +601,54 @@ pub struct Hub {
     /// Modbus hub: id of the Server connection (Modbus panel) this hub listens on.
     #[serde(default)]
     pub modbus_server: String,
+    /// OPC UA hub: also publish host points that have no catalog row (internal names).
+    #[serde(default = "default_true")]
+    pub opcua_expose_unmapped: bool,
+    /// OPC UA hub: public address space (host point -> UA names / folder).
+    #[serde(default)]
+    pub opcua_catalog: Vec<OpcUaCatalogEntry>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// One row of an OPC UA hub's public tag catalog. NodeId stays the host point id.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OpcUaCatalogEntry {
+    pub point: String,
+    #[serde(default)]
+    pub path: String,
+    pub browse_name: String,
+    #[serde(default)]
+    pub display_name: String,
+}
+
+impl OpcUaCatalogEntry {
+    pub fn norm_path(&self) -> String {
+        self.path
+            .split('/')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+    /// `WellA/Tank1/Level` as shown in Mappings.
+    pub fn full_path(&self) -> String {
+        let f = self.norm_path();
+        if f.is_empty() { self.browse_name.clone() } else { format!("{f}/{}", self.browse_name) }
+    }
+}
+
+impl Hub {
+    /// Browse-name collision check within a folder; `skip` ignores one row.
+    pub fn catalog_conflict(&self, e: &OpcUaCatalogEntry, skip: Option<usize>) -> bool {
+        self.opcua_catalog.iter().enumerate().any(|(i, o)| {
+            Some(i) != skip
+                && (o.point == e.point
+                    || (o.norm_path() == e.norm_path() && o.browse_name == e.browse_name))
+        })
+    }
 }
 
 impl Hub {
@@ -830,6 +878,8 @@ impl HubModel {
                     calculations: vec![],
                     at: None,
                     modbus_server: "hub".into(),
+                    opcua_expose_unmapped: true,
+                    opcua_catalog: vec![],
                 },
                 Hub {
                     id: 6,
@@ -854,6 +904,8 @@ impl HubModel {
                     calculations: vec![],
                     at: None,
                     modbus_server: String::new(),
+                    opcua_expose_unmapped: true,
+                    opcua_catalog: vec![],
                 },
             ],
         }
@@ -1184,6 +1236,8 @@ impl HubModel {
             calculations: vec![],
             at: None,
             modbus_server: String::new(),
+            opcua_expose_unmapped: true,
+            opcua_catalog: vec![],
         });
         self.focus_hub(id);
     }
@@ -4571,7 +4625,7 @@ fn edit_opcua_input_binds(
     }
     ui.add_space(space::AFTER_FIELD);
     let draft_id = egui::Id::new(("pb_opcua_draft", port_id));
-    let (mut draft_node, mut draft_point): (String, String) =
+    let (draft_node, draft_point): (String, String) =
         ui.ctx().data_mut(|d| d.get_temp(draft_id).unwrap_or_default());
     let mut add_bind = false;
     let mut draft = (draft_node, draft_point);
@@ -6485,6 +6539,150 @@ fn edit_modbus_hub_server(ui: &mut Ui, model: &mut HubModel, hub_id: u64, host: 
     change
 }
 
+/// Live value for display: at most three decimal places.
+fn short_value(v: &str) -> String {
+    if v.contains(['.', 'e', 'E']) {
+        if let Ok(f) = v.trim().parse::<f64>() {
+            return format!("{f:.3}");
+        }
+    }
+    v.to_string()
+}
+
+/// Text box that edits a draft while focused and writes the value back only on
+/// Enter / focus loss, so half-typed text never reaches the live address space.
+fn commit_text(ui: &mut Ui, key: (u64, &str, &str), value: &mut String, hint: &str, width: f32, p: &ThemePalette) -> bool {
+    let id = egui::Id::new(("pb_commit_text", key.0, key.1, key.2));
+    let mut draft = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| value.clone());
+    let r = ui.add_sized(
+        [width, 22.0],
+        egui::TextEdit::singleline(&mut draft)
+            .hint_text(egui::RichText::new(hint).italics().color(p.muted.gamma_multiply(0.55))),
+    );
+    if r.lost_focus() {
+        ui.data_mut(|d| d.remove::<String>(id));
+        if draft != *value {
+            *value = draft;
+            return true;
+        }
+    } else if r.has_focus() || r.changed() {
+        ui.data_mut(|d| d.insert_temp(id, draft));
+    } else {
+        ui.data_mut(|d| d.remove::<String>(id));
+    }
+    false
+}
+
+/// OPC UA hub: public address space. NodeId stays the host point id; only names/folders change.
+fn edit_opcua_catalog(ui: &mut Ui, model: &mut HubModel, hub_id: u64, host: &HostSnapshot, p: &ThemePalette) -> HubChange {
+    let mut change = HubChange::quiet();
+    ui.label(egui::RichText::new("OPC UA CATALOG").font(font_ui(10.5)).color(p.muted));
+    ui.add_space(space::AFTER_HEADING);
+    let Some(hub) = model.hub_mut(hub_id) else { return change };
+    if ui
+        .checkbox(&mut hub.opcua_expose_unmapped, "Expose unmapped points (internal names)")
+        .changed()
+    {
+        change.dirty = true;
+    }
+    // Display name always follows the browse name (clients show both).
+    let avail = ui.available_width();
+    let mut remove = None;
+    let mut warn = Vec::new();
+    if !hub.opcua_catalog.is_empty() {
+        let bad: Vec<bool> = (0..hub.opcua_catalog.len())
+            .map(|i| {
+                let e = hub.opcua_catalog[i].clone();
+                hub.catalog_conflict(&e, Some(i)) || e.browse_name.trim().is_empty()
+            })
+            .collect();
+        let lives: Vec<String> = hub
+            .opcua_catalog
+            .iter()
+            .map(|e| {
+                host.points
+                    .iter()
+                    .find(|pt| pt.name == e.point)
+                    .map(|pt| pt.value.clone())
+                    .unwrap_or_else(|| "—".into())
+            })
+            .collect();
+        let gap = space::ITEM_X;
+        let (w_point, w_value, w_x) = (90.0, 64.0, 24.0);
+        let field_w = ((avail - w_point - w_value - w_x - gap * 4.0) / 2.0).max(60.0);
+        let cell = |ui: &mut Ui, w: f32, t: &str| {
+            ui.add_sized(
+                [w, 14.0],
+                egui::Label::new(egui::RichText::new(t).font(font_ui(10.5)).color(p.muted)).truncate(),
+            );
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            cell(ui, w_point, "Point");
+            cell(ui, field_w, "Folder (optional)");
+            cell(ui, field_w, "Display name");
+            cell(ui, w_value, "Value");
+        });
+        for i in 0..hub.opcua_catalog.len() {
+            let e = &mut hub.opcua_catalog[i];
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.add_sized(
+                    [w_point, 22.0],
+                    egui::Label::new(egui::RichText::new(&e.point).font(font_ui(12.0)).color(p.text)).truncate(),
+                );
+                change.dirty |= commit_text(ui, (hub_id, &e.point, "path"), &mut e.path, "WellA/Tank1", field_w, p);
+                change.dirty |= commit_text(ui, (hub_id, &e.point, "browse_name"), &mut e.browse_name, "Level", field_w, p);
+                ui.add_sized(
+                    [w_value, 22.0],
+                    egui::Label::new(egui::RichText::new(short_value(&lives[i])).font(font_ui(11.0)).color(p.muted)).truncate(),
+                );
+                if text_button(ui, "×", false, p).clicked() {
+                    remove = Some(i);
+                }
+            });
+            if bad[i] {
+                warn.push(e.point.clone());
+            }
+        }
+    }
+    for pt in warn {
+        ui.label(
+            egui::RichText::new(format!("{pt}: name is empty or duplicates another row in its folder."))
+                .font(font_ui(11.0))
+                .color(p.muted),
+        );
+    }
+    if let Some(i) = remove {
+        hub.opcua_catalog.remove(i);
+        change.dirty = true;
+    }
+    // Point picker: host points not yet in the catalog.
+    let taken: std::collections::HashSet<String> = hub.opcua_catalog.iter().map(|e| e.point.clone()).collect();
+    let mut add: Option<String> = None;
+    egui::ComboBox::from_id_salt(("pb_hub_opcua_add", hub_id))
+        .selected_text("Add point…")
+        .width(ui.available_width().min(280.0).max(140.0))
+        .show_ui(ui, |ui| {
+            for pt in host.points.iter().filter(|pt| !taken.contains(&pt.name)) {
+                if ui.selectable_label(false, &pt.name).clicked() {
+                    add = Some(pt.name.clone());
+                }
+            }
+        });
+    if let Some(point) = add {
+        let mut entry = OpcUaCatalogEntry { browse_name: point.clone(), point, ..Default::default() };
+        let mut n = 1;
+        while hub.catalog_conflict(&entry, None) && n < 1000 {
+            n += 1;
+            entry.browse_name = format!("{}_{n}", entry.point);
+        }
+        hub.opcua_catalog.push(entry);
+        change.dirty = true;
+    }
+    change
+}
+
 fn conn_combo(
     ui: &mut Ui,
     salt: (&str, u64),
@@ -7465,6 +7663,10 @@ fn edit_hub(ui: &mut Ui, model: &mut HubModel, p: &ThemePalette, host: &HostSnap
     if model.hub(id).is_some_and(|h| h.protocol == HubProto::Modbus) {
         ui.add_space(8.0);
         change = change.join(edit_modbus_hub_server(ui, model, id, host, p));
+    }
+    if model.hub(id).is_some_and(|h| h.protocol == HubProto::OpcUa) {
+        ui.add_space(8.0);
+        change = change.join(edit_opcua_catalog(ui, model, id, host, p));
     }
     ui.add_space(10.0);
     if port_section(ui, model, id, true, p) {

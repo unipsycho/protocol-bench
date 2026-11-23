@@ -19,3 +19,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ctrlc = { workspace = true }
 directories = { workspace = true }
+
+# Status-area tray (StatusNotifierItem over D-Bus; no GTK). Linux only for now.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", default-features = false, features = ["blocking", "tokio"] }

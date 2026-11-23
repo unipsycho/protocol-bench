@@ -52,6 +52,38 @@ pub struct ServiceStatus {
     pub slots: Vec<SlotStatus>,
 }
 
+impl ServiceStatus {
+    /// Human-readable list of what is live right now (hubs listening, clients/endpoints up).
+    /// Drives the "this will stop" confirmations and the service tray tooltip.
+    pub fn running_hubs(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.mqtt_hub_running {
+            out.push("MQTT broker (embedded hub)".to_string());
+        }
+        if self.opcua_hub_running {
+            out.push("OPC UA server (embedded hub)".to_string());
+        }
+        for s in &self.slots {
+            if !s.pack_loaded || !s.connected {
+                continue;
+            }
+            let name = match s.id.as_str() {
+                "mqtt" => "MQTT",
+                "opcua" => "OPC UA",
+                "streams" => "Streams / TCP",
+                "modbus" => "Modbus",
+                "filefollow" => "File follow",
+                "http" => "HTTP / REST",
+                "snmp" => "SNMP",
+                "las" => "LAS",
+                other => other,
+            };
+            out.push(format!("{name}: {}", s.state));
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlotStatus {
     pub id: String,
@@ -127,6 +159,8 @@ pub const METHOD_PUT_PROJECT: &str = "put_project";
 pub const METHOD_OPEN_PROJECT: &str = "open_project";
 pub const METHOD_IMPORT_BINDINGS: &str = "import_bindings";
 pub const METHOD_PING: &str = "ping";
+/// Stop every embedded hub and disconnect every client (project file is left as is).
+pub const METHOD_STOP_ALL: &str = "stop_all";
 
 /// Rebuild a wire snapshot for clients (engine HostSnapshot is authoritative).
 pub fn status_from_host(host: &HostSnapshot, project_path: &str, last_error: &str) -> ServiceStatus {
@@ -160,5 +194,45 @@ pub fn status_from_host(host: &HostSnapshot, project_path: &str, last_error: &st
                 last_error: s.last_error.clone(),
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod running_hubs_tests {
+    use super::*;
+
+    fn status(mqtt: bool, opc: bool, slots: Vec<SlotStatus>) -> ServiceStatus {
+        ServiceStatus {
+            connected_ok: true,
+            project_path: String::new(),
+            packs_loaded: vec![],
+            mqtt_hub_running: mqtt,
+            opcua_hub_running: opc,
+            point_count: 0,
+            uptime_ms: 0,
+            last_error: String::new(),
+            slots,
+        }
+    }
+
+    #[test]
+    fn idle_service_lists_nothing() {
+        assert!(status(false, false, vec![]).running_hubs().is_empty());
+    }
+
+    #[test]
+    fn lists_hubs_and_connected_slots_only() {
+        let slot = |id: &str, connected: bool| SlotStatus {
+            id: id.into(),
+            state: "up".into(),
+            connected,
+            pack_loaded: true,
+            last_error: String::new(),
+        };
+        let got = status(true, true, vec![slot("modbus", true), slot("snmp", false)]).running_hubs();
+        assert_eq!(got.len(), 3);
+        assert!(got[0].contains("MQTT broker"));
+        assert!(got[1].contains("OPC UA server"));
+        assert!(got[2].starts_with("Modbus"));
     }
 }

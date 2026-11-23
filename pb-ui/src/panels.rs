@@ -7,7 +7,7 @@ use pb_engine::HostSnapshot;
 
 use crate::art;
 use crate::dock::DockPane;
-use crate::hubs::HubModel;
+use crate::hubs::{HubModel, HubProto};
 use crate::http_panel::{self, HttpPanelState};
 use crate::las_panel::{self, LasPanelState};
 use crate::mqtt_panel::{self, MqttPanelState};
@@ -55,7 +55,9 @@ pub fn paint(
     project_path: &std::path::Path,
 ) -> crate::hubs::HubChange {
     match pane {
-        DockPane::Project => project_panel(ui, hubs, mqtt, opcua, host, settings, project_path, p),
+        DockPane::Project => {
+            project_panel(ui, hubs, engine, mqtt, opcua, host, settings, project_path, p)
+        }
         DockPane::Hubs => {
             // Sync trees so Input inspector can pick topics from live traffic.
             mqtt.sync_trees_from_host(host);
@@ -438,11 +440,13 @@ fn empty_message(pane: DockPane) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn project_panel(
     ui: &mut egui::Ui,
-    hubs: &HubModel,
-    mqtt: &MqttPanelState,
-    opcua: &OpcUaPanelState,
+    hubs: &mut HubModel,
+    engine: &EngineHandle,
+    mqtt: &mut MqttPanelState,
+    opcua: &mut OpcUaPanelState,
     host: &HostSnapshot,
     settings: &mut ProjectSettings,
     project_path: &std::path::Path,
@@ -525,7 +529,34 @@ fn project_panel(
                             .color(p.muted),
                     );
                     ui.add_space(space::AFTER_HEADING);
-                    summary_row(ui, hubs, host.point_count, p);
+                    let has_mqtt = hubs.hubs.iter().any(|h| h.protocol == HubProto::Mqtt)
+                        || mqtt.embedded.enabled;
+                    let has_opcua = hubs.hubs.iter().any(|h| h.protocol == HubProto::OpcUa)
+                        || opcua.embedded.enabled;
+                    let any_running = mqtt.broker_running || opcua.server_running;
+                    let run_ctl = RunCtl {
+                        running: any_running,
+                        enabled: has_mqtt || has_opcua,
+                    };
+                    if summary_row(ui, hubs, host.point_count, run_ctl, p) {
+                        // Running → stop everything live; stopped → start each hub the project has.
+                        if any_running {
+                            if mqtt.broker_running {
+                                mqtt_panel::set_hub_running(engine, mqtt, hubs, false);
+                            }
+                            if opcua.server_running {
+                                opcua_panel::set_hub_running(engine, opcua, false);
+                            }
+                        } else {
+                            if has_mqtt {
+                                mqtt_panel::set_hub_running(engine, mqtt, hubs, true);
+                            }
+                            if has_opcua {
+                                opcua_panel::set_hub_running(engine, opcua, true);
+                            }
+                        }
+                        change.dirty = true;
+                    }
                     ui.add_space(space::AFTER_FIELD);
                     running_hubs_line(ui, mqtt, opcua, p);
                     ui.add_space(space::AFTER_BLURB);
@@ -555,13 +586,37 @@ fn project_panel(
                     // Compact accordion stack (PB-94): override form ITEM_Y between sections.
                     let prev_y = ui.spacing().item_spacing.y;
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    list_section(
+                    let toggles: Vec<Option<bool>> = hubs
+                        .hubs
+                        .iter()
+                        .map(|h| match h.protocol {
+                            HubProto::Mqtt => Some(mqtt.broker_running),
+                            HubProto::OpcUa => Some(opcua.server_running),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(i) = list_section_with(
                         ui,
                         "Hubs",
                         &hub_names(hubs),
                         DockPane::Hubs.ink(p.is_light),
                         p,
-                    );
+                        &toggles,
+                    ) {
+                        match hubs.hubs[i].protocol {
+                            HubProto::Mqtt => {
+                                let run = !mqtt.broker_running;
+                                mqtt_panel::set_hub_running(engine, mqtt, hubs, run);
+                                change.dirty = true;
+                            }
+                            HubProto::OpcUa => {
+                                let run = !opcua.server_running;
+                                opcua_panel::set_hub_running(engine, opcua, run);
+                                change.dirty = true;
+                            }
+                            _ => {}
+                        }
+                    }
                     list_section(
                         ui,
                         "Inputs",
@@ -628,18 +683,41 @@ fn running_hubs_line(
     );
 }
 
-fn summary_row(ui: &mut egui::Ui, hubs: &HubModel, points: usize, p: &ThemePalette) {
+/// State of the HUBS tile's Start / Stop control.
+#[derive(Clone, Copy)]
+struct RunCtl {
+    running: bool,
+    enabled: bool,
+}
+
+/// Returns true when the HUBS tile's Start / Stop control was clicked.
+fn summary_row(
+    ui: &mut egui::Ui,
+    hubs: &HubModel,
+    points: usize,
+    run: RunCtl,
+    p: &ThemePalette,
+) -> bool {
+    let mut clicked = false;
     let gap = space::CHIP;
     let cols = 3.0;
     let width = ((ui.available_width() - gap * (cols - 1.0)) / cols).max(48.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
-        stat_tile(
+        let tip = if !run.enabled {
+            "No embedded MQTT / OPC UA hubs in this project"
+        } else if run.running {
+            "Stop running hubs"
+        } else {
+            "Start hubs"
+        };
+        clicked = stat_tile_action(
             ui,
             width,
             "HUBS",
             &hubs.hubs.len().to_string(),
             DockPane::Hubs.ink(p.is_light),
+            Some((run, tip)),
             p,
         );
         stat_tile(
@@ -687,6 +765,7 @@ fn summary_row(ui: &mut egui::Ui, hubs: &HubModel, points: usize, p: &ThemePalet
             p,
         );
     });
+    clicked
 }
 
 fn hub_names(hubs: &HubModel) -> Vec<String> {
@@ -763,6 +842,19 @@ fn stat_tile(
     ink: Color32,
     p: &ThemePalette,
 ) {
+    stat_tile_action(ui, width, label, value, ink, None, p);
+}
+
+/// Stat tile with an optional Start / Stop control in the top-right corner.
+fn stat_tile_action(
+    ui: &mut egui::Ui,
+    width: f32,
+    label: &str,
+    value: &str,
+    ink: Color32,
+    action: Option<(RunCtl, &str)>,
+    p: &ThemePalette,
+) -> bool {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 54.0), Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, Rounding::same(6.0), p.control);
@@ -791,9 +883,33 @@ fn stat_tile(
         font_ui(10.0),
         p.muted,
     );
+    let Some((ctl, tip)) = action else {
+        return false;
+    };
+    let size = 22.0;
+    let btn = Rect::from_min_size(
+        Pos2::new(rect.max.x - size - 8.0, rect.min.y + 9.0),
+        Vec2::splat(size),
+    );
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(btn));
+    art::run_button(&mut child, ctl.running, ctl.enabled, tip, p, size).clicked()
 }
 
 fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, p: &ThemePalette) {
+    list_section_with(ui, title, names, ink, p, &[]);
+}
+
+/// Accordion list; `toggles[i] = Some(running)` adds a Start / Stop control to row `i`.
+/// Returns the index of the row whose control was clicked.
+fn list_section_with(
+    ui: &mut egui::Ui,
+    title: &str,
+    names: &[String],
+    ink: Color32,
+    p: &ThemePalette,
+    toggles: &[Option<bool>],
+) -> Option<usize> {
+    let mut clicked_row = None;
     // Accordion inventory — default collapsed so the diagram stays the source of truth (PB-58).
     // Compact header + rows (PB-94).
     let id = ui.make_persistent_id(("pb_project_list", title));
@@ -831,7 +947,7 @@ fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, 
     }
     state.store(ui.ctx());
     if !state.is_open() {
-        return;
+        return None;
     }
     if names.is_empty() {
         ui.label(
@@ -839,19 +955,34 @@ fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, 
                 .font(font_ui(11.5))
                 .color(p.muted),
         );
-        return;
+        return None;
     }
     let row_y = ui.spacing().item_spacing.y;
     ui.spacing_mut().item_spacing.y = 1.0;
-    for name in names {
+    for (i, name) in names.iter().enumerate() {
         let width = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
+        let toggle = toggles.get(i).copied().flatten();
+        let row_h = if toggle.is_some() { 22.0 } else { 18.0 };
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::hover());
         ui.painter()
             .circle_filled(Pos2::new(rect.min.x + 10.0, rect.center().y), 2.75, ink);
+        let reserve = if toggle.is_some() { 28.0 } else { 6.0 };
         let clip = Rect::from_min_max(
             Pos2::new(rect.min.x + 20.0, rect.min.y),
-            Pos2::new(rect.max.x - 6.0, rect.max.y),
+            Pos2::new(rect.max.x - reserve, rect.max.y),
         );
+        if let Some(running) = toggle {
+            let size = 18.0;
+            let btn = Rect::from_center_size(
+                Pos2::new(rect.max.x - size * 0.5 - 4.0, rect.center().y),
+                Vec2::splat(size),
+            );
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(btn));
+            let tip = if running { "Stop this hub" } else { "Start this hub" };
+            if art::run_button(&mut child, running, true, tip, p, size).clicked() {
+                clicked_row = Some(i);
+            }
+        }
         ui.painter().with_clip_rect(clip).text(
             Pos2::new(clip.min.x, rect.center().y),
             Align2::LEFT_CENTER,
@@ -861,6 +992,7 @@ fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, 
         );
     }
     ui.spacing_mut().item_spacing.y = row_y;
+    clicked_row
 }
 
 pub fn format_uptime(ms: u64) -> String {

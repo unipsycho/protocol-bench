@@ -454,7 +454,13 @@ impl PackState {
                     .map(|arr| {
                         arr.iter()
                             .filter_map(|p| {
+                                let text = |k: &str| {
+                                    p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+                                };
                                 Some(PointSnap {
+                                    browse_name: text("browse_name"),
+                                    display_name: text("display_name"),
+                                    folder: text("folder"),
                                     id: p.get("id")?.as_str()?.to_string(),
                                     value: p
                                         .get("value")

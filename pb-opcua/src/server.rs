@@ -21,6 +21,32 @@ const POINTS_NS_URI: &str = "urn:protocol-bench:points";
 pub struct PointSnap {
     pub id: String,
     pub value: String,
+    /// Public BrowseName; empty means the point id.
+    pub browse_name: String,
+    /// Public DisplayName; empty means the browse name.
+    pub display_name: String,
+    /// Folder path under `Points` (`WellA/Tank1`); empty = directly under `Points`.
+    pub folder: String,
+}
+
+impl PointSnap {
+    fn browse(&self) -> &str {
+        if self.browse_name.is_empty() { &self.id } else { &self.browse_name }
+    }
+    fn display(&self) -> &str {
+        if self.display_name.is_empty() { self.browse() } else { &self.display_name }
+    }
+    fn folder_path(&self) -> String {
+        self.folder
+            .split('/')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+    fn signature(&self) -> (String, String, String) {
+        (self.browse().to_string(), self.display().to_string(), self.folder_path())
+    }
 }
 
 struct LiveServer {
@@ -28,7 +54,8 @@ struct LiveServer {
     manager: Arc<InMemoryNodeManager<SimpleNodeManagerImpl>>,
     ns: u16,
     folder: NodeId,
-    nodes: HashMap<String, NodeId>,
+    nodes: HashMap<String, (NodeId, (String, String, String))>,
+    folders: HashMap<String, NodeId>,
 }
 
 /// Embedded UA server running on its own OS thread.
@@ -160,22 +187,39 @@ impl EmbeddedServer {
         let address_space = live.manager.address_space();
         {
             let mut space = address_space.write();
-            for p in points {
-                if live.nodes.contains_key(&p.id) {
-                    continue;
+            // Drop nodes whose point left the snapshot, then folders nothing lives in.
+            let current: std::collections::HashSet<&str> = points.iter().map(|p| p.id.as_str()).collect();
+            let gone: Vec<String> = live.nodes.keys().filter(|k| !current.contains(k.as_str())).cloned().collect();
+            for k in gone {
+                if let Some((nid, _)) = live.nodes.remove(&k) {
+                    space.delete(&nid, true);
                 }
+            }
+            for p in points {
+                let sig = p.signature();
+                if let Some((nid, old)) = live.nodes.get(&p.id) {
+                    if *old == sig {
+                        continue;
+                    }
+                    // Catalog edit: NodeId is stable, so drop and re-add under the new names.
+                    let nid = nid.clone();
+                    space.delete(&nid, true);
+                    live.nodes.remove(&p.id);
+                }
+                let parent = ensure_folders(&mut space, live.ns, &live.folder, &mut live.folders, &sig.2);
                 let nid = NodeId::new(live.ns, p.id.as_str());
                 let _ = space.add_variables(
-                    vec![Variable::new(&nid, &p.id, &p.id, UAString::from(p.value.as_str()))],
-                    &live.folder,
+                    vec![Variable::new(&nid, &sig.0, &sig.1, UAString::from(p.value.as_str()))],
+                    &parent,
                 );
-                live.nodes.insert(p.id.clone(), nid);
+                live.nodes.insert(p.id.clone(), (nid, sig));
             }
+            prune_folders(&mut space, &live.nodes, &mut live.folders);
         }
         let updates: Vec<_> = points
             .iter()
             .filter_map(|p| {
-                let nid = live.nodes.get(&p.id)?;
+                let (nid, _) = live.nodes.get(&p.id)?;
                 Some((
                     nid,
                     None,
@@ -225,6 +269,59 @@ pub struct EmbeddedServerConfig {
     pub auto_generate_cert: bool,
     pub auto_trust_clients: bool,
     pub pki_dir: String,
+}
+
+/// Delete cached folders that no live point sits in (or under), deepest first.
+fn prune_folders(
+    space: &mut opcua::server::address_space::AddressSpace,
+    nodes: &HashMap<String, (NodeId, (String, String, String))>,
+    folders: &mut HashMap<String, NodeId>,
+) {
+    let mut needed = std::collections::HashSet::new();
+    for (_, sig) in nodes.values() {
+        let mut acc = String::new();
+        for seg in sig.2.split('/').filter(|s| !s.is_empty()) {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(seg);
+            needed.insert(acc.clone());
+        }
+    }
+    let mut stale: Vec<String> = folders.keys().filter(|k| !needed.contains(*k)).cloned().collect();
+    stale.sort_by_key(|k| std::cmp::Reverse(k.matches('/').count()));
+    for k in stale {
+        if let Some(id) = folders.remove(&k) {
+            space.delete(&id, true);
+        }
+    }
+}
+
+/// Create any missing folder nodes along `path` (under `root`); returns the leaf folder.
+fn ensure_folders(
+    space: &mut opcua::server::address_space::AddressSpace,
+    ns: u16,
+    root: &NodeId,
+    cache: &mut HashMap<String, NodeId>,
+    path: &str,
+) -> NodeId {
+    let mut parent = root.clone();
+    let mut acc = String::new();
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(seg);
+        if let Some(id) = cache.get(&acc) {
+            parent = id.clone();
+            continue;
+        }
+        let id = NodeId::new(ns, format!("Points/{acc}"));
+        space.add_folder(&id, seg, seg, &parent);
+        cache.insert(acc.clone(), id.clone());
+        parent = id;
+    }
+    parent
 }
 
 async fn run_server(
@@ -316,6 +413,7 @@ async fn run_server(
             ns,
             folder,
             nodes: HashMap::new(),
+            folders: HashMap::new(),
         });
     }
 

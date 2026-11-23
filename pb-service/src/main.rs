@@ -6,11 +6,14 @@
 //!   PB_MODULES=./modules cargo run -p pb-service
 //!   PB_IPC_PORT=7500 PB_MODULES=./modules cargo run -p pb-service
 //!
+//! A status-area tray icon (Linux) shows the active project and which hubs are live; see `tray`.
+//!
 //! Endpoint/token: `…/ProtocolBench/ipc.json` + `ipc.token`
 //! Windows Service entry is scaffolded under `windows_service` (follows Linux IPC).
 
 mod runtime;
 mod server;
+mod tray;
 
 #[cfg(windows)]
 mod windows_service_host;
@@ -74,5 +77,6 @@ pub(crate) fn run_foreground() -> Result<(), String> {
         }
     });
 
+    tray::spawn(Arc::clone(&runtime));
     server::serve(runtime, port)
 }

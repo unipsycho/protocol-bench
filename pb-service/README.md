@@ -21,4 +21,16 @@ Ship shape is a true Windows Service (`--windows-service` entry scaffolded). Ful
 
 ## IPC
 
-Length-prefixed JSON (`u32` LE + body). Methods: `hello`, `ping`, `status`, `snapshot`, `submit`, `set_calcs`, `set_aggs`, `get_project`, `put_project`, `open_project`, `import_bindings`.
+Length-prefixed JSON (`u32` LE + body). Methods: `hello`, `ping`, `status`, `snapshot`, `submit`, `set_calcs`, `set_aggs`, `get_project`, `put_project`, `open_project`, `stop_all`, `import_bindings`.
+
+`open_project` stops every embedded hub and client the previous project started before the new project's config is applied. `stop_all` does the same without loading anything (project file untouched); the UI's "Stop all and quit" and the tray's "Stop all hubs" use it.
+
+## Project lifecycle
+
+- The service holds one active project. A starting UI **attaches** to it (`status.project_path` + `get_project`) instead of re-opening the default, so what is running is what you see. A service with nothing live is asked to open the project so auto-run still applies.
+- Closing the UI leaves everything running. The UI warns on quit (window close, Alt+F4 or File > Quit) when hubs are live and offers **Quit, keep running**, **Stop all and quit** or **Stay**.
+- Switching projects in the UI lists what will stop and asks first.
+
+## Tray (Linux)
+
+A StatusNotifierItem (D-Bus, no GTK) shows the Protocol Bench mark with a green dot when hubs are live and grey when idle. Tooltip and menu list the project and each live hub; the menu has **Stop all hubs** and **Quit service**. Other platforms run without a tray for now.

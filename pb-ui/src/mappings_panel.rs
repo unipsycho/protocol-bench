@@ -58,6 +58,26 @@ fn output_routes(port: &HubPort) -> Vec<(String, String)> {
 pub fn rows(hubs: &HubModel, host: &HostSnapshot) -> Vec<MappingRow> {
     let mut rows = Vec::new();
     for hub in &hubs.hubs {
+        if hub.protocol == HubProto::OpcUa {
+            for e in &hub.opcua_catalog {
+                if e.point.trim().is_empty() || e.browse_name.trim().is_empty() {
+                    continue;
+                }
+                let from = host
+                    .points
+                    .iter()
+                    .find(|p| p.name == e.point)
+                    .map(|p| p.source.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "—".into());
+                rows.push(MappingRow {
+                    point: e.point.clone(),
+                    from,
+                    to: format!("opcua/hub/{}", e.full_path()),
+                    hub: hub.name.clone(),
+                });
+            }
+        }
         for port in &hub.outputs {
             for (point, to) in output_routes(port) {
                 if point.trim().is_empty() {

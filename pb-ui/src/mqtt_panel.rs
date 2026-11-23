@@ -1075,6 +1075,20 @@ fn stop_embedded_broker(
     apply_mqtt_session(engine, state, hubs)
 }
 
+/// Project-panel Start / Stop for the embedded broker.
+pub fn set_hub_running(
+    engine: &EngineHandle,
+    state: &mut MqttPanelState,
+    hubs: &mut HubModel,
+    run: bool,
+) -> bool {
+    if run {
+        start_embedded_broker(engine, state, hubs)
+    } else {
+        stop_embedded_broker(engine, state, hubs)
+    }
+}
+
 /// Start the embedded hub broker when project settings ask for it and config is enabled.
 pub fn maybe_auto_start_embedded(
     engine: &EngineHandle,

@@ -5,7 +5,7 @@
 //! Theme + auto-run hubs stay in `ui.toml`. Hub diagram is mirrored here when saved.
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::dock::DockPane;
 use crate::hubs::{HubModel, HubProto, MqttInputBind, MqttOutputBind};
@@ -19,7 +19,7 @@ use crate::persist::UiState;
 use pb_points::{is_address_path, is_short_point_id, PointBinding, PointStore};
 
 /// v8: dock layout (tree / hidden / maximized) lives in the project (PB-95).
-pub const PROJECT_VERSION: u32 = 10;
+pub const PROJECT_VERSION: u32 = 11;
 
 /// Project identity + options (Project panel / project.json).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -924,7 +924,6 @@ impl OpcUaClientSerde {
             subscription_interval_ms: self.subscription_interval_ms,
             auto_connect: self.auto_connect,
             draft_node_id: String::new(),
-            draft_point: String::new(),
         }
     }
 
@@ -1320,109 +1319,6 @@ fn normalize_transport(raw: &str) -> String {
 pub fn default_project_path() -> Option<PathBuf> {
     let dirs = directories::ProjectDirs::from("ca", "AgileAutomation", "ProtocolBench")?;
     Some(dirs.config_dir().join("project.json"))
-}
-
-pub fn load(path: &Path) -> Result<ProjectFile, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    // v1 single-client → wrap as one client.
-    if value.get("mqtt").and_then(|m| m.get("clients")).is_none()
-        && value
-            .get("mqtt")
-            .and_then(|m| m.get("host"))
-            .is_some()
-    {
-        let legacy = value.get("mqtt").cloned().unwrap_or(serde_json::json!({}));
-        let mut client = MqttClientSerde::default_local();
-        if let Some(h) = legacy.get("host").and_then(|v| v.as_str()) {
-            client.host = h.into();
-        }
-        if let Some(p) = legacy.get("port").and_then(|v| v.as_u64()) {
-            client.port = p as u16;
-        }
-        if let Some(c) = legacy.get("client_id").and_then(|v| v.as_str()) {
-            client.client_id = c.into();
-        }
-        if let Some(u) = legacy.get("username").and_then(|v| v.as_str()) {
-            client.username = u.into();
-        }
-        if let Some(p) = legacy.get("password").and_then(|v| v.as_str()) {
-            client.password = p.into();
-        }
-        if let Some(t) = legacy.get("transport").and_then(|v| v.as_str()) {
-            client.transport = normalize_transport(t);
-        }
-        if let Some(subs) = legacy.get("subscriptions").and_then(|v| v.as_array()) {
-            client.subscriptions = subs
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-        } else if let Some(s) = legacy.get("subscribe_topic").and_then(|v| v.as_str()) {
-            client.subscriptions = vec![s.into()];
-        }
-        if let Some(rules) = legacy.get("parse_rules").cloned() {
-            client.parse_rules = serde_json::from_value(rules).unwrap_or_default();
-        }
-        client.auto_connect = legacy
-            .get("auto_connect")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        return Ok(ProjectFile {
-            version: PROJECT_VERSION,
-            points: Vec::new(),
-            next_point_seq: 1,
-            mqtt: MqttProject {
-                selected_id: client.id.clone(),
-                clients: vec![client],
-                embedded: EmbeddedBrokerConfig::default(),
-            },
-            opcua: OpcUaProject::default(),
-            http: HttpProject::default(),
-            streams: StreamsProject::default(),
-            las: LasProject::default(),
-            snmp: SnmpProject::default(),
-            modbus: ModbusProject::default(),
-            files: FilesProject::default(),
-            hubs: None,
-            settings: ProjectSettings::default(),
-            layout: None,
-        });
-    }
-    let mut project: ProjectFile = serde_json::from_value(value).map_err(|e| e.to_string())?;
-    for c in &mut project.mqtt.clients {
-        c.transport = normalize_transport(&c.transport);
-    }
-    if project.mqtt.clients.is_empty() {
-        project.mqtt = MqttProject::default();
-    }
-    if project.next_point_seq == 0 {
-        project.next_point_seq = 1;
-    }
-    // High-water mark from any persisted ids.
-    for b in &project.points {
-        if let Some(n) = b.id.rsplit_once('_').and_then(|(_, s)| s.parse::<u64>().ok()) {
-            project.next_point_seq = project.next_point_seq.max(n.saturating_add(1));
-        }
-    }
-    project.version = PROJECT_VERSION;
-    Ok(project)
-}
-
-pub fn save(path: &Path, project: &ProjectFile) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    // PB-78: keep last non-empty hubs file as project.json.bak before overwrite.
-    if path.is_file() {
-        if let Ok(prev) = load(path) {
-            if prev.hubs.as_ref().is_some_and(|h| !h.hubs.is_empty()) {
-                let bak = path.with_extension("json.bak");
-                let _ = std::fs::copy(path, &bak);
-            }
-        }
-    }
-    let text = serde_json::to_string_pretty(project).map_err(|e| e.to_string())?;
-    std::fs::write(path, text).map_err(|e| e.to_string())
 }
 
 /// Snapshot point bindings from the live host store for project.json.
@@ -2095,6 +1991,8 @@ mod tests {
             calculations: vec![],
             at: None,
             modbus_server: "hub".into(),
+            opcua_expose_unmapped: true,
+            opcua_catalog: vec![],
         }];
         a.hubs = Some(hubs);
         std::fs::create_dir_all(&data).unwrap();
@@ -2230,6 +2128,8 @@ mod tests {
             calculations: vec![],
             at: None,
             modbus_server: String::new(),
+            opcua_expose_unmapped: true,
+            opcua_catalog: vec![],
         }];
         b.hubs = Some(hubs);
         std::fs::write(dir.join("edge-logger.json"), serde_json::to_string_pretty(&b).unwrap()).unwrap();

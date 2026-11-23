@@ -95,6 +95,14 @@ pub struct ProtocolBenchApp {
     last_project_save: Instant,
     /// Native open/save dialog running off the UI thread (Hyprland-safe).
     file_pick: Option<PendingFilePick>,
+    /// Open-project request waiting on the "this will stop" confirmation.
+    pending_switch: Option<PendingSwitch>,
+    /// Quit request waiting on confirmation (what keeps running in the service).
+    pending_quit: Option<Vec<String>>,
+    /// Set once the user confirmed quitting, so the close request is let through.
+    quit_confirmed: bool,
+    /// Hubs were stopped for quit: never autosave again (a save re-applies the project).
+    stopped_all: bool,
     /// Live host snapshot for Calc/Agg/points — refreshed on poll, not mouse FPS (PB-64).
     live_host: HostSnapshot,
     live_points_fp: u64,
@@ -107,6 +115,14 @@ pub struct ProtocolBenchApp {
 enum FilePickKind {
     Open,
     SaveAs,
+}
+
+/// An Open / Open Recent request held back until the user confirms stopping live hubs.
+struct PendingSwitch {
+    /// Project file to open once confirmed.
+    path: PathBuf,
+    /// What the service is running now and will stop on switch.
+    running: Vec<String>,
 }
 
 struct PendingFilePick {
@@ -150,7 +166,7 @@ impl ProtocolBenchApp {
         let ui_state = persist::load();
         let theme = persist::theme_from_state(&ui_state);
         theme::apply_theme(&cc.egui_ctx, theme);
-        let project_path = project::default_project_path().unwrap_or_else(|| {
+        let mut project_path = project::default_project_path().unwrap_or_else(|| {
             PathBuf::from("protocol-bench-project.json")
         });
         let mut mqtt = MqttPanelState::default();
@@ -188,9 +204,21 @@ impl ProtocolBenchApp {
         let mut seed_layout = false;
         let mut auto_run = ui_state.auto_run_embedded_hubs;
         if service_connected {
-            // Service owns project.json — open (or load default) over IPC.
-            let open_path = project_path.display().to_string();
-            let _ = engine.open_project(&open_path, auto_run);
+            // The service owns the active project: attach to whatever it is running instead of
+            // re-opening the default (that would swap out the project and its live hubs).
+            // Only a service with nothing live gets an explicit open, so auto-run still fires.
+            let probe = engine.status().ok();
+            let mut attached = false;
+            if let Some(st) = probe.as_ref() {
+                if !st.project_path.is_empty() {
+                    project_path = PathBuf::from(&st.project_path);
+                }
+                attached = !st.running_hubs().is_empty();
+            }
+            if !attached {
+                let open_path = project_path.display().to_string();
+                let _ = engine.open_project(&open_path, auto_run);
+            }
             match engine.get_project_json() {
                 Ok(value) => match serde_json::from_value::<ProjectFile>(value) {
                     Ok(file) => {
@@ -239,14 +267,16 @@ impl ProtocolBenchApp {
                         }
                         // IPC: local PointStore is a mirror — promote hub binds and push to service.
                         Self::push_hub_binds_to_service(&engine, &mut ui_state.hubs);
+                        // Attached to live hubs: never auto-start over them.
+                        let auto_start = auto_run && !attached;
                         mqtt_panel::maybe_auto_start_embedded(
                             &engine,
                             &mut mqtt,
                             &mut ui_state.hubs,
-                            auto_run,
+                            auto_start,
                         );
                         opcua_panel::apply_opcua_session(&engine, &mut opcua, &ui_state.hubs);
-                        opcua_panel::maybe_auto_start_embedded(&engine, &mut opcua, auto_run);
+                        opcua_panel::maybe_auto_start_embedded(&engine, &mut opcua, auto_start);
                         status = format!("Connected · project {}", project_path.display());
                     }
                     Err(err) => status = format!("Project decode: {err}"),
@@ -303,6 +333,10 @@ impl ProtocolBenchApp {
             layout_saved,
             last_project_save: Instant::now(),
             file_pick: None,
+            pending_switch: None,
+            pending_quit: None,
+            quit_confirmed: false,
+            stopped_all: false,
             live_host,
             live_points_fp,
             last_live_poll: Instant::now(),
@@ -400,7 +434,7 @@ impl ProtocolBenchApp {
 
     fn autosave_project(&mut self, _host: &pb_engine::HostSnapshot) {
         // Offline: chip covers it — never hammer IPC or flash save errors (PB-101).
-        if !self.service_connected {
+        if !self.service_connected || self.stopped_all {
             return;
         }
         let current = MqttProject::from_panel(&self.mqtt);
@@ -524,6 +558,103 @@ impl ProtocolBenchApp {
             self.mark_dirty();
         }
         Ok(())
+    }
+
+    /// What the service is running right now (empty when idle or when the service is unreachable).
+    /// Drives the "this will stop" / "this keeps running" confirmations.
+    fn running_hubs(&self) -> Vec<String> {
+        self.engine
+            .probe_status()
+            .map(|st| st.running_hubs())
+            .unwrap_or_default()
+    }
+
+    /// Open a project, warning first when the service has live hubs the switch will stop.
+    fn request_project_open(&mut self, path: PathBuf) {
+        let running = self.running_hubs();
+        if running.is_empty() {
+            if let Err(err) = self.load_project_from_path(path) {
+                self.status = format!("Open failed: {err}");
+            }
+        } else {
+            self.pending_switch = Some(PendingSwitch { path, running });
+        }
+    }
+
+    /// Quit: when the service still has hubs live, say they keep running after the UI exits.
+    fn request_quit(&mut self, ctx: &egui::Context) {
+        let running = self.running_hubs();
+        if running.is_empty() {
+            self.quit_confirmed = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            self.pending_quit = Some(running);
+        }
+    }
+
+    /// Modal confirmations for project switch and quit.
+    fn confirm_dialogs(&mut self, ctx: &egui::Context) {
+        let p = self.theme.palette();
+        if let Some(sw) = self.pending_switch.as_ref() {
+            let path = sw.path.clone();
+            let spec = ConfirmSpec {
+                id: "pb_confirm_switch",
+                title: "Switch project?",
+                intro: "Opening this project stops what is running now.",
+                items: &sw.running,
+                detail: Some(format!("Open: {}", elide_middle(&path.display().to_string(), 58))),
+                primary: "Stop and open",
+                secondary: "Cancel",
+                danger: None,
+            };
+            match confirm_modal(ctx, &p, &spec) {
+                Some(Choice::Primary) => {
+                    self.pending_switch = None;
+                    if let Err(err) = self.load_project_from_path(path) {
+                        self.status = format!("Open failed: {err}");
+                    }
+                }
+                Some(Choice::Secondary) => {
+                    self.pending_switch = None;
+                    self.status = "Cancelled".into();
+                }
+                Some(Choice::Danger) | None => {}
+            }
+        }
+        if let Some(running) = self.pending_quit.as_ref() {
+            let spec = ConfirmSpec {
+                id: "pb_confirm_quit",
+                title: "Quit Protocol Bench?",
+                intro: "The service keeps these running. Stop all disconnects clients too.",
+                items: running,
+                detail: None,
+                primary: "Quit, keep running",
+                secondary: "Stay",
+                danger: Some("Stop all and quit"),
+            };
+            match confirm_modal(ctx, &p, &spec) {
+                Some(Choice::Primary) => {
+                    self.pending_quit = None;
+                    self.quit_confirmed = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Some(Choice::Danger) => {
+                    // Flush edits first, then stop embedded hubs and disconnect every client.
+                    let _ = self.save_project_now();
+                    if let Err(err) = self.engine.stop_all_hubs() {
+                        self.status = format!("Stop all failed: {err}");
+                        self.pending_quit = None;
+                    } else {
+                        self.pending_quit = None;
+                        self.stopped_all = true;
+                        self.quit_confirmed = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                Some(Choice::Secondary) => self.pending_quit = None,
+                None => {}
+            }
+        }
     }
 
     fn load_project_from_path(&mut self, path: PathBuf) -> Result<(), String> {
@@ -671,11 +802,7 @@ impl ProtocolBenchApp {
                     return;
                 }
                 match kind {
-                    FilePickKind::Open => {
-                        if let Err(err) = self.load_project_from_path(path) {
-                            self.status = format!("Open failed: {err}");
-                        }
-                    }
+                    FilePickKind::Open => self.request_project_open(path),
                     FilePickKind::SaveAs => {
                         self.project_path = Self::ensure_project_ext(path);
                         match self.save_project_now() {
@@ -732,11 +859,7 @@ impl ProtocolBenchApp {
                 Err(err) => self.status = format!("Save failed: {err}"),
             },
             MenuAction::SaveAsProject => self.begin_file_pick(FilePickKind::SaveAs),
-            MenuAction::OpenRecent(path) => {
-                if let Err(err) = self.load_project_from_path(path) {
-                    self.status = format!("Open failed: {err}");
-                }
-            }
+            MenuAction::OpenRecent(path) => self.request_project_open(path),
             MenuAction::ClearRecent => {
                 if persist::clear_recent_projects(&mut self.ui_state) {
                     self.mark_dirty();
@@ -744,7 +867,7 @@ impl ProtocolBenchApp {
                 self.status = "Cleared recent projects".into();
             }
             MenuAction::ResetLayout => self.reset_layout(),
-            MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            MenuAction::Quit => self.request_quit(ctx),
             MenuAction::About => self.about_open = true,
             MenuAction::Settings => self.settings_open = true,
             MenuAction::Toggle(pane) => {
@@ -855,6 +978,11 @@ impl eframe::App for ProtocolBenchApp {
         theme::paint_root_bg(ctx, &p);
         self.pane_hits.clear();
         let host_for_panes = self.live_host.clone();
+        // Keep the UA address space in step with hub catalog edits even when the
+        // OPC UA panel is not on screen (the pack ignores unchanged rows).
+        if self.opcua.server_running {
+            opcua_panel::sync_points_to_server(&self.engine, &host_for_panes, &self.ui_state.hubs);
+        }
 
         self.app_bar(ctx, &p);
         self.status_bar(ctx, &p);
@@ -862,6 +990,12 @@ impl eframe::App for ProtocolBenchApp {
         self.settings_drawer(ctx, &p, &host_for_panes);
         self.about_window(ctx, &p);
         self.poll_file_pick(ctx);
+        // Window X / Alt+F4 / compositor close: hold it until the user has been told what keeps running.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_confirmed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_quit(ctx);
+        }
+        self.confirm_dialogs(ctx);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -1174,7 +1308,21 @@ impl ProtocolBenchApp {
         .fixed_pos(pos)
         .interactable(true)
         .show(ctx, |ui| {
-            let inner = menu_frame(p).show(ui, |ui| add(ui, action)).response;
+            // Separators fill the available width, which in an Area is the whole screen;
+            // cap it to the menu's own width measured last frame (96 on the first frame).
+            let wkey = Id::new(("pb_menu_w", id as u8));
+            let prev: f32 = ctx.data(|d| d.get_temp(wkey)).unwrap_or(96.0);
+            let inner = menu_frame(p)
+                .show(ui, |ui| {
+                    ui.set_max_width(prev);
+                    add(ui, action);
+                    let w = ui.min_rect().width();
+                    ctx.data_mut(|d| d.insert_temp(wkey, w));
+                    if (w - prev).abs() > 0.5 {
+                        ctx.request_repaint();
+                    }
+                })
+                .response;
             if inner.clicked_elsewhere() && !anchor.clicked {
                 close = true;
             }
@@ -2140,6 +2288,15 @@ fn recent_open_key() -> Id {
     Id::new("pb_file_recent_open")
 }
 
+/// Time (egui seconds) the pointer was last inside the parent row, the submenu, or the gap
+/// between them. The submenu stays open for a short grace period after that so a slow or
+/// diagonal move toward it does not close it.
+fn recent_hover_time_key() -> Id {
+    Id::new("pb_file_recent_hover_time")
+}
+
+const RECENT_CLOSE_GRACE: f64 = 0.35;
+
 /// Small right-pointing triangle marking a row that opens a submenu.
 fn submenu_arrow(painter: &egui::Painter, row: Rect, p: &ThemePalette) {
     let c = Pos2::new(row.max.x - 12.0, row.center().y);
@@ -2169,6 +2326,7 @@ fn recent_submenu(
         return;
     }
     let pointer = ctx.input(|i| i.pointer.hover_pos());
+    let now = ctx.input(|i| i.time);
     let inner = egui::Area::new(Id::new("pb_menu_file_recent"))
         .order(egui::Order::Foreground)
         .fixed_pos(Pos2::new(row.max.x + 4.0, row.min.y - 8.0))
@@ -2209,8 +2367,22 @@ fn recent_submenu(
                 }
             });
         });
-    let over_sub = pointer.is_some_and(|pos| inner.response.rect.contains(pos));
-    let open = row_hovered || (was_open && over_sub);
+    let sub = inner.response.rect;
+    // Bridge across the gap (parent frame padding + offset) between the row and the submenu.
+    let bridge = Rect::from_min_max(
+        Pos2::new(row.min.x, row.min.y),
+        Pos2::new(sub.min.x + 1.0, row.max.y),
+    );
+    let in_zone = row_hovered
+        || pointer.is_some_and(|pos| sub.contains(pos) || bridge.contains(pos));
+    if in_zone {
+        ctx.data_mut(|d| d.insert_temp(recent_hover_time_key(), now));
+    }
+    let last = ctx.data(|d| d.get_temp::<f64>(recent_hover_time_key())).unwrap_or(now);
+    let open = in_zone || now - last < RECENT_CLOSE_GRACE;
+    if open && !in_zone {
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
     ctx.data_mut(|d| d.insert_temp(recent_open_key(), open));
 }
 
@@ -2442,4 +2614,232 @@ fn about_chip(ui: &mut egui::Ui, label: &str, ink: Color32, p: &ThemePalette) {
         .rect_stroke(rect, Rounding::same(5.0), Stroke::new(1.0, ink));
     ui.painter()
         .galley(rect.min + Vec2::new(8.0, 4.0), galley, ink);
+}
+
+
+/// Content of one [`confirm_modal`].
+struct ConfirmSpec<'a> {
+    /// Stable egui id; one per dialog so their layers never collide.
+    id: &'static str,
+    title: &'a str,
+    /// One-line explanation under the title.
+    intro: &'a str,
+    /// Live things listed in the boxed body (capped, the rest shown as "+ N more").
+    items: &'a [String],
+    /// Optional muted line under the list (e.g. the project about to open).
+    detail: Option<String>,
+    /// Main action (orange, rightmost).
+    primary: &'a str,
+    /// Dismiss action (leftmost); Esc and a scrim click map here too.
+    secondary: &'a str,
+    /// Optional destructive third choice (red), e.g. "Stop all and quit".
+    danger: Option<&'a str>,
+}
+
+/// Which button closed a [`confirm_modal`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    Primary,
+    Secondary,
+    Danger,
+}
+
+/// Themed confirmation modal: dimmed scrim, warning badge, running list, two buttons.
+/// Secondary is also Esc / scrim click; `None` = still open.
+///
+/// Size is computed (not measured) so the window lands on whole points: a content-sized window
+/// centred on an odd screen edge puts its 1px border on half pixels, which shows as a fuzzy,
+/// jagged outline.
+fn confirm_modal(ctx: &egui::Context, p: &ThemePalette, spec: &ConfirmSpec) -> Option<Choice> {
+    const W: f32 = 520.0;
+    const PAD: f32 = 24.0;
+    const ROW: f32 = 22.0;
+    const MAX_ROWS: usize = 6;
+
+    let shown = spec.items.len().min(MAX_ROWS);
+    let extra = spec.items.len() - shown;
+    let rows = shown + usize::from(extra > 0);
+    let list_h = if rows == 0 { 0.0 } else { ROW * rows as f32 + 16.0 };
+    let detail_h = if spec.detail.is_some() { 38.0 } else { 0.0 };
+    let h = PAD + 44.0 + 16.0 + list_h + detail_h + 22.0 + 34.0 + PAD;
+    let size = Vec2::new(W, h.ceil());
+
+    let screen = ctx.screen_rect();
+    let pos = Pos2::new(
+        (screen.center().x - size.x * 0.5).round(),
+        (screen.center().y - size.y * 0.5).round(),
+    );
+
+    let mut decision = None;
+    let scrim = egui::Area::new(Id::new((spec.id, "scrim")))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .interactable(true)
+        .show(ctx, |ui| {
+            let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+            ui.painter()
+                .rect_filled(rect, Rounding::ZERO, Color32::from_black_alpha(96));
+            resp
+        });
+    if scrim.inner.clicked() {
+        decision = Some(Choice::Secondary);
+    }
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        decision = Some(Choice::Secondary);
+    }
+
+    let frame = egui::Frame::none()
+        .fill(p.pane)
+        .stroke(Stroke::new(1.0, p.line))
+        .rounding(Rounding::same(10.0))
+        .shadow(egui::epaint::Shadow {
+            offset: Vec2::new(0.0, 8.0),
+            blur: 24.0,
+            spread: 0.0,
+            color: Color32::from_black_alpha(90),
+        })
+        .inner_margin(egui::Margin::same(PAD));
+    egui::Window::new(spec.id)
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .movable(false)
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .fixed_size(size - Vec2::splat(PAD * 2.0))
+        .frame(frame)
+        .show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            let inner_w = W - PAD * 2.0;
+
+            // Header: badge + title / intro.
+            let (head, _) = ui.allocate_exact_size(Vec2::new(inner_w, 44.0), Sense::hover());
+            art::paint_warning_badge(
+                ui.painter(),
+                Rect::from_min_size(head.min, Vec2::splat(44.0)),
+                p.warn,
+            );
+            ui.painter().text(
+                Pos2::new(head.min.x + 58.0, head.min.y + 13.0),
+                Align2::LEFT_CENTER,
+                spec.title,
+                font_semi(16.0),
+                p.text,
+            );
+            ui.painter().text(
+                Pos2::new(head.min.x + 58.0, head.min.y + 33.0),
+                Align2::LEFT_CENTER,
+                spec.intro,
+                font_ui(12.5),
+                p.muted,
+            );
+            ui.add_space(16.0);
+
+            // What is running.
+            if rows > 0 {
+                let (list, _) = ui.allocate_exact_size(Vec2::new(inner_w, list_h), Sense::hover());
+                ui.painter().rect_filled(list, Rounding::same(6.0), p.control);
+                ui.painter()
+                    .rect_stroke(list, Rounding::same(6.0), Stroke::new(1.0, p.line));
+                let clip = Rect::from_min_max(
+                    Pos2::new(list.min.x + 30.0, list.min.y),
+                    Pos2::new(list.max.x - 10.0, list.max.y),
+                );
+                for (i, item) in spec.items.iter().take(shown).enumerate() {
+                    let y = list.min.y + 8.0 + ROW * i as f32 + ROW * 0.5;
+                    ui.painter()
+                        .circle_filled(Pos2::new(list.min.x + 16.0, y), 3.0, p.live);
+                    ui.painter().with_clip_rect(clip).text(
+                        Pos2::new(clip.min.x, y),
+                        Align2::LEFT_CENTER,
+                        item,
+                        font_ui(12.5),
+                        p.text,
+                    );
+                }
+                if extra > 0 {
+                    let y = list.min.y + 8.0 + ROW * shown as f32 + ROW * 0.5;
+                    ui.painter().text(
+                        Pos2::new(clip.min.x, y),
+                        Align2::LEFT_CENTER,
+                        format!("+ {extra} more"),
+                        font_ui(12.0),
+                        p.muted,
+                    );
+                }
+            }
+            if let Some(detail) = &spec.detail {
+                let (row, _) = ui.allocate_exact_size(Vec2::new(inner_w, 38.0), Sense::hover());
+                ui.painter().with_clip_rect(row).text(
+                    Pos2::new(row.min.x, row.center().y + 6.0),
+                    Align2::LEFT_CENTER,
+                    detail,
+                    font_ui(11.5),
+                    p.muted,
+                );
+            }
+            ui.add_space(22.0);
+
+            // Buttons, right-aligned: secondary then primary.
+            let (bar, _) = ui.allocate_exact_size(Vec2::new(inner_w, 34.0), Sense::hover());
+            let mut bar_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(bar)
+                    .layout(Layout::right_to_left(egui::Align::Center)),
+            );
+            bar_ui.spacing_mut().item_spacing.x = 10.0;
+            let on_accent = if p.is_light { Color32::WHITE } else { p.bg };
+            let primary = egui::Button::new(
+                egui::RichText::new(spec.primary)
+                    .font(font_semi(13.0))
+                    .color(on_accent),
+            )
+            .fill(p.accent)
+            .stroke(Stroke::NONE)
+            .rounding(Rounding::same(7.0))
+            .min_size(Vec2::new(130.0, 34.0));
+            if bar_ui.add(primary).clicked() {
+                decision = Some(Choice::Primary);
+            }
+            if let Some(label) = spec.danger {
+                let danger = egui::Button::new(
+                    egui::RichText::new(label)
+                        .font(font_semi(13.0))
+                        .color(Color32::WHITE),
+                )
+                .fill(p.err)
+                .stroke(Stroke::NONE)
+                .rounding(Rounding::same(7.0))
+                .min_size(Vec2::new(140.0, 34.0));
+                if bar_ui.add(danger).clicked() {
+                    decision = Some(Choice::Danger);
+                }
+            }
+            let secondary = egui::Button::new(
+                egui::RichText::new(spec.secondary)
+                    .font(font_ui(13.0))
+                    .color(p.text),
+            )
+            .fill(p.control)
+            .stroke(Stroke::new(1.0, p.line))
+            .rounding(Rounding::same(7.0))
+            .min_size(Vec2::new(96.0, 34.0));
+            if bar_ui.add(secondary).clicked() {
+                decision = Some(Choice::Secondary);
+            }
+        });
+    decision
+}
+
+/// Shorten `text` to `max` chars keeping the head and the tail (file name stays visible).
+fn elide_middle(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let tail = max * 2 / 3;
+    let head = max - tail - 1;
+    let start: String = chars[..head].iter().collect();
+    let end: String = chars[chars.len() - tail..].iter().collect();
+    format!("{start}…{end}")
 }

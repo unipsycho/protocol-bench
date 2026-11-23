@@ -149,6 +149,11 @@ impl RemoteHandle {
         self.call(METHOD_PING, serde_json::Value::Null).map(|_| ())
     }
 
+    /// Stop every embedded hub and disconnect every client the service is running.
+    pub fn stop_all_hubs(&self) -> Result<(), String> {
+        self.call(METHOD_STOP_ALL, serde_json::Value::Null).map(|_| ())
+    }
+
     /// Service status (uptime, packs, hub state). Caches it for [`RemoteHandle::status_or_reconnect`].
     pub fn status(&self) -> Result<ServiceStatus, String> {
         let v = self.call(METHOD_STATUS, serde_json::Value::Null)?;

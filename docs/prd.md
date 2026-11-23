@@ -33,6 +33,10 @@ Moving a value between a serial instrument, a Modbus device, a growing CSV, an M
 - Help → About: centered “Protocol Bench” wordmark, slogan **“Your protocol hub for every stream.”**, version, Agile Automation logo at the bottom.
 - File menu: Open project… (native file dialog), Save project, Save project as…, Recent projects (up to 15), Quit. View menu: panel toggles, Show all panels, Reset layout.
 - Status bar: left message + **service connection** chip (connected / disconnected over localhost IPC). The UI opens when the service is down and reconnects.
+- **Attach, not restart:** the UI opens whatever project the service is already running. Switching projects first lists the live hubs it will stop and asks; the service then stops the old project's hubs and clients before applying the new one (auto-run from Settings starts what the new project needs).
+- **Quit:** closing the UI leaves the service running. When hubs are live the UI asks first: **Quit, keep running**, **Stop all and quit** (stops hubs, disconnects clients) or **Stay**.
+- **Project panel:** the HUBS tile and the Hubs inventory rows have Start / Stop controls for the embedded MQTT broker and OPC UA server.
+- **Tray (Linux):** the service shows a tray icon (Protocol Bench mark, green dot when hubs are live) listing the project and running hubs, with Stop all hubs / Quit service.
 - Panels: Project, Hubs, Points, Mappings (read-only route list derived from hub Outputs), Traffic, Streams / TCP, Modbus, MQTT, OPC UA, File follow, HTTP / REST, LAS, SNMP. Each protocol panel owns **connections / endpoints**; hub Input / Output nodes own the binds.
 
 ## MCP server on the service
@@ -79,7 +83,7 @@ Rules:
 - Wide subscribe may be broad; **only hub Input–defined paths become points** (pack traffic still feeds the topic tree).
 - Shared **topic tree** (TopicBench-style): MQTT panel preview + Input inspector. Tree is fed from pack `traffic` snapshot, merged with live point sources so it stays aligned with the Points panel.
 - MQTT Input diagram nodes show bound **point count** on the right of the title. Input inspector has no Hide/Remove — delete via diagram later.
-- Persist in `project.json` (current version 10): `mqtt.clients[]`, `mqtt.embedded` (hub broker listen; rumqttd Start/Stop in MQTT panel), `hubs` (binds), `points[]`, `next_point_seq`; other protocols add `opcua`, `http`, `streams`, `las`, `snmp`, `modbus`, `files`.
+- Persist in `project.json` (current version 11): `mqtt.clients[]`, `mqtt.embedded` (hub broker listen; rumqttd Start/Stop in MQTT panel), `hubs` (binds), `points[]`, `next_point_seq`; other protocols add `opcua`, `http`, `streams`, `las`, `snmp`, `modbus`, `files`.
 
 ### Modbus model (live: TCP + RTU, client + server)
 
