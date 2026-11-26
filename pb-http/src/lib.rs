@@ -108,6 +108,8 @@ struct PackState {
     last_body: String,
     poll_count: u64,
     point_values: BTreeMap<String, String>,
+    /// Last request (poll or push) succeeded. A configured client alone is not a live link.
+    link_ok: bool,
 }
 
 impl PackState {
@@ -121,6 +123,7 @@ impl PackState {
             last_body: String::new(),
             poll_count: 0,
             point_values: BTreeMap::new(),
+            link_ok: false,
         }
     }
 
@@ -137,6 +140,7 @@ impl PackState {
         self.config = cfg;
         self.last_poll.clear();
         self.last_error.clear();
+        self.link_ok = false;
         self.state = if self.config.clients.is_empty() {
             "idle".into()
         } else {
@@ -175,10 +179,12 @@ impl PackState {
                     self.last_poll.insert(key, Instant::now());
                     self.poll_count = self.poll_count.saturating_add(1);
                     self.state = "ok".into();
+                    self.link_ok = true;
                 }
                 Err(e) => {
                     self.last_error = e.clone();
                     self.state = "error".into();
+                    self.link_ok = false;
                     self.log(PB_LOG_ERROR, &e);
                     self.last_poll.insert(key, Instant::now());
                 }
@@ -222,9 +228,13 @@ impl PackState {
         let outs = self.config.outputs.clone();
         for out in outs {
             if out.binds.iter().any(|b| b.point == name) {
-                if let Err(e) = self.run_output(&out) {
-                    self.last_error = e.clone();
-                    self.log(PB_LOG_ERROR, &e);
+                match self.run_output(&out) {
+                    Ok(()) => self.link_ok = true,
+                    Err(e) => {
+                        self.last_error = e.clone();
+                        self.link_ok = false;
+                        self.log(PB_LOG_ERROR, &e);
+                    }
                 }
             }
         }
@@ -434,7 +444,7 @@ impl Pack for PackState {
     }
 
     fn is_connected(&self) -> bool {
-        !self.config.clients.is_empty()
+        self.link_ok
     }
 
     fn detail_json(&self) -> String {
@@ -447,6 +457,70 @@ pb_abi::export_pack!(PackState);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quiet_host() -> HostRef {
+        HostRef::new(pb_abi::PbHostApi {
+            abi_version: pb_abi::PB_ABI_VERSION,
+            ctx: std::ptr::null_mut(),
+            upsert_point: None,
+            log_message: None,
+        })
+    }
+
+    /// One-shot HTTP server answering every request with `body`; returns its base URL.
+    fn serve(body: &'static str, requests: usize) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(requests).flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn configured_client_is_not_a_live_link_until_a_request_succeeds() {
+        let mut pack = PackState::new(quiet_host());
+        let cfg = serde_json::json!({"clients": [{"id": "api", "base_url": "http://127.0.0.1:9"}]});
+        pack.configure_json(&cfg.to_string()).unwrap();
+        pack.poll_inputs();
+        assert!(!Pack::is_connected(&pack), "client with nothing to poll is idle, not live");
+        assert_eq!(pack.state, "1 clients");
+    }
+
+    #[test]
+    fn successful_poll_marks_live_and_failure_clears_it() {
+        let url = serve(r#"{"tank":{"level":7.5}}"#, 1);
+        let mut pack = PackState::new(quiet_host());
+        let cfg = serde_json::json!({
+            "clients": [{"id": "api", "base_url": url, "timeout_secs": 2}],
+            "inputs": [{"client": "api", "path": "/x", "interval_secs": 0.5,
+                        "binds": [{"json_path": "tank.level", "point": "lvl"}]}]
+        });
+        pack.configure_json(&cfg.to_string()).unwrap();
+        pack.poll_inputs();
+        assert!(Pack::is_connected(&pack), "state {} err {}", pack.state, pack.last_error);
+        assert_eq!(pack.poll_count, 1);
+        assert!(pack.last_body.contains("7.5"));
+        // Server gone (it served one request): the next due poll fails and drops the link.
+        pack.last_poll.clear();
+        pack.poll_inputs();
+        assert!(!Pack::is_connected(&pack));
+        assert_eq!(pack.state, "error");
+        assert!(!pack.last_error.is_empty());
+        // Reconfigure resets to not-live.
+        pack.configure_json(&cfg.to_string()).unwrap();
+        assert!(!Pack::is_connected(&pack));
+    }
 
     #[test]
     fn register_ok() {

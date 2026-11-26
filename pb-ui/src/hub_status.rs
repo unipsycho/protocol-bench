@@ -169,7 +169,8 @@ pub fn banner_strip(
     let t = ui.input(|i| i.time) as f32;
     if any_up {
         // Drives the live timers and the status-dot pulse.
-        ui.ctx().request_repaint_after(Duration::from_millis(100));
+        // 4 fps is plenty for a seconds timer and a slow pulse (100 ms cost ~10 redraws/s).
+        ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
 
     // Per-hub chip text.

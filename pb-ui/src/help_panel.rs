@@ -806,7 +806,9 @@ word with `#` to filter by tag. Use **↑ ↓** to move through results, **Enter
 fn start_row(ui: &mut Ui, n: usize, a: &Article, p: &ThemePalette) -> egui::Response {
     let color = a.color();
     let w = ui.available_width();
-    let text_w = (w - 96.0).max(80.0);
+    // Text runs from the badge (x = 48) to just short of the "Read ›" link on the right.
+    let rg = ui.fonts(|f| f.layout_no_wrap("Read  ›".into(), font_ui(12.0), p.accent));
+    let text_w = (w - 48.0 - rg.size().x - 12.0 - 14.0).max(80.0);
     let title = ui.fonts(|f| f.layout_job(inline_job(a.title, font_semi(13.5), p.text, p, &[], text_w)));
     let sum = ui.fonts(|f| f.layout_job(inline_job(a.summary, font_ui(12.0), p.muted, p, &[], text_w)));
     let h = (12.0 + title.size().y + 2.0 + sum.size().y + 12.0).max(48.0);
@@ -822,7 +824,6 @@ fn start_row(ui: &mut Ui, n: usize, a: &Article, p: &ThemePalette) -> egui::Resp
     let top = rect.center().y - (th + 2.0 + sum.size().y) / 2.0;
     ui.painter().galley(egui::pos2(x, top), title, p.text);
     ui.painter().galley(egui::pos2(x, top + th + 2.0), sum, p.muted);
-    let rg = ui.fonts(|f| f.layout_no_wrap("Read  ›".into(), font_ui(12.0), p.accent));
     let rpos = egui::pos2(rect.max.x - 12.0 - rg.size().x, rect.center().y - rg.size().y / 2.0);
     ui.painter().galley(rpos, rg, p.accent);
     ui.add_space(4.0);

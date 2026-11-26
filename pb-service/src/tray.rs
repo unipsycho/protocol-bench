@@ -13,6 +13,10 @@ pub fn spawn(runtime: Arc<Mutex<Runtime>>) {
     use ksni::blocking::TrayMethods;
     use std::{thread, time::Duration};
 
+    // Headless runs (tests, CI, perf harness) skip the status-area icon.
+    if std::env::var_os("PB_NO_TRAY").is_some() {
+        return;
+    }
     let tray = HubTray {
         runtime: Arc::clone(&runtime),
         project: String::new(),

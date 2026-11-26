@@ -55,6 +55,10 @@ impl FrameConfig {
     }
 }
 
+/// A delimiter that never comes (wrong EOL setting, binary device) must not grow the buffer
+/// forever: past this many bytes the buffer is emitted as one frame.
+pub const MAX_FRAME: usize = 64 * 1024;
+
 /// Accumulate bytes and emit complete frames.
 pub struct Framer {
     cfg: FrameConfig,
@@ -96,9 +100,16 @@ impl Framer {
             return out;
         }
         while let Some(pos) = find_subslice(&self.buf, &eol) {
-            let frame = self.buf.drain(..pos).collect::<Vec<u8>>();
+            let mut frame = self.buf.drain(..pos).collect::<Vec<u8>>();
             let _ = self.buf.drain(..eol.len()); // drop delimiter
+            // LF mode fed by a CRLF device: the CR is part of the terminator, not the value.
+            if eol == b"\n" && frame.last() == Some(&b'\r') {
+                frame.pop();
+            }
             out.push(String::from_utf8_lossy(&frame).into_owned());
+        }
+        if self.buf.len() > MAX_FRAME {
+            out.push(String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned());
         }
         out
     }
@@ -134,6 +145,71 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg(mode: &str, eol: &str, idle_ms: u64) -> FrameConfig {
+        FrameConfig { mode: mode.into(), eol: eol.into(), eol_custom: String::new(), idle_ms }
+    }
+
+    #[test]
+    fn crlf_device_on_lf_endpoint_drops_the_cr() {
+        let mut f = Framer::new(FrameConfig::default());
+        assert_eq!(f.push(b"12.5\r\n13.0\r\n"), vec!["12.5", "13.0"]);
+    }
+
+    #[test]
+    fn crlf_and_custom_terminators_split_across_reads() {
+        let mut f = Framer::new(cfg("delimited", "crlf", 0));
+        assert!(f.push(b"A\r").is_empty(), "half a terminator waits");
+        assert_eq!(f.push(b"\nB\r\n"), vec!["A", "B"]);
+        let mut f = Framer::new(FrameConfig { eol_custom: "<END>".into(), ..cfg("delimited", "custom", 0) });
+        assert_eq!(f.push(b"x<EN"), Vec::<String>::new());
+        assert_eq!(f.push(b"D>y<END>"), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn transparent_passes_chunks_through() {
+        let mut f = Framer::new(cfg("transparent", "lf", 0));
+        assert_eq!(f.push(b"no\nsplit"), vec!["no\nsplit"]);
+        assert!(f.push(b"").is_empty());
+        assert_eq!(f.push(&[0xff, b'a']), vec!["\u{fffd}a"], "invalid UTF-8 is replaced, not dropped");
+    }
+
+    #[test]
+    fn idle_gap_flushes_a_partial_frame() {
+        let mut f = Framer::new(cfg("delimited", "idle", 20));
+        assert!(f.push(b"no terminator").is_empty());
+        assert_eq!(f.tick_idle(), None, "gap not elapsed yet");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert_eq!(f.tick_idle().as_deref(), Some("no terminator"));
+        assert_eq!(f.tick_idle(), None, "buffer emptied");
+        // LF mode never flushes on idle.
+        let mut f = Framer::new(cfg("delimited", "lf", 1));
+        f.push(b"partial");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(f.tick_idle(), None);
+    }
+
+    #[test]
+    fn missing_delimiter_cannot_grow_the_buffer_forever() {
+        let mut f = Framer::new(FrameConfig::default());
+        let chunk = vec![b'x'; 4096];
+        let mut frames = Vec::new();
+        for _ in 0..40 {
+            frames.extend(f.push(&chunk));
+        }
+        assert!(!frames.is_empty(), "oversized garbage is flushed");
+        assert!(f.buf.len() <= MAX_FRAME, "buffer bounded: {}", f.buf.len());
+    }
+
+    #[test]
+    fn eol_bytes_and_idle_timeouts() {
+        assert_eq!(cfg("delimited", "cr", 0).eol_bytes(), b"\r");
+        assert!(cfg("delimited", "idle", 0).eol_bytes().is_empty());
+        assert_eq!(cfg("delimited", "eol_idle", 0).eol_bytes(), b"\n");
+        assert_eq!(cfg("transparent", "idle", 30).idle_timeout(), None);
+        assert_eq!(cfg("delimited", "idle", 30).idle_timeout(), Some(std::time::Duration::from_millis(30)));
+        assert_eq!(cfg("delimited", "lf", 30).idle_timeout(), Some(std::time::Duration::from_millis(50)), "short poll in LF mode");
+    }
 
     #[test]
     fn splits_on_lf() {

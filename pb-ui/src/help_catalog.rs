@@ -283,7 +283,11 @@ Protocol Bench is two programs:
 
 ## Attach, not restart
 
-The UI opens **whatever project the service is already running**. If the service is down, the UI still opens and reconnects automatically about every 1.5 s. The **status bar** chip shows *connected* or *disconnected*.
+The UI opens **whatever project the service is already running** when it has live links; otherwise it opens the project you used last. If the service is down, the UI still opens and reconnects automatically about every 1.5 s, then opens your last project. The **status bar** chip shows *connected* or *disconnected*.
+
+## After a restart or crash
+
+The service remembers the project it last opened (`last-project` in the settings folder) and reopens it when it starts again, even after the process was killed. `PB_PROJECT` still wins when set. If the remembered file was deleted, the service falls back to the default project.
 
 ## Switching projects
 
@@ -337,12 +341,13 @@ The strip sits in the free space of the bar and reports, for example, *2 hubs ru
         title: "File menu: open and save projects",
         category: Category::Workspace,
         accent: None,
-        tags: &["file", "open", "save", "save as", "recent", "quit", "project"],
-        summary: "Open project…, Save, Save as…, Open recent and Quit.",
+        tags: &["file", "new", "open", "save", "save as", "recent", "quit", "project"],
+        summary: "New project…, Open project…, Save, Save as…, Open recent and Quit.",
         body: r#"
 | Item | What it does |
 |---|---|
-| **Open project…** | Native file dialog; the service switches to the chosen project. |
+| **New project…** | Choose a file name; creates an empty project (no connections, no hubs) and opens it. |
+| **Open project…** | Native file dialog; the service switches to the chosen project. A file that is not a valid project is refused and the current project stays open. |
 | **Open recent** | Up to 15 recent projects, plus a clear option. |
 | **Save project** | Writes the current project (hubs, connections, binds, layout). |
 | **Save project as…** | Choose a new file and save there. |

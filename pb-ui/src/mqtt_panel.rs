@@ -303,14 +303,10 @@ impl MqttPanelState {
         self.trees.get(conn_id)
     }
 
+    /// Keep the selection in range. An empty list is allowed (and saved as empty).
     fn ensure_clients(&mut self) {
-        if self.clients.is_empty() {
-            self.clients.push(MqttClient::default_local());
+        if self.selected.is_some_and(|i| i >= self.clients.len()) {
             self.selected = None;
-        } else if let Some(i) = self.selected {
-            if i >= self.clients.len() {
-                self.selected = None;
-            }
         }
     }
 
@@ -1122,7 +1118,7 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette) {
                     .color(p.muted),
             ),
         );
-        let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
+        let w = (ui.available_width() - 8.0).clamp(64.0, 360.0);
         ui.add(
             egui::TextEdit::singleline(value)
                 .desired_width(w)
@@ -1143,7 +1139,13 @@ fn client_id_field(ui: &mut egui::Ui, c: &mut MqttClient, p: &ThemePalette) {
                     .color(p.muted),
             ),
         );
-        let w = (ui.available_width() - 100.0).clamp(120.0, 280.0);
+        // Room for the "Unique" checkbox (box + gap + label) so it never clips in narrow panes.
+        let unique_w = ui.fonts(|f| f.layout_no_wrap("Unique".into(), font_ui(12.0), p.text).size().x)
+            + ui.spacing().icon_width
+            + ui.spacing().icon_spacing
+            + space::ITEM_X
+            + 6.0;
+        let w = (ui.available_width() - unique_w).clamp(60.0, 280.0);
         let edit = egui::TextEdit::singleline(&mut c.client_id)
             .desired_width(w)
             .margin(egui::Margin::symmetric(6.0, 3.0));
@@ -1175,7 +1177,7 @@ fn password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette
                     .color(p.muted),
             ),
         );
-        let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
+        let w = (ui.available_width() - 8.0).clamp(64.0, 360.0);
         ui.add(
             egui::TextEdit::singleline(value)
                 .password(true)
@@ -1199,7 +1201,7 @@ fn transport(ui: &mut egui::Ui, value: &mut String, p: &ThemePalette) {
                     .color(p.muted),
             ),
         );
-        let w = (ui.available_width() - 8.0).clamp(140.0, 220.0);
+        let w = (ui.available_width() - 8.0).clamp(64.0, 220.0);
         egui::ComboBox::from_id_salt("pb_mqtt_transport")
             .selected_text(value.as_str())
             .width(w)

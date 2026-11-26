@@ -115,16 +115,25 @@ impl Runtime {
     }
 
     /// Read, apply and remember a project file. `auto_run_hubs` starts embedded brokers / servers.
+    /// A file that cannot be read or parsed leaves the current project (and its path) as it
+    /// was, so a later save never lands on top of the broken file.
     pub fn load_project_file(&mut self, path: &Path, auto_run_hubs: bool) -> Result<(), String> {
-        self.project_path = path.to_path_buf();
-        self.auto_run_hubs = auto_run_hubs;
         if !path.is_file() {
             // New project — keep empty doc; UI will PutProject.
+            self.project_path = path.to_path_buf();
+            self.auto_run_hubs = auto_run_hubs;
             self.project_json = serde_json::json!({ "version": 7 });
             return Ok(());
         }
-        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+        if !value.is_object() {
+            return Err(format!("{} is not a Protocol Bench project", path.display()));
+        }
+        self.project_path = path.to_path_buf();
+        self.auto_run_hubs = auto_run_hubs;
         self.apply_project_value(value, auto_run_hubs)
     }
 

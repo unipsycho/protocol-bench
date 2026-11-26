@@ -179,14 +179,10 @@ impl SnmpPanelState {
             .collect()
     }
 
+    /// Keep the selection in range. An empty list stays empty (and is saved that way).
     fn ensure_targets(&mut self) {
-        if self.targets.is_empty() {
-            self.targets.push(SnmpTarget::default_local());
+        if self.selected.is_some_and(|i| i >= self.targets.len()) {
             self.selected = None;
-        } else if let Some(i) = self.selected {
-            if i >= self.targets.len() {
-                self.selected = None;
-            }
         }
     }
 

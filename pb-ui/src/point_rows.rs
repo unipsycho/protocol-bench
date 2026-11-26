@@ -106,24 +106,33 @@ impl PointsCols {
         let remove = if with_remove { REMOVE } else { 0.0 };
         let gaps = GAP * if with_remove { 5.0 } else { 4.0 };
         let avail = avail.max(1.0);
+        let mut gaps = gaps;
         let mut source = avail - DOT - name - value - updated - remove - gaps;
         if source < SOURCE_MIN {
-            let deficit = SOURCE_MIN - source;
-            source = SOURCE_MIN;
-            let give = deficit.min((name - NAME_MIN).max(0.0));
-            name -= give;
+            // Narrow pane: drop Source (it stays in the name tooltip) before cropping names —
+            // a column of "…cdab" tails helps nobody, a readable name does.
+            gaps -= GAP;
+            source = 0.0;
+            let room = avail - DOT - value - updated - remove - gaps;
+            name = name.min(room.max(NAME_MIN));
         }
         let row_w = DOT + name + value + source + updated + remove + gaps;
         Self {
             row_w: row_w.max(avail),
             gap: GAP,
             dot: DOT,
-            name,
+            // Slack goes to Source when shown, else to Name.
+            name: if source > 0.0 { name } else { name + (avail - row_w).max(0.0) },
             value,
-            source: source + (avail - row_w).max(0.0),
+            source: if source > 0.0 { source + (avail - row_w).max(0.0) } else { 0.0 },
             updated,
             remove,
         }
+    }
+
+    /// Source column hidden (narrow pane).
+    pub fn source_hidden(&self) -> bool {
+        self.source <= 0.0
     }
 
     pub fn cell_rects(&self, row: Rect) -> (Rect, Rect, Rect, Rect, Rect, Option<Rect>) {
@@ -137,7 +146,9 @@ impl PointsCols {
         let value = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.value, y1));
         x += self.value + self.gap;
         let source = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.source, y1));
-        x += self.source + self.gap;
+        if self.source > 0.0 {
+            x += self.source + self.gap;
+        }
         let updated = Rect::from_min_max(Pos2::new(x, y0), Pos2::new(x + self.updated, y1));
         x += self.updated;
         let remove = if self.remove > 0.0 {
@@ -393,7 +404,8 @@ fn paint_points_header(
     {
         clicked = Some(PointsSort::Value);
     }
-    if header_label(
+    if !cols.source_hidden()
+        && header_label(
         ui,
         source_r,
         &format!("SOURCE{}", sort_mark(state, PointsSort::Source)),
@@ -487,7 +499,9 @@ pub fn paint_full_row(
     let fit_w = |r: Rect| (r.width() - CELL_PAD * 0.5).max(1.0);
     let name_shown = fit_text_end(ui, row.id, &font, fit_w(name_r));
     let name_resp = paint_cell_text(ui, name_r, &name_shown, font.clone(), p.text, false);
-    if name_shown != row.id {
+    if cols.source_hidden() && !row.source.is_empty() {
+        name_resp.on_hover_text(format!("{}\n{}", row.id, row.source));
+    } else if name_shown != row.id {
         name_resp.on_hover_text(row.id);
     }
     if let Some(value) = row.value {
@@ -495,8 +509,10 @@ pub fn paint_full_row(
         paint_cell_text(ui, value_r, &flat(value), font.clone(), p.text, false)
             .on_hover_text(value);
     }
-    let shown = fit_text_keep_end(ui, row.source, &font, fit_w(source_r));
-    paint_cell_text(ui, source_r, &shown, font.clone(), p.muted, false).on_hover_text(row.source);
+    if !cols.source_hidden() {
+        let shown = fit_text_keep_end(ui, row.source, &font, fit_w(source_r));
+        paint_cell_text(ui, source_r, &shown, font.clone(), p.muted, false).on_hover_text(row.source);
+    }
     if let Some(updated) = row.updated {
         paint_cell_text(ui, updated_r, updated, font, p.muted, true);
     }
@@ -1067,5 +1083,81 @@ pub fn format_updated(updated_ms: u64) -> String {
             .format("%Y-%m-%d %H:%M")
             .to_string(),
         None => "—".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &str, source: &str) -> PointsTableRow {
+        PointsTableRow {
+            id: id.into(),
+            source: source.into(),
+            value: "12.5".into(),
+            quality: "good".into(),
+            updated: "just now".into(),
+            updated_ms: 0,
+            bind_index: None,
+            topic: String::new(),
+            path: String::new(),
+        }
+    }
+
+    /// Run `f` inside a real egui frame so text measurement uses the default fonts.
+    fn with_ui(f: impl FnOnce(&egui::Ui)) {
+        let ctx = egui::Context::default();
+        let mut f = Some(f);
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(f) = f.take() {
+                    f(ui);
+                }
+            });
+        });
+    }
+
+    fn rows() -> Vec<PointsTableRow> {
+        vec![
+            row("blender_rate_bpm", "modbus/blender::hr:0:f32:cdab"),
+            row("p1_discharge_psi", "modbus/pump1::hr:0:f32:cdab"),
+        ]
+    }
+
+    #[test]
+    fn wide_pane_shows_every_column_and_fills_the_row() {
+        with_ui(|ui| {
+            let cols = PointsCols::fit(ui, 900.0, &rows(), false);
+            assert!(!cols.source_hidden());
+            assert!((cols.row_w - 900.0).abs() < 0.5, "row fills the pane: {}", cols.row_w);
+            let (_, name, _, source, updated, rm) = cols.cell_rects(Rect::from_min_size(Pos2::ZERO, Vec2::new(cols.row_w, 20.0)));
+            assert!(source.width() > SOURCE_MIN);
+            assert!(name.max.x <= source.min.x && source.max.x <= updated.min.x, "columns in order, no overlap");
+            assert!(rm.is_none());
+        });
+    }
+
+    #[test]
+    fn narrow_pane_drops_source_before_cropping_names() {
+        with_ui(|ui| {
+            let wide = PointsCols::fit(ui, 900.0, &rows(), false);
+            let full_name = wide.name;
+            let cols = PointsCols::fit(ui, 280.0, &rows(), false);
+            assert!(cols.source_hidden(), "source hidden at 280px");
+            assert!(cols.name >= full_name - 0.5, "names keep their full width: {} vs {}", cols.name, full_name);
+            assert!(cols.row_w <= 280.5, "fits without horizontal scroll: {}", cols.row_w);
+            let (_, name, value, _, updated, _) = cols.cell_rects(Rect::from_min_size(Pos2::ZERO, Vec2::new(cols.row_w, 20.0)));
+            assert!(name.max.x <= value.min.x && value.max.x <= updated.min.x);
+        });
+    }
+
+    #[test]
+    fn tiny_pane_keeps_name_minimum_and_scrolls() {
+        with_ui(|ui| {
+            let cols = PointsCols::fit(ui, 120.0, &rows(), true);
+            assert!(cols.source_hidden());
+            assert!(cols.name >= NAME_MIN - 0.5);
+            assert!(cols.row_w > 120.0, "row grows past the pane; the scroll area handles it");
+        });
     }
 }

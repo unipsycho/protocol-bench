@@ -38,8 +38,9 @@ Keep the service running in its own terminal (it stays in the foreground and pri
 | Variable | Meaning |
 | --- | --- |
 | `PB_MODULES` | Directory the service loads protocol packs from (unset = no packs loaded) |
-| `PB_PROJECT` | Project file the service opens (otherwise the default project path) |
+| `PB_PROJECT` | Project file the service opens (otherwise the project it had open last — `~/.config/protocolbench/last-project` — or the default `project.json`) |
 | `PB_IPC_PORT` | Fixed localhost IPC port (otherwise chosen and written to `~/.config/protocolbench/ipc.json` with `ipc.token`) |
+| `PB_NO_TRAY` | `1` = no status-area tray icon (tests, headless runs) |
 | `PB_AUTO_RUN_HUBS` | `1` = start the project's embedded MQTT broker / OPC UA server at service start, with no UI attached (headless demos) |
 
 ### Tests
@@ -47,7 +48,7 @@ Keep the service running in its own terminal (it stays in the foreground and pri
 ```bash
 scripts/test-all.sh             # everything below, one command (add --quick for unit tests only)
 
-cargo test --workspace
+cargo test --workspace         # includes pb-service/tests: real service binary in a temp config dir (restart, IPC contract)
 ./scripts/modbus-smoke.sh       # service + Modbus pack (client + server) against a fake TCP device
 ./scripts/modbus-rtu-smoke.sh   # Modbus RTU master + slave over a virtual serial pair (pty), no hardware
 ./scripts/files-smoke.sh        # File follow: appends, restart catch-up, rotation, column picker
@@ -113,11 +114,12 @@ Headless (web demos): `PB_AUTO_RUN_HUBS=1 PB_MODULES=$PWD/modules PB_PROJECT=…
 
 ## Projects
 
-A project is one JSON file (current version 11). Sample projects live in `../protocol-bench-projects/`. UI layout and theme are stored separately in `~/.config/protocolbench/ui.toml`.
+A project is one JSON file (current version 11). File → New project creates an empty one. Sample projects live in `../protocol-bench-projects/`. UI layout, theme and recent projects are stored separately in `~/.config/protocolbench/ui.toml`; the service remembers the open project in `last-project` and reopens it after a restart or crash.
 
 ## More docs
 
 - [docs/free-vs-paid-isolation.md](docs/free-vs-paid-isolation.md) — licensing / entitlement split
 - [docs/protocol-pack-loading.md](docs/protocol-pack-loading.md) — pack ABI and loading
+- [docs/performance.md](docs/performance.md) — CPU / RAM measurements and how to re-run them
 - [docs/pack-development.md](docs/pack-development.md) — writing a pack (`pb_abi::Pack`), contracts that are not obvious from the code, known quirks
 - [pb-service/README.md](pb-service/README.md) — service details and IPC methods

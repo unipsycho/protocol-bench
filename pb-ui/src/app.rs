@@ -95,6 +95,9 @@ pub struct ProtocolBenchApp {
     /// Last dock layout written to project.json (PB-95).
     layout_saved: DockLayout,
     last_project_save: Instant,
+    /// The panels hold the service's project. False when the UI started with the service down;
+    /// the first successful probe then opens the last project (or adopts a live one).
+    project_synced: bool,
     /// Native open/save dialog running off the UI thread (Hyprland-safe).
     file_pick: Option<PendingFilePick>,
     /// Open-project request waiting on the "this will stop" confirmation.
@@ -109,6 +112,8 @@ pub struct ProtocolBenchApp {
     live_host: HostSnapshot,
     live_points_fp: u64,
     last_live_poll: Instant,
+    /// Data polls in a row that found nothing new (drives the idle repaint back-off).
+    quiet_polls: u32,
     /// Last IPC status probe (chip + bottom report).
     last_service_poll: Instant,
     /// Per-hub start/stop timers for the banner status strip.
@@ -118,6 +123,7 @@ pub struct ProtocolBenchApp {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FilePickKind {
+    New,
     Open,
     SaveAs,
 }
@@ -144,6 +150,7 @@ enum BarMenu {
 }
 
 enum MenuAction {
+    NewProject,
     OpenProject,
     SaveProject,
     SaveAsProject,
@@ -165,6 +172,82 @@ enum MenuAction {
 struct Anchor {
     rect: Rect,
     clicked: bool,
+}
+
+/// Write an empty project to `path` (File → New). The name comes from the file name.
+/// The dialog already asked before overwriting, so an existing file is replaced.
+fn write_blank_project(path: &Path) -> Result<(), String> {
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.replace(['-', '_'], " "))
+        .unwrap_or_default();
+    let file = ProjectFile::blank(&name);
+    let text = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Delay until the next data poll: `live` while values move, 1 s once
+/// [`QUIET_POLLS_BEFORE_IDLE`] polls in a row brought nothing new.
+const QUIET_POLLS_BEFORE_IDLE: u32 = 7;
+const IDLE_POLL: Duration = Duration::from_secs(1);
+
+fn next_poll_delay(quiet_polls: u32, live: Duration) -> Duration {
+    if quiet_polls >= QUIET_POLLS_BEFORE_IDLE {
+        IDLE_POLL
+    } else {
+        live
+    }
+}
+
+/// `PB_FPS=1`: print frames per second to stderr once a second (perf checks).
+fn fps_log() {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("PB_FPS").is_some()) {
+        return;
+    }
+    static FRAMES: AtomicU32 = AtomicU32::new(0);
+    static SINCE_MS: AtomicU64 = AtomicU64::new(0);
+    let now = pb_points::now_ms();
+    let since = SINCE_MS.load(Ordering::Relaxed);
+    let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if since == 0 {
+        SINCE_MS.store(now, Ordering::Relaxed);
+    } else if now - since >= 1000 {
+        eprintln!("protocol-bench: {:.1} fps", n as f64 * 1000.0 / (now - since) as f64);
+        FRAMES.store(0, Ordering::Relaxed);
+        SINCE_MS.store(now, Ordering::Relaxed);
+    }
+}
+
+/// Status-bar summary of the service: packs, points and what is live, in words.
+fn service_report_text(st: &pb_ipc::ServiceStatus) -> String {
+    let packs = st.packs_loaded.len();
+    let mut parts = vec![
+        match packs {
+            0 => "no protocol packs loaded".to_string(),
+            1 => "1 protocol pack".to_string(),
+            n => format!("{n} protocol packs"),
+        },
+        match st.point_count {
+            1 => "1 point".to_string(),
+            n => format!("{n} points"),
+        },
+    ];
+    let live = st.running_hubs();
+    if live.is_empty() {
+        parts.push("nothing running".into());
+    } else {
+        parts.push(match live.len() {
+            1 => "1 live link".to_string(),
+            n => format!("{n} live links"),
+        });
+    }
+    parts.join(" · ")
 }
 
 /// Project to show at launch. A service running live hubs keeps its project (re-opening would
@@ -247,6 +330,15 @@ impl ProtocolBenchApp {
                 attached = !st.running_hubs().is_empty();
                 project_path =
                     startup_project(last_used.as_deref(), &st.project_path, attached, &default_path);
+                eprintln!(
+                    "protocol-bench: startup project {} (last used {:?}, service {}, live {:?})",
+                    project_path.display(),
+                    last_used,
+                    st.project_path,
+                    st.running_hubs()
+                );
+            } else {
+                eprintln!("protocol-bench: service status probe failed at startup");
             }
             if !attached {
                 let open_path = project_path.display().to_string();
@@ -380,6 +472,7 @@ impl ProtocolBenchApp {
             hubs_saved,
             layout_saved,
             last_project_save: Instant::now(),
+            project_synced: service_connected,
             file_pick: None,
             pending_switch: None,
             pending_quit: None,
@@ -388,6 +481,7 @@ impl ProtocolBenchApp {
             live_host,
             live_points_fp,
             last_live_poll: Instant::now(),
+            quiet_polls: 0,
             clock_mqtt: Default::default(),
             clock_opcua: Default::default(),
             last_service_poll: Instant::now()
@@ -404,10 +498,7 @@ impl ProtocolBenchApp {
     }
 
     fn format_service_report(st: &pb_ipc::ServiceStatus) -> String {
-        format!(
-            "packs={:?} pts={} mqtt_hub={} opcua_hub={}",
-            st.packs_loaded, st.point_count, st.mqtt_hub_running, st.opcua_hub_running
-        )
+        service_report_text(st)
     }
 
     /// Periodic IPC probe: chip + bottom rate without a click.
@@ -427,6 +518,9 @@ impl ProtocolBenchApp {
                     self.service_report = report.clone();
                     self.status = format!("Service · {report}");
                 }
+                if !self.project_synced {
+                    self.sync_project_after_connect(&st);
+                }
             }
             Err(_) => {
                 // Chip is enough when offline — do not spam the left status (PB-101).
@@ -440,6 +534,29 @@ impl ProtocolBenchApp {
                         self.status = "Ready".into();
                     }
                 }
+            }
+        }
+    }
+
+    /// The service came up after the UI: open the project the UI was showing (the last one
+    /// used), or take on the service's own project when it already runs live hubs.
+    fn sync_project_after_connect(&mut self, st: &pb_ipc::ServiceStatus) {
+        let live = !st.running_hubs().is_empty();
+        let default = project::default_project_path()
+            .unwrap_or_else(|| PathBuf::from("protocol-bench-project.json"));
+        let last = persist::existing_recent_projects(&self.ui_state).into_iter().next();
+        let target = startup_project(last.as_deref(), &st.project_path, live, &default);
+        let result = if live {
+            self.adopt_project(target.clone(), false)
+        } else {
+            self.adopt_project(target.clone(), true)
+        };
+        match result {
+            Ok(()) => self.status = format!("Connected · project {}", target.display()),
+            Err(err) => {
+                // Do not retry every probe: a broken file would spam the service.
+                self.project_synced = true;
+                self.status = format!("Could not open {}: {err}", target.display());
             }
         }
     }
@@ -713,14 +830,23 @@ impl ProtocolBenchApp {
     }
 
     fn load_project_from_path(&mut self, path: PathBuf) -> Result<(), String> {
-        if !path.is_file() {
+        self.adopt_project(path, true)
+    }
+
+    /// Load `path` into the panels. `open` asks the service to switch to it first; without it
+    /// the UI takes on the project the service already runs (live hubs stay up).
+    fn adopt_project(&mut self, path: PathBuf, open: bool) -> Result<(), String> {
+        if open && !path.is_file() {
             let _ = persist::remove_recent_project(&mut self.ui_state, &path);
             self.mark_dirty();
             return Err(format!("File not found: {}", path.display()));
         }
         let auto_run = self.ui_state.auto_run_embedded_hubs;
-        self.engine
-            .open_project(&path.display().to_string(), auto_run)?;
+        if open {
+            self.engine
+                .open_project(&path.display().to_string(), auto_run)?;
+        }
+        self.project_synced = true;
         let value = self.engine.get_project_json()?;
         let file: ProjectFile = serde_json::from_value(value).map_err(|e| e.to_string())?;
         file.mqtt.apply_to_panel(&mut self.mqtt);
@@ -829,6 +955,10 @@ impl ProtocolBenchApp {
                 dlg = dlg.set_directory(dir);
             }
             let picked = match kind {
+                FilePickKind::New => dlg
+                    .set_title("New project")
+                    .set_file_name("new-project.json")
+                    .save_file(),
                 FilePickKind::Open => dlg.set_title("Open project").pick_file(),
                 FilePickKind::SaveAs => dlg
                     .set_title("Save project as")
@@ -839,6 +969,7 @@ impl ProtocolBenchApp {
         });
         self.file_pick = Some(PendingFilePick { kind, rx });
         self.status = match kind {
+            FilePickKind::New => "Choose where to create the new project…".into(),
             FilePickKind::Open => "Choose a project to open…".into(),
             FilePickKind::SaveAs => "Choose where to save the project…".into(),
         };
@@ -859,6 +990,13 @@ impl ProtocolBenchApp {
                     return;
                 }
                 match kind {
+                    FilePickKind::New => {
+                        let path = Self::ensure_project_ext(path);
+                        match write_blank_project(&path) {
+                            Ok(()) => self.request_project_open(path),
+                            Err(err) => self.status = format!("New project failed: {err}"),
+                        }
+                    }
                     FilePickKind::Open => self.request_project_open(path),
                     FilePickKind::SaveAs => {
                         self.project_path = Self::ensure_project_ext(path);
@@ -908,6 +1046,7 @@ impl ProtocolBenchApp {
         self.menu = None;
         match action {
             MenuAction::Close => {}
+            MenuAction::NewProject => self.begin_file_pick(FilePickKind::New),
             MenuAction::OpenProject => self.begin_file_pick(FilePickKind::Open),
             MenuAction::SaveProject => match self.save_project_now() {
                 Ok(()) => {
@@ -1023,7 +1162,7 @@ impl eframe::App for ProtocolBenchApp {
             self.theme_applied = Some(self.theme);
         }
         // PB-64: poll engine on a data timer — mouse frames reuse live_host.
-        const LIVE_POLL: Duration = Duration::from_millis(150);
+        const LIVE_POLL: Duration = Duration::from_millis(200);
         if self.last_live_poll.elapsed() >= LIVE_POLL {
             self.last_live_poll = Instant::now();
             self.engine
@@ -1035,7 +1174,9 @@ impl eframe::App for ProtocolBenchApp {
             if fp != self.live_points_fp {
                 self.live_points_fp = fp;
                 self.live_host = snap;
+                self.quiet_polls = 0;
             } else {
+                self.quiet_polls = self.quiet_polls.saturating_add(1);
                 // Keep point values frozen; still track pack liveness lightly.
                 self.live_host.alive = snap.alive;
                 self.live_host.ticks = snap.ticks;
@@ -1099,8 +1240,11 @@ impl eframe::App for ProtocolBenchApp {
         self.handle_drop(ctx, &p);
         self.autosave();
         self.autosave_project(&host_for_panes);
-        // Next data poll only — do not chase mouse FPS for live values (PB-64).
-        ctx.request_repaint_after(LIVE_POLL);
+        // Next data poll only — do not chase mouse FPS for live values (PB-64). When nothing
+        // has changed for a while, poll once a second instead: an idle window used to redraw
+        // ~7×/s forever (a full core under software GL). Input still repaints at once.
+        ctx.request_repaint_after(next_poll_delay(self.quiet_polls, LIVE_POLL));
+        fps_log();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1298,6 +1442,9 @@ impl ProtocolBenchApp {
         let has_recent_entries = !self.ui_state.recent_projects.is_empty();
         let current = self.project_path.clone();
         self.popup(ctx, anchor, BarMenu::File, p, action, |ui, action| {
+            if menu_row(ui, "New project…", None, p).clicked() {
+                *action = Some(MenuAction::NewProject);
+            }
             if menu_row(ui, "Open project…", None, p).clicked() {
                 *action = Some(MenuAction::OpenProject);
             }
@@ -1643,28 +1790,54 @@ impl ProtocolBenchApp {
                 }
                 ui.add_space(18.0);
                 ui.label(
-                    egui::RichText::new("ENGINE HOST")
+                    egui::RichText::new("SERVICE")
                         .font(font_ui(10.5))
                         .color(p.muted),
                 );
                 ui.add_space(4.0);
-                let alive = if host.alive { "up" } else { "stopped" };
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} · {} · {}",
-                        host.thread_name,
-                        alive,
-                        panels::format_uptime(host.uptime_ms)
-                    ))
-                    .font(theme::font_mono(12.0))
-                    .color(p.text),
-                );
+                let link = if self.service_connected && host.alive {
+                    format!("Connected · up {}", panels::format_uptime(host.uptime_ms))
+                } else {
+                    "Not connected — start pb-service".to_string()
+                };
+                ui.label(egui::RichText::new(link).font(font_ui(12.5)).color(p.text));
                 ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("Five slots. No sockets, brokers, or files.")
-                        .font(font_ui(12.0))
-                        .color(p.muted),
+                let packs: Vec<&str> = host
+                    .slots
+                    .iter()
+                    .filter(|s| s.pack_loaded)
+                    .map(|s| s.title.as_str())
+                    .collect();
+                let pack_line = match packs.len() {
+                    0 => "No protocol packs loaded.".to_string(),
+                    n => format!("{n} protocol packs: {}", packs.join(", ")),
+                };
+                ui.add(
+                    egui::Label::new(egui::RichText::new(pack_line).font(font_ui(12.0)).color(p.muted))
+                        .wrap(),
                 );
+                if !host.modules_dir.is_empty() {
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("Packs folder: {}", host.modules_dir))
+                                .font(font_ui(11.0))
+                                .color(p.muted),
+                        )
+                        .wrap(),
+                    );
+                }
+                if let Some(dir) = pb_ipc::config_dir() {
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("Settings folder: {}", dir.display()))
+                                .font(font_ui(11.0))
+                                .color(p.muted),
+                        )
+                        .wrap(),
+                    );
+                }
             });
     }
 
@@ -3101,6 +3274,57 @@ fn elide_middle(text: &str, max: usize) -> String {
     let start: String = chars[..head].iter().collect();
     let end: String = chars[chars.len() - tail..].iter().collect();
     format!("{start}…{end}")
+}
+
+#[cfg(test)]
+mod new_project_tests {
+    use super::write_blank_project;
+
+    #[test]
+    fn new_project_file_is_a_loadable_empty_project_named_from_the_file() {
+        let dir = std::env::temp_dir().join(format!("pb-new-proj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("sub").join("pump-skid_2.json");
+        write_blank_project(&path).unwrap();
+        assert!(crate::persist::looks_like_project(&path), "shows up in Open recent");
+        let file: crate::project::ProjectFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(file.settings.name, "pump skid 2");
+        assert!(file.modbus.connections.is_empty() && file.hubs.unwrap().hubs.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod repaint_tests {
+    use super::*;
+
+    #[test]
+    fn idle_window_backs_off_and_live_data_keeps_the_fast_poll() {
+        let live = Duration::from_millis(150);
+        assert_eq!(next_poll_delay(0, live), live, "fresh change: fast");
+        assert_eq!(next_poll_delay(QUIET_POLLS_BEFORE_IDLE - 1, live), live);
+        assert_eq!(next_poll_delay(QUIET_POLLS_BEFORE_IDLE, live), IDLE_POLL);
+        assert_eq!(next_poll_delay(u32::MAX, live), IDLE_POLL);
+        assert!(IDLE_POLL <= Duration::from_secs(1), "uptime clocks still tick each second");
+    }
+}
+
+#[cfg(test)]
+mod service_report_tests {
+    use super::service_report_text;
+
+    #[test]
+    fn report_reads_as_words_not_debug() {
+        let mut st = pb_ipc::ServiceStatus::default();
+        assert_eq!(service_report_text(&st), "no protocol packs loaded · 0 points · nothing running");
+        st.packs_loaded = vec!["mqtt".into(), "modbus".into()];
+        st.point_count = 1;
+        st.mqtt_hub_running = true;
+        let text = service_report_text(&st);
+        assert_eq!(text, "2 protocol packs · 1 point · 1 live link");
+        assert!(!text.contains('[') && !text.contains("=false"), "{text}");
+    }
 }
 
 #[cfg(test)]

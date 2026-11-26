@@ -47,10 +47,14 @@ fn main() {
 
 pub(crate) fn run_foreground() -> Result<(), String> {
     let modules = std::env::var_os("PB_MODULES").map(PathBuf::from);
-    let project = std::env::var_os("PB_PROJECT")
-        .map(PathBuf::from)
-        .or_else(default_project_path)
-        .ok_or_else(|| "no project path".to_string())?;
+    // PB_PROJECT, else the project open when the service last ran, else the default.
+    let marker = pb_ipc::last_project_marker();
+    let project = pb_ipc::startup_project_path(
+        std::env::var_os("PB_PROJECT").map(PathBuf::from),
+        marker.as_deref(),
+        default_project_path(),
+    )
+    .ok_or_else(|| "no project path".to_string())?;
     let port: u16 = std::env::var("PB_IPC_PORT")
         .ok()
         .and_then(|s| s.parse().ok())

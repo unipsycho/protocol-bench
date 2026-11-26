@@ -182,11 +182,6 @@ impl OpcUaPanelState {
         self.selected.and_then(|i| self.clients.get_mut(i))
     }
 
-    pub fn ensure_clients(&mut self) {
-        if self.clients.is_empty() {
-            self.clients.push(OpcUaClient::default_plant());
-        }
-    }
 
     pub fn unique_id(&self, prefix: &str) -> String {
         let mut n = 1;
@@ -270,7 +265,6 @@ impl OpcUaPanelState {
 
 /// Push client list + monitored binds from hub OPC UA Inputs into the pack.
 pub fn apply_opcua_session(engine: &EngineHandle, state: &mut OpcUaPanelState, hubs: &HubModel) {
-    state.ensure_clients();
     let clients: Vec<serde_json::Value> = state
         .clients
         .iter()
@@ -385,7 +379,9 @@ pub fn paint(
     state: &mut OpcUaPanelState,
     hubs: &HubModel,
 ) {
-    state.ensure_clients();
+    if state.selected.is_some_and(|i| i >= state.clients.len()) {
+        state.selected = None;
+    }
     state.sync_from_host(host);
     if state.server_running {
         sync_points_to_server(engine, host, hubs);
@@ -1051,7 +1047,7 @@ fn labeled_text(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePal
             [LABEL_W, 20.0],
             egui::Label::new(egui::RichText::new(label).font(font_ui(12.5)).color(p.muted)),
         );
-        let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
+        let w = (ui.available_width() - 8.0).clamp(64.0, 360.0);
         changed = ui
             .add(
                 egui::TextEdit::singleline(value)
@@ -1072,7 +1068,7 @@ fn labeled_password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &Them
             [LABEL_W, 20.0],
             egui::Label::new(egui::RichText::new(label).font(font_ui(12.5)).color(p.muted)),
         );
-        let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
+        let w = (ui.available_width() - 8.0).clamp(64.0, 360.0);
         changed = ui
             .add(
                 egui::TextEdit::singleline(value)

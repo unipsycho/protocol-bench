@@ -1,6 +1,20 @@
 # PRD gap review
 
-Reviewed 2026-11-19, updated 2026-11-25 against the working tree. `[x]` done, `[ ]` open.
+Reviewed 2026-11-19, updated 2026-11-26 against the working tree. `[x]` done, `[ ]` open.
+
+## 2026-11-26 pass — restart behaviour, project loading tests, UI fit
+
+- [x] **Reopen the last project after a restart.** Cause: the service always started on the default `project.json`, and the HTTP pack reported "connected" as soon as any client was configured (every sample has one), so the UI saw "live hubs", attached to the default project and never opened yours. Fixes: the service writes `<config dir>/last-project` on open / save-as and starts from it (`pb_ipc::startup_project_path`); HTTP reports connected only after a request succeeds; a UI that starts before the service opens the last project once the service appears. Tests: `pb-service/tests/restart_reopens_project.rs` runs the real binary, kills it with SIGKILL and checks the same project comes back (fails against the old start-up code).
+- [x] **Malformed project files** are refused without moving the service's project path (a later save used to land on top of the broken file). **IPC client** keeps the connection on an error reply instead of dropping it. Tests: `pb-service/tests/ipc_contract.rs` (auth, hello-first, open / get / put, new-project path, malformed files, idle status).
+- [x] **No placeholder connections.** Opening a project with an empty MQTT / OPC UA / HTTP / Streams / LAS / SNMP / Modbus / File follow list added a stub (an enabled Modbus client on 127.0.0.1:502, a `/dev/ttyUSB0` serial port, …) and autosave wrote it back. Lists now stay empty. Tests: `pb-ui/src/project_load_tests.rs` (every section file → panels → file for the demos, the sample folder, a sparse project; old / unknown / malformed files; layout seeding; point bindings), checked with a mutant.
+- [x] **File → New project…** writes an empty project (`ProjectFile::blank`) and opens it.
+- [x] UI fit in narrow panes: Hubs toolbar hint shortens instead of widening the pane (which made the register map overflow), Points table drops Source before cropping names, Mappings keeps To over From and hides Hub for single-hub projects, protocol picker no longer covers Pop out, connection rows elide under the ×, form labels narrow, MQTT Unique checkbox fits, Traffic listener address wraps, Help "Read ›" no longer overlaps. Status bar says "13 protocol packs · 69 points · 3 live links" instead of a debug dump. Settings lists the loaded packs and folders (the old "Five slots" text is gone).
+- [x] Test hygiene: IPC frame tests (round trip, size cap, truncation, one write per frame), HTTP pack link tests with a local server, OPC UA server tests on free ports with a temp PKI (one used the real `~/.local/share` store), MCP test waits for the first snapshot (was flaky). `PB_NO_TRAY=1` for headless service runs.
+
+### Still open after this pass
+
+- [ ] Saved projects that went through the old UI keep their placeholder connections (`com1`, `meter`, `api`, `plant`, `switch` in most samples) until deleted by hand.
+- [ ] Protocol picker list scrolls after ~10 entries (egui popup height); every protocol is still reachable.
 
 ## 2026-11-25 pass — register maps, five new protocols, MCP, demo plants
 
@@ -23,7 +37,7 @@ Reviewed 2026-11-19, updated 2026-11-25 against the working tree. `[x]` done, `[
 - [ ] DNP3 over serial, DNP3 outstation role, secure authentication. Sparkplug DataSets / Templates / primary-host STATE. SNMPv3 / SET / traps. WITSML.
 - [ ] MCP edits are not pushed to an open UI (it keeps its own copy until the project is reopened).
 - [ ] Windows: new packs untested there (CAN reports "needs Linux"); MSI not started.
-- [ ] Two-serial + two-TCP and restart-restores-bridges acceptance tests still have no automated coverage.
+- [ ] Two-serial + two-TCP acceptance test has no automated coverage; restart now restores the same project (tested), bridge traffic after restart is not asserted.
 
 ## Done in the 2026-11-19 pass (UI)
 
@@ -38,12 +52,12 @@ Reviewed 2026-11-19, updated 2026-11-25 against the working tree. `[x]` done, `[
 ## Open — needs a pack or a decision
 
 - [ ] Modbus is done in the pack for TCP + RTU client and server, but only exercised against fakes: no real device, no real serial port, and no Modbus Bench pass yet (phase 7).
-- [ ] Live link state, quality and last error per endpoint in the UI — the Modbus pack reports state / error / client count per connection already (`topics_json`); the panel does not show it yet (phase 6). 
+- [x] Live link state, quality and last error per endpoint in the UI (Modbus phase 6, then every pack).
 - [x] MCP server on the service (PRD #14) — built 2026-11-25.
 - [x] Sparkplug B, DNP3, WebSocket, CAN, WITS — built 2026-11-25 (see above).
 - [ ] Windows: service host is scaffolded only; MSI / `cargo-wix` not started (PRD says hold until license details land).
-- [ ] Output binds exist for Modbus (client writes) only; OPC UA, File and SNMP outputs are not available.
-- [ ] Two-serial + two-TCP and restart-restores-bridges acceptance tests (PRD "Done when") have no automated coverage.
+- [x] Output binds exist for MQTT, Modbus, Streams, HTTP, LAS, WITS, WebSocket, Sparkplug B, DNP3 and CAN. Still input-only: OPC UA client writes, File follow, SNMP (no SET).
+- [ ] Two-serial + two-TCP acceptance test (PRD "Done when") has no automated coverage.
 
 ## SNMP, LAS, RTU test, column picker — done
 

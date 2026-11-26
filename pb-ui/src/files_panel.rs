@@ -285,11 +285,9 @@ impl FilesPanelState {
             .collect()
     }
 
+    /// Keep the selection in range. An empty list stays empty (and is saved that way).
     fn ensure(&mut self) {
-        if self.sources.is_empty() {
-            self.sources.push(FileSource::default_csv());
-            self.selected = None;
-        } else if self.selected.is_some_and(|i| i >= self.sources.len()) {
+        if self.selected.is_some_and(|i| i >= self.sources.len()) {
             self.selected = None;
         }
     }
@@ -421,7 +419,7 @@ fn paint_body(ui: &mut egui::Ui, p: &ThemePalette, state: &mut FilesPanelState, 
                 let mut v = s.parser;
                 egui::ComboBox::from_id_salt("pb_files_parser")
                     .selected_text(v.label())
-                    .width(160.0)
+                    .width((ui.available_width() - 8.0).clamp(64.0, 160.0))
                     .show_ui(ui, |ui| {
                         for x in [FileParser::Csv, FileParser::Jsonl] {
                             ui.selectable_value(&mut v, x, x.label());
@@ -441,7 +439,7 @@ fn paint_body(ui: &mut egui::Ui, p: &ThemePalette, state: &mut FilesPanelState, 
                     let mut v = s.header_row;
                     egui::ComboBox::from_id_salt("pb_files_header")
                         .selected_text(v.label())
-                        .width(180.0)
+                        .width((ui.available_width() - 8.0).clamp(64.0, 180.0))
                         .show_ui(ui, |ui| {
                             let line = match s.header_row {
                                 HeaderMode::Line(n) => n,

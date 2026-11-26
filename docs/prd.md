@@ -1,6 +1,6 @@
 # Protocol Bench — product requirements
 
-Date: 2026-11-13. Reviewed against the code: 2026-11-19. Status: living draft. Build status and open items: [prd-gap-review.md](prd-gap-review.md).
+Date: 2026-11-13. Reviewed against the code: 2026-11-26. Status: living draft. Build status and open items: [prd-gap-review.md](prd-gap-review.md).
 
 Research: competitive landscape and protocol notes live in the research store (not in this repo). Free vs paid isolation: [free-vs-paid-isolation.md](free-vs-paid-isolation.md). Pack loading: [protocol-pack-loading.md](protocol-pack-loading.md).
 
@@ -31,9 +31,10 @@ Moving a value between a serial instrument, a Modbus device, a growing CSV, an M
 - Docked panels (drag titles, tab strips, edge splits). Top bar: File, View, Help, theme chip, settings. Side rail of panel icons.
 - Themes. Hub canvas and panel diagrams keep the scope blue mixed with the theme background.
 - Help → About: centered “Protocol Bench” wordmark, slogan **“Your protocol hub for every stream.”**, version, Agile Automation logo at the bottom.
-- File menu: Open project… (native file dialog), Save project, Save project as…, Recent projects (up to 15), Quit. View menu: panel toggles, Show all panels, Reset layout.
-- Status bar: left message + **service connection** chip (connected / disconnected over localhost IPC). The UI opens when the service is down and reconnects.
-- **Attach, not restart:** the UI opens whatever project the service is already running. Switching projects first lists the live hubs it will stop and asks; the service then stops the old project's hubs and clients before applying the new one (auto-run from Settings starts what the new project needs).
+- File menu: New project… (an empty project: no connections, no hubs), Open project… (native file dialog), Open recent (up to 15), Save project, Save project as…, Quit. View menu: panel toggles, Show all panels, Reset layout.
+- Status bar: left message (service summary in words: packs loaded, point count, live links) + **service connection** chip (connected / disconnected over localhost IPC). The UI opens when the service is down and reconnects; when the service comes up later the UI then opens the last project.
+- **Same project after a restart:** the service remembers the project it last opened or saved (`last-project` in the config dir) and reopens it at start, even after a crash or `kill -9`. Start order: `PB_PROJECT`, then the remembered project (if the file still exists), then the default `project.json`. A file that fails to open (bad JSON, not an object) is refused and the current project stays open; nothing is saved over the broken file.
+- **Attach, not restart:** the UI opens whatever project the service is already running when it has live links; otherwise it opens the project used last in the UI. Switching projects first lists the live hubs it will stop and asks; the service then stops the old project's hubs and clients before applying the new one (auto-run from Settings starts what the new project needs).
 - **Quit:** closing the UI leaves the service running. When hubs are live the UI asks first: **Quit, keep running**, **Stop all and quit** (stops hubs, disconnects clients) or **Stay**.
 - **Project panel:** the HUBS tile and the Hubs inventory rows have Start / Stop controls for the embedded MQTT broker and OPC UA server.
 - **Tray (Linux):** the service shows a tray icon (Protocol Bench mark, green dot when hubs are live) listing the project and running hubs, with Stop all hubs / Quit service.
@@ -49,7 +50,9 @@ Moving a value between a serial instrument, a Modbus device, a growing CSV, an M
 
 ## Engines
 
-Each protocol engine owns its work on a thread the UI does not block. `pb-engine` lives in the **service**; the UI takes a snapshot and submits commands (IPC details follow-on). Packs load via the C ABI (`pb-abi`) from a `modules/` directory. **MQTT client** is the first live pack (`pb-mqtt` / rumqttc): multi-client connect, wildcard subscribe, traffic topic tree, hub Input/Output point binds, publish. OPC UA, Streams, HTTP, Modbus, File follow, SNMP and LAS packs are also live.
+Each protocol engine owns its work on a thread the UI does not block. `pb-engine` lives in the **service**; the UI reads snapshots and submits commands over localhost IPC (`pb-ipc`). Packs load via the C ABI (`pb-abi`) from a `modules/` directory. All 13 packs are live: MQTT, OPC UA, Streams / TCP, HTTP / REST, Modbus, File follow, SNMP, LAS, WITS, WebSocket, Sparkplug B, DNP3 and CAN.
+
+A pack reports **connected** only while a link is actually up (a socket open, a request answered, a file being read); a configured but idle connection is not "live". That flag drives the tray, the quit / switch confirmations and which project the UI opens at start.
 
 ## Hubs
 
@@ -83,7 +86,7 @@ Rules:
 - Wide subscribe may be broad; **only hub Input–defined paths become points** (pack traffic still feeds the topic tree).
 - Shared **topic tree** (TopicBench-style): MQTT panel preview + Input inspector. Tree is fed from pack `traffic` snapshot, merged with live point sources so it stays aligned with the Points panel.
 - MQTT Input diagram nodes show bound **point count** on the right of the title. Input inspector has no Hide/Remove — delete via diagram later.
-- Persist in `project.json` (current version 11): `mqtt.clients[]`, `mqtt.embedded` (hub broker listen; rumqttd Start/Stop in MQTT panel), `hubs` (binds), `points[]`, `next_point_seq`; other protocols add `opcua`, `http`, `streams`, `las`, `snmp`, `modbus`, `files`.
+- Persist in `project.json` (current version 11): `mqtt.clients[]`, `mqtt.embedded` (hub broker listen; rumqttd Start/Stop in MQTT panel), `hubs` (binds), `points[]`, `next_point_seq`; other protocols add `opcua`, `http`, `streams`, `las`, `snmp`, `modbus`, `files`, `wits`, `websocket`, `sparkplug`, `dnp3`, `can`. An empty connection list stays empty on open and save (no placeholder connection is added).
 
 ### Modbus model (live: TCP + RTU, client + server)
 
@@ -132,6 +135,8 @@ One schema-driven path for the five newer protocols: a protocol panel (connectio
 
 Today: the window, layout, themes, the hub diagram with Input/Output binds for every protocol, the engine thread boundary, host point store (`pb-points`), pack loader, headless `pb-service` with localhost IPC and an MCP server, and live packs for **MQTT** (client + embedded broker; TCP / TLS / WS / WSS), **OPC UA** (client + server), **Streams** (serial / TCP), **HTTP / REST**, **Modbus** (TCP / RTU, client + server, register maps with scaling), **File follow** (CSV / JSON lines), **SNMP** (v1 / v2c GET), **LAS** (2.0 follow + write), **WITS** (level 0 in / out), **WebSocket** (client + server), **Sparkplug B** (host + edge), **DNP3** (TCP master) and **CAN** (SocketCAN).
 
+Hub Outputs exist for MQTT, Modbus, Streams, HTTP, LAS and the five ext protocols; OPC UA (client writes), File follow and SNMP are input-only.
+
 Not yet: license signing enforcement, MSI, DNP3 serial / outstation, SNMPv3 / SET, WITSML. Embedded MQTT broker (rumqttd) Start/Stop is live in the MQTT panel. Project open/save uses a native file requester (`rfd`) on a worker thread so the egui loop never blocks (Hyprland stalls if the dialog runs on the UI thread).
 
 ## Protocols
@@ -160,7 +165,7 @@ LAS and WITS are the oilfield and frac data plane. WITS means the WITS record st
 
 ## First usable build (targets)
 
-When live engines land, the first usable build should cover:
+All engines below are live. The first usable build covers:
 
 | Endpoint | Role |
 | --- | --- |
@@ -171,16 +176,16 @@ When live engines land, the first usable build should cover:
 | OPC UA | **Client and server** |
 | File follow | Growing CSV / JSON lines → points; byte offset across restart and rotate |
 | Platforms | **Linux and Windows** |
-| Mappings | **Type-preserving copy only** (no scale / endian / word-swap yet) |
+| Mappings | Type-preserving copy; Modbus binds add byte / word order and scale / offset; single-stream calculations and aggregators on hub edges |
 
-Done when:
+Done when (status 2026-11-26):
 
-- Two serial ports and two TCP endpoints run in one project.
-- A Modbus value is visible as a point and leaves on MQTT and OPC UA; MQTT can write a Modbus register.
-- Stopping and opening the project restores the same bridges.
-- A dead endpoint shows bad quality and is retried.
-- Appending a CSV row becomes points that leave on MQTT without rereading seen rows.
-- The same project shape runs on Linux and Windows.
+- [ ] Two serial ports and two TCP endpoints run in one project (no automated test yet).
+- [x] A Modbus value is visible as a point and leaves on MQTT and OPC UA; MQTT can write a Modbus register (Plant demo, `scripts/modbus-smoke.sh`).
+- [~] Stopping and opening the project restores the same bridges — the service reopens the same project after a hard kill (`pb-service/tests/restart_reopens_project.rs`); bridge traffic after the restart is not asserted yet.
+- [x] A dead endpoint shows bad quality and is retried (Modbus, SNMP, File follow, DNP3, WITS tests).
+- [x] Appending a CSV row becomes points that leave on MQTT without rereading seen rows (`scripts/files-smoke.sh`).
+- [ ] The same project shape runs on Linux and Windows (Windows untested).
 
 ## Multi-hub test approach
 
@@ -188,7 +193,7 @@ Bench validation uses **scripts → hub store → outputs**, then a **second hub
 
 ## Later
 
-Hold until the first build is real: SQL, cloud connectors, Kafka as its own client, Influx line protocol as a write format, syslog / NATS / MTConnect / OpenTelemetry, vendor PLC catalogs (S7, EtherNet/IP, BACnet, …), OPC DA / COM, historians, redundancy, OPC Foundation certification, scripted transforms beyond type-preserving copy (scale / endian / word-swap), WITSML.
+Hold until the first build is real: SQL, cloud connectors, Kafka as its own client, Influx line protocol as a write format, syslog / NATS / MTConnect / OpenTelemetry, vendor PLC catalogs (S7, EtherNet/IP, BACnet, …), OPC DA / COM, historians, redundancy, OPC Foundation certification, scripted transforms beyond the built-in calculations, WITSML.
 
 Embedded MQTT broker (and similar in-process server ideas, e.g. OPC UA) are **planned for hub scenarios**, not deferred forever — see Settled decisions.
 
@@ -200,14 +205,14 @@ Short version (detail in the landscape doc): Neuron, Kepware, and DataHub are pl
 
 - Language: **Rust** for the Protocol Bench **service** and **UI** (workspace today: `pb-ui` egui/eframe, `pb-engine`; service/UI split is the settled process shape — see Settled #1).
 - Online **license server** can also be Rust. Cloudflare Workers supports Rust via [workers-rs](https://github.com/cloudflare/workers-rs) (first-class language). That fit is viable for a license API on Workers with D1 / KV / R2. Workers is not a long-running tokio process — use Containers or a VPS if that model is required. Hosting is not over-specified here; CF Workers + Rust is noted as a viable option only.
-- Candidate crates (spikes, not defaults): `serialport`, `tokio-modbus`, `rumqttc` (or equivalent), [async-opcua](https://github.com/FreeOpcUa/async-opcua) (MPL-2.0 subset).
+- Crates in use: `serialport`, `rumqttc` / `rumqttd`, [async-opcua](https://github.com/FreeOpcUa/async-opcua) (MPL-2.0 subset), `tungstenite`, `ureq`. Modbus, SNMP, DNP3, WITS, Sparkplug B and CAN framing are our own code (no `tokio-modbus`).
 - Adjacent product: Modbus Bench remains Modbus-only; Protocol Bench is separate and can be tested with it.
 
 ## Settled decisions
 
 Recorded 2026-11-13 from Mike’s answers (numbering matches the former Open decisions list):
 
-1. **Process shape** — **service always + separate UI**. The service is the always-on converter; the UI is for config and monitoring only. No dual-mode single-process bench. Protocol packs load in the **service**. Local IPC between UI and service is follow-on design.
+1. **Process shape** — **service always + separate UI**. The service is the always-on converter; the UI is for config and monitoring only. No dual-mode single-process bench. Protocol packs load in the **service**. UI ↔ service IPC is length-prefixed JSON over localhost with a token (built).
 2. **UI toolkit** — egui / eframe (already in the shell).
 3. **Raw serial** — both transparent byte pipe and delimited frames in the first build.
 4. **MQTT** — client required; embedded broker / in-process server capability planned for hub scenarios (MQTT first; consider OPC UA for similar hub concepts). Some hub designs will use protocols already suited to that role.
@@ -220,7 +225,7 @@ Recorded 2026-11-13 from Mike’s answers (numbering matches the former Open dec
 11. **File parsers** — CSV and JSON lines stay the first-build set.
 12. **Language** — Protocol Bench service + UI remain Rust. Online license server can also be Rust; Cloudflare Workers + workers-rs is a viable host for a license API (see [Runtime](#runtime)).
 13. **Windows installer** — **MSI via WiX**, driven from the Rust repo with **`cargo-wix`** (not Inno Setup). Chosen for IT-friendly deploys (GPO / SCCM / silent install, standard Add/Remove Programs). Layout installs **service + UI + module dir**; upgrades must **preserve config, licenses, and packs**. Product **updates** stay on the Rust **license server** path (manifest + signed downloads) — the installer choice does not replace that. **Linux installer** is later / TBD and is not blocking.
-14. **MCP on the service** — the always-on **service** hosts an **MCP server** so an agent can manage setup (channels, points, mappings, hubs, and related product actions). Not in the UI process. High-level product intent only; no tool schema yet (see [MCP server on the service](#mcp-server-on-the-service)).
+14. **MCP on the service** — the always-on **service** hosts an **MCP server** so an agent can manage setup (channels, points, mappings, hubs, and related product actions). Not in the UI process. Built with 11 tools (see [MCP server on the service](#mcp-server-on-the-service)).
 15. **Hub graph model** — **Hub** = conversion / routing point (multiple hubs allowed for multiple conversion points). **Aggregator** and **Calculation** are edge transforms on the data path between nodes (sources → optional edge transforms → hub → optional edge transforms → outputs), not independent sibling hub-step nodes. UI adds them on a selected / right-clicked connection. **Calculation** = single-stream; **Aggregator** = N≥2 member combine → `agg_N` (see [Calculations vs Aggregators](#calculations-vs-aggregators)).
 16. **Hub protocol** — every hub is **one protocol**; **Split** hubs are removed. Only **server-capable** protocols may be hubs (Modbus server, MQTT broker/server-oriented, OPC UA server). Sources and outputs define other protocols on the diagram.
 
@@ -230,8 +235,9 @@ Recorded 2026-11-13 from Mike’s answers (numbering matches the former Open dec
 
 ## Polish still in front of us
 
-- Live link state, quality, and last error on each endpoint.
-- A saved project that restores endpoints and mappings (beyond window layout persistence).
-- File follow byte offset across restart and rotated log.
-- The rest of the protocol list, each on its own engine thread.
+Done since the first draft: live link state / quality / last error per endpoint, projects that restore endpoints and mappings, File follow offsets across restart and rotation, every protocol on its own engine thread, reopen-last-project after a restart, File → New project.
+
+- MCP edits are not pushed to an open UI (it sees them after reopening the project).
+- The protocol picker's list scrolls after ~10 entries instead of showing all 13.
+- Two-serial + two-TCP and bridges-after-restart acceptance tests.
 - Panel art that keeps following the theme as new diagrams are added.

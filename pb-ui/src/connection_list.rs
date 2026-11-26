@@ -89,7 +89,9 @@ pub fn selectable_row(
         Pos2::new(text_right, rect.max.y),
     );
 
-    let title = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font_ui(13.0), p.text));
+    // One line each, cut with "…" at the text edge so nothing runs under the × button.
+    let max_w = text_rect.width().max(1.0);
+    let title = elided(ui, label, font_ui(13.0), p.text, max_w);
     if subtitle.is_empty() {
         ui.painter().galley(
             Pos2::new(
@@ -100,7 +102,7 @@ pub fn selectable_row(
             p.text,
         );
     } else {
-        let sub = ui.fonts(|f| f.layout_no_wrap(subtitle.to_owned(), font_ui(11.0), p.muted));
+        let sub = elided(ui, subtitle, font_ui(11.0), p.muted, max_w);
         let title_h = title.size().y;
         let block_h = title_h + 2.0 + sub.size().y;
         let top = text_rect.center().y - block_h * 0.5;
@@ -114,7 +116,14 @@ pub fn selectable_row(
     }
 
     let label_id = ui.id().with(("pb_conn_row", label, subtitle));
-    let label_resp = ui.interact(text_rect, label_id, Sense::click());
+    let mut label_resp = ui.interact(text_rect, label_id, Sense::click());
+    if elided_width(ui, label, font_ui(13.0)) > max_w || elided_width(ui, subtitle, font_ui(11.0)) > max_w {
+        label_resp = label_resp.on_hover_text(if subtitle.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label}\n{subtitle}")
+        });
+    }
     if label_resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -154,6 +163,28 @@ pub fn selectable_row(
     }
 
     action
+}
+
+fn elided_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
+    ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE).size().x)
+}
+
+/// Single-line galley no wider than `max_w`, ending in "…" when cut.
+pub fn elided(
+    ui: &egui::Ui,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping {
+        max_width: max_w,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ui.fonts(|f| f.layout_job(job))
 }
 
 /// Modal confirm before removing a connection. Returns index when Delete is chosen.
@@ -303,7 +334,7 @@ pub fn labeled_field(ui: &mut egui::Ui, label_w: f32, label: &str, value: &mut S
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = space::ITEM_X;
         ui.add_sized([label_w, 20.0], egui::Label::new(egui::RichText::new(label).font(font_ui(12.0)).color(p.muted)));
-        let w = (ui.available_width() - 8.0).clamp(140.0, 420.0);
+        let w = (ui.available_width() - 8.0).clamp(64.0, 420.0);
         if ui
             .add(egui::TextEdit::singleline(value).desired_width(w).margin(egui::Margin::symmetric(6.0, 3.0)))
             .changed()
@@ -313,4 +344,23 @@ pub fn labeled_field(ui: &mut egui::Ui, label_w: f32, label: &str, value: &mut S
     });
     ui.add_space(2.0);
     changed
+}
+
+#[cfg(test)]
+mod elide_tests {
+    #[test]
+    fn long_rows_are_cut_to_the_text_edge() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let long = "TCP client · 127.0.0.1:5021 · unit 1 · error: connection refused";
+                let g = super::elided(ui, long, crate::theme::font_ui(11.0), egui::Color32::WHITE, 120.0);
+                assert!(g.size().x <= 120.5, "{}", g.size().x);
+                assert_eq!(g.rows.len(), 1);
+                assert!(g.text().len() < long.len() || g.rows[0].glyphs.last().map(|x| x.chr) == Some('…'));
+                let short = super::elided(ui, "Pump 1", crate::theme::font_ui(11.0), egui::Color32::WHITE, 120.0);
+                assert_eq!(short.rows[0].glyphs.iter().map(|x| x.chr).collect::<String>(), "Pump 1");
+            });
+        });
+    }
 }

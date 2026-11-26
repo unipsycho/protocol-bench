@@ -149,8 +149,14 @@ fn dispatch(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from);
+            let named = path.is_some();
             match rt.put_project(params.project, params.auto_run_hubs, path) {
-                Ok(()) => Response::ok(id, serde_json::json!({ "ok": true })),
+                Ok(()) => {
+                    if named {
+                        let _ = pb_ipc::write_last_project(&rt.project_path);
+                    }
+                    Response::ok(id, serde_json::json!({ "ok": true }))
+                }
                 Err(e) => Response::err(id, e),
             }
         }
@@ -167,10 +173,14 @@ fn dispatch(
             // Switching projects: stop what the old one started before the new one configures.
             rt.stop_all_hubs();
             match rt.load_project_file(&path, params.auto_run_hubs) {
-                Ok(()) => Response::ok(
-                    id,
-                    serde_json::json!({ "ok": true, "path": path.display().to_string() }),
-                ),
+                Ok(()) => {
+                    // Remember it so a restarted service reopens this project, not the default.
+                    let _ = pb_ipc::write_last_project(&path);
+                    Response::ok(
+                        id,
+                        serde_json::json!({ "ok": true, "path": path.display().to_string() }),
+                    )
+                }
                 Err(e) => Response::err(id, e),
             }
         }

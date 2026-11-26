@@ -97,6 +97,7 @@ fn blank_project() -> ProjectFile {
     f.opcua.clients.clear();
     f.opcua.selected_client_id.clear();
     f.las.endpoints.clear();
+    f.las.selected_id.clear();
     f.snmp.targets.clear();
     f.snmp.selected_id.clear();
     f

@@ -159,6 +159,35 @@ impl Default for ProjectFile {
     }
 }
 
+impl ProjectFile {
+    /// A fresh project for File → New: no connections in any protocol, no hubs, no points.
+    /// (`Default` keeps sample connections for the first-run project.) The embedded MQTT /
+    /// OPC UA hub settings stay at their defaults, off until a hub uses them.
+    pub fn blank(name: &str) -> Self {
+        let mut f = Self::default();
+        f.mqtt.clients.clear();
+        f.mqtt.selected_id.clear();
+        f.opcua.clients.clear();
+        f.opcua.selected_client_id.clear();
+        f.http.clients.clear();
+        f.http.selected_id.clear();
+        f.streams.endpoints.clear();
+        f.streams.selected_id.clear();
+        f.las.endpoints.clear();
+        f.las.selected_id.clear();
+        f.snmp.targets.clear();
+        f.snmp.selected_id.clear();
+        f.modbus.connections.clear();
+        f.modbus.selected_id.clear();
+        f.files.sources.clear();
+        f.files.selected_id.clear();
+        f.ext = Default::default();
+        f.hubs = Some(HubModel::empty());
+        f.settings.name = name.trim().to_string();
+        f
+    }
+}
+
 /// LAS well-log file endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LasProject {
@@ -265,11 +294,6 @@ impl LasProject {
 
     pub fn apply_to_panel(&self, state: &mut crate::las_panel::LasPanelState) {
         state.endpoints = self.endpoints.iter().map(|e| e.to_endpoint()).collect();
-        if state.endpoints.is_empty() {
-            state
-                .endpoints
-                .push(crate::las_panel::LasEndpoint::default_incoming());
-        }
         state.selected = if self.selected_id.is_empty() {
             None
         } else {
@@ -362,9 +386,6 @@ impl ModbusProject {
 
     pub fn apply_to_panel(&self, state: &mut crate::modbus_panel::ModbusPanelState) {
         state.conns = self.connections.clone();
-        if state.conns.is_empty() {
-            state.conns.push(crate::modbus_panel::ModbusConn::default_client());
-        }
         state.selected = if self.selected_id.is_empty() {
             None
         } else {
@@ -407,9 +428,6 @@ impl FilesProject {
 
     pub fn apply_to_panel(&self, state: &mut crate::files_panel::FilesPanelState) {
         state.sources = self.sources.clone();
-        if state.sources.is_empty() {
-            state.sources.push(crate::files_panel::FileSource::default_csv());
-        }
         state.selected = if self.selected_id.is_empty() {
             None
         } else {
@@ -525,9 +543,6 @@ impl SnmpProject {
 
     pub fn apply_to_panel(&self, state: &mut crate::snmp_panel::SnmpPanelState) {
         state.targets = self.targets.iter().map(|t| t.to_target()).collect();
-        if state.targets.is_empty() {
-            state.targets.push(crate::snmp_panel::SnmpTarget::default_local());
-        }
         state.selected = if self.selected_id.is_empty() {
             None
         } else {
@@ -678,9 +693,6 @@ impl HttpProject {
 
     pub fn apply_to_panel(&self, state: &mut crate::http_panel::HttpPanelState) {
         state.clients = self.clients.iter().map(|c| c.to_client()).collect();
-        if state.clients.is_empty() {
-            state.clients.push(crate::http_panel::HttpClient::default_local());
-        }
         state.selected = if self.selected_id.is_empty() {
             None
         } else {
@@ -823,9 +835,6 @@ impl StreamsProject {
 
     pub fn apply_to_panel(&self, state: &mut crate::streams_panel::StreamsPanelState) {
         state.endpoints = self.endpoints.iter().map(|e| e.to_endpoint()).collect();
-        if state.endpoints.is_empty() {
-            state.endpoints.push(crate::streams_panel::StreamEndpoint::default_serial());
-        }
         state.selected = if self.selected_id.is_empty() {
             None
         } else {
@@ -972,11 +981,8 @@ impl OpcUaProject {
 
     pub fn apply_to_panel(&self, state: &mut OpcUaPanelState) {
         state.embedded = self.embedded.clone();
-        state.clients = if self.clients.is_empty() {
-            vec![OpcUaClient::default_plant()]
-        } else {
-            self.clients.iter().map(OpcUaClientSerde::to_panel).collect()
-        };
+        // An empty list stays empty: a stub client here would be saved back into the project.
+        state.clients = self.clients.iter().map(OpcUaClientSerde::to_panel).collect();
         state.selected = state
             .clients
             .iter()
@@ -1209,9 +1215,6 @@ impl MqttProject {
 
     pub fn apply_to_panel(&self, state: &mut MqttPanelState) {
         state.clients = self.clients.iter().map(|c| c.to_client()).collect();
-        if state.clients.is_empty() {
-            state.clients.push(MqttClient::default_local());
-        }
         state.ensure_unique_mqtt_client_ids();
         // Empty selected_id → list-only (no detail form).
         state.selected = if self.selected_id.is_empty() {

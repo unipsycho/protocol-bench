@@ -843,6 +843,21 @@ fn mb_bind(area: &str, address: u16, dtype: &str, order: &str, point: &str) -> M
 }
 
 impl HubModel {
+    /// No hubs, no wires (File → New project). View settings keep their defaults.
+    pub fn empty() -> Self {
+        let mut model = Self::sample();
+        model.hubs.clear();
+        model.feeds.clear();
+        model.selected = None;
+        model.selected_port = None;
+        model.selected_link = None;
+        model.selection.clear();
+        model.selected_feed = None;
+        model.next_id = 1;
+        model.wired = true;
+        model
+    }
+
     /// Two hubs: Plant (Modbus server) with mixed-protocol links, Edge (MQTT broker).
     pub fn sample() -> Self {
         let mut model = Self::sample_unwired();
@@ -2701,8 +2716,10 @@ pub fn paint(
             change.dirty = true;
         }
         ui.add_space(8.0);
-        legend(ui, p);
-        ui.add_space(8.0);
+        // Reserve the Navigation chip and the layout toggle on the right.
+        let nav_w = ui.fonts(|f| f.layout_no_wrap("Navigation  (?)".into(), font_ui(12.0), p.text).size().x) + 14.0;
+        let reserve = nav_w + 36.0 + 16.0 + ui.spacing().item_spacing.x * 3.0;
+        legend(ui, p, ui.available_width() - reserve);
         ui.add_space(8.0);
         // PB-77: chip control so hover help is obvious (not inert text).
         navigation_help_chip(ui, p);
@@ -2904,16 +2921,28 @@ fn layout_toggle_icon(ui: &mut Ui, below: bool, p: &ThemePalette) -> egui::Respo
     })
 }
 
-fn legend(ui: &mut Ui, p: &ThemePalette) {
+/// Wiring hint, in the longest form that fits `max_w` (nothing in a very narrow pane).
+/// A toolbar row wider than the pane would widen the whole pane's layout, so this must
+/// never overflow.
+fn legend(ui: &mut Ui, p: &ThemePalette, max_w: f32) {
+    const FORMS: [&str; 3] = [
+        "Wire: drag from an input / hub edge · right-click a wire to add a calc or aggregator",
+        "Wire: drag from an input / hub edge",
+        "Drag to wire",
+    ];
+    let swatch = 28.0 + ui.spacing().item_spacing.x;
+    let Some(text) = FORMS.iter().find(|t| {
+        swatch + ui.fonts(|f| f.layout_no_wrap(t.to_string(), font_ui(11.0), p.muted).size().x) <= max_w
+    }) else {
+        return;
+    };
     let (rect, _) = ui.allocate_exact_size(vec2(28.0, 14.0), Sense::hover());
     let y = rect.center().y;
     ui.painter()
-        .line_segment([pos2(rect.min.x, y), pos2(rect.max.x, y)], Stroke::new(1.6, p.live));
-    ui.label(
-        egui::RichText::new("Wire: drag from an input / hub edge · right-click a wire to add a calc or aggregator")
-            .font(font_ui(11.0))
-            .color(p.muted),
-    );
+        .line_segment([pos2(rect.min.x, y), pos2(rect.max.x, y)], Stroke::new(1.6, p.live))
+    ;
+    ui.label(egui::RichText::new(*text).font(font_ui(11.0)).color(p.muted))
+        .on_hover_text(FORMS[0]);
 }
 
 fn diagram_view(

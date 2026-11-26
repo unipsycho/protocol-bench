@@ -505,11 +505,9 @@ impl ModbusPanelState {
             .collect()
     }
 
+    /// Keep the selection in range. An empty list stays empty (and is saved that way).
     fn ensure_conns(&mut self) {
-        if self.conns.is_empty() {
-            self.conns.push(ModbusConn::default_client());
-            self.selected = None;
-        } else if self.selected.is_some_and(|i| i >= self.conns.len()) {
+        if self.selected.is_some_and(|i| i >= self.conns.len()) {
             self.selected = None;
         }
     }
@@ -673,7 +671,7 @@ fn edit_selected(
         let mut role = c.role;
         egui::ComboBox::from_id_salt("pb_modbus_role")
             .selected_text(role.label())
-            .width(160.0)
+            .width((ui.available_width() - 8.0).clamp(64.0, 160.0))
             .show_ui(ui, |ui| {
                 for r in [ModbusRole::Client, ModbusRole::Server] {
                     ui.selectable_value(&mut role, r, r.label());
@@ -694,7 +692,7 @@ fn edit_selected(
         let mut t = c.transport;
         egui::ComboBox::from_id_salt("pb_modbus_transport")
             .selected_text(t.label())
-            .width(160.0)
+            .width((ui.available_width() - 8.0).clamp(64.0, 160.0))
             .show_ui(ui, |ui| {
                 for v in [ModbusTransport::Tcp, ModbusTransport::Rtu] {
                     ui.selectable_value(&mut t, v, v.label());
@@ -826,9 +824,15 @@ pub(crate) fn section(ui: &mut egui::Ui, title: &str, p: &ThemePalette) {
     ui.add_space(space::AFTER_HEADING);
 }
 
+/// Label column for form rows: [`LABEL_W`] normally, narrower in a narrow pane so the
+/// field beside it is not pushed past the right edge.
+pub(crate) fn label_width(row_w: f32) -> f32 {
+    LABEL_W.min((row_w * 0.34).max(56.0))
+}
+
 fn label_cell(ui: &mut egui::Ui, label: &str, p: &ThemePalette) {
     ui.add_sized(
-        [LABEL_W, 20.0],
+        [label_width(ui.available_width()), 20.0],
         egui::Label::new(RichText::new(label).font(font_ui(12.0)).color(p.muted)),
     );
 }
@@ -861,7 +865,7 @@ pub(crate) fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String, p: 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = space::ITEM_X;
         label_cell(ui, label, p);
-        let w = (ui.available_width() - 8.0).clamp(140.0, 420.0);
+        let w = (ui.available_width() - 8.0).clamp(64.0, 420.0);
         changed = ui
             .add(
                 egui::TextEdit::singleline(value)
@@ -871,6 +875,19 @@ pub(crate) fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String, p: 
             .changed();
     });
     changed
+}
+
+#[cfg(test)]
+mod label_width_tests {
+    use super::*;
+
+    #[test]
+    fn label_column_shrinks_only_in_narrow_panes() {
+        assert_eq!(label_width(600.0), LABEL_W);
+        assert!(label_width(240.0) < LABEL_W);
+        assert!(label_width(240.0) + 64.0 + 16.0 <= 240.0, "room for a minimum field");
+        assert_eq!(label_width(100.0), 56.0, "never below a readable minimum");
+    }
 }
 
 #[cfg(test)]

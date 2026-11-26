@@ -33,6 +33,8 @@ mod panels;
 mod persist;
 mod point_rows;
 mod project;
+#[cfg(test)]
+mod project_load_tests;
 mod register_map;
 mod streams_panel;
 mod theme;

@@ -106,6 +106,27 @@ pub fn rows(hubs: &HubModel, host: &HostSnapshot) -> Vec<MappingRow> {
     rows
 }
 
+const HEADERS: [&str; 4] = ["POINT", "FROM", "TO", "HUB"];
+const GRID_GAP: f32 = 14.0;
+
+/// Which of POINT / FROM / TO / HUB fit in `avail`. Point and To always show (To is what
+/// tells two rows for the same point apart); From, then Hub, are added while they fit.
+/// Hub is left out when every row belongs to the same hub.
+fn plan_columns(widths: [f32; 4], avail: f32, gap: f32, single_hub: bool) -> [bool; 4] {
+    let mut show = [true, false, true, false];
+    let mut used = widths[0] + gap + widths[2];
+    for i in [1, 3] {
+        if i == 3 && single_hub {
+            continue;
+        }
+        if used + gap + widths[i] <= avail {
+            show[i] = true;
+            used += gap + widths[i];
+        }
+    }
+    show
+}
+
 pub fn paint(ui: &mut egui::Ui, host: &HostSnapshot, hubs: &HubModel, p: &ThemePalette) {
     let full = ui.available_rect_before_wrap();
     let inner = form_inset(full);
@@ -136,20 +157,37 @@ pub fn paint(ui: &mut egui::Ui, host: &HostSnapshot, hubs: &HubModel, p: &ThemeP
                 .id_salt("pb_mappings")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    let measure = |t: &str| ui.fonts(|f| f.layout_no_wrap(t.to_string(), font_ui(12.0), p.text).size().x);
+                    let mut widths = [0.0f32; 4];
+                    for (i, h) in HEADERS.iter().enumerate() {
+                        widths[i] = measure(h);
+                    }
+                    for r in &rows {
+                        for (i, t) in [&r.point, &r.from, &r.to, &r.hub].into_iter().enumerate() {
+                            widths[i] = widths[i].max(measure(t));
+                        }
+                    }
+                    let single_hub = rows.iter().all(|r| r.hub == rows[0].hub);
+                    let show = plan_columns(widths, ui.available_width(), GRID_GAP, single_hub);
+                    let cols: Vec<usize> = (0..4).filter(|i| show[*i]).collect();
                     egui::Grid::new("pb_mappings_grid")
-                        .num_columns(4)
-                        .spacing([14.0, 4.0])
+                        .num_columns(cols.len())
+                        .spacing([GRID_GAP, 4.0])
                         .striped(true)
                         .show(ui, |ui| {
-                            for h in ["POINT", "FROM", "TO", "HUB"] {
-                                ui.label(RichText::new(h).font(font_ui(10.5)).color(p.muted));
+                            for &i in &cols {
+                                ui.label(RichText::new(HEADERS[i]).font(font_ui(10.5)).color(p.muted));
                             }
                             ui.end_row();
                             for r in &rows {
-                                ui.label(RichText::new(&r.point).font(font_ui(12.0)).color(p.text));
-                                ui.label(RichText::new(&r.from).font(font_ui(12.0)).color(p.muted));
-                                ui.label(RichText::new(&r.to).font(font_ui(12.0)).color(p.text));
-                                ui.label(RichText::new(&r.hub).font(font_ui(12.0)).color(p.muted));
+                                let cells = [&r.point, &r.from, &r.to, &r.hub];
+                                for &i in &cols {
+                                    let color = if i == 1 || i == 3 { p.muted } else { p.text };
+                                    let resp = ui.label(RichText::new(cells[i]).font(font_ui(12.0)).color(color));
+                                    if i == 0 && cols.len() < 4 {
+                                        resp.on_hover_text(format!("{}  →  {}\nhub: {}", r.from, r.to, r.hub));
+                                    }
+                                }
                                 ui.end_row();
                             }
                         });
@@ -157,4 +195,29 @@ pub fn paint(ui: &mut egui::Ui, host: &HostSnapshot, hubs: &HubModel, p: &ThemeP
         },
     );
     ui.allocate_rect(full, egui::Sense::hover());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plan_columns;
+
+    const W: [f32; 4] = [120.0, 200.0, 220.0, 90.0];
+
+    #[test]
+    fn wide_pane_shows_all_four() {
+        assert_eq!(plan_columns(W, 1000.0, 14.0, false), [true, true, true, true]);
+    }
+
+    #[test]
+    fn single_hub_drops_the_hub_column() {
+        assert_eq!(plan_columns(W, 1000.0, 14.0, true), [true, true, true, false]);
+    }
+
+    #[test]
+    fn narrow_pane_keeps_to_and_drops_from() {
+        // Room for point + to only: the destination tells duplicate-looking rows apart.
+        assert_eq!(plan_columns(W, 360.0, 14.0, false), [true, false, true, false]);
+        // Room for hub but not from: hub is added.
+        assert_eq!(plan_columns(W, 460.0, 14.0, false), [true, false, true, true]);
+    }
 }

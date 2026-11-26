@@ -11,7 +11,8 @@ mod proto;
 pub use client::RemoteHandle;
 pub use frame::{read_json, write_json};
 pub use paths::{
-    config_dir, default_project_path, endpoint_path, ensure_token, read_endpoint, read_token,
-    token_path, write_endpoint, write_token, IpcEndpoint,
+    config_dir, default_project_path, endpoint_path, ensure_token, last_project_marker,
+    read_endpoint, read_last_project_from, read_token, startup_project_path, token_path,
+    write_endpoint, write_last_project, write_last_project_to, write_token, IpcEndpoint,
 };
 pub use proto::*;

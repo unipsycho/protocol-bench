@@ -115,22 +115,28 @@ impl RemoteHandle {
         let Some(stream) = guard.as_mut() else {
             return Err("service disconnected".into());
         };
-        let result = (|| {
+        // Transport trouble (write/read failure, id mismatch) drops the socket so the next
+        // probe reconnects. An error *reply* ("not valid JSON", "unknown point") is the
+        // service answering normally: the connection stays up.
+        let transport = (|| {
             write_json(stream, &req)?;
             let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
             let resp: Response = read_json(&mut reader)?;
             if resp.id != id {
                 return Err(format!("IPC id mismatch: sent {id}, got {}", resp.id));
             }
-            if let Some(err) = resp.error {
-                return Err(err);
-            }
-            Ok(resp.result.unwrap_or(serde_json::Value::Null))
+            Ok(resp)
         })();
-        if result.is_err() {
-            *guard = None;
+        match transport {
+            Ok(resp) => match resp.error {
+                Some(err) => Err(err),
+                None => Ok(resp.result.unwrap_or(serde_json::Value::Null)),
+            },
+            Err(err) => {
+                *guard = None;
+                Err(err)
+            }
         }
-        result
     }
 
     /// Status with auto-reconnect when the socket is dead.

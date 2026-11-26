@@ -498,3 +498,70 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod store_invariants {
+    use super::*;
+
+    #[test]
+    fn rebinding_an_id_moves_its_source_and_frees_the_old_address() {
+        let mut s = PointStore::new();
+        s.bind("modbus_1", "modbus/plc::hr:0");
+        s.bind("modbus_1", "modbus/plc::hr:2");
+        assert_eq!(s.source_for_id("modbus_1"), Some("modbus/plc::hr:2"));
+        assert_eq!(s.id_for_source("modbus/plc::hr:0"), None, "old address no longer maps");
+        assert_eq!(s.get("modbus_1").unwrap().source, "modbus/plc::hr:2", "row follows");
+    }
+
+    #[test]
+    fn binding_an_address_to_a_new_id_retires_the_old_id_but_never_reuses_it() {
+        let mut s = PointStore::new();
+        s.bind("mqtt_1", "mqtt/local/a");
+        s.bind("mqtt_2", "mqtt/local/a");
+        assert_eq!(s.id_for_source("mqtt/local/a"), Some("mqtt_2"));
+        assert_eq!(s.source_for_id("mqtt_1"), None);
+        let fresh = s.ensure_id("mqtt", "mqtt/local/b");
+        assert_eq!(fresh, "mqtt_3", "1 and 2 stay reserved");
+    }
+
+    #[test]
+    fn bind_keeps_a_live_value_already_upserted() {
+        let mut s = PointStore::new();
+        s.upsert("mqtt_4", PointValue::String("42".into()), Quality::Good, "mqtt/local/x");
+        s.bind("mqtt_4", "mqtt/local/x");
+        let p = s.get("mqtt_4").unwrap();
+        assert_eq!(p.quality, Quality::Good, "project load must not blank a live point");
+        assert_eq!(p.value, PointValue::String("42".into()));
+    }
+
+    #[test]
+    fn imported_ids_raise_the_sequence_and_removal_never_frees_a_number() {
+        let mut s = PointStore::new();
+        s.import_bindings(&[PointBinding { id: "file_17".into(), source: "file/meter::flow".into() }]);
+        assert!(s.next_seq() >= 18);
+        assert_eq!(s.ensure_id("file", "file/meter::temp"), "file_18");
+        s.remove("file_18");
+        assert_eq!(s.ensure_id("file", "file/meter::temp2"), "file_19");
+        // Lowering the high-water mark is refused.
+        s.set_next_seq_at_least(3);
+        assert!(s.next_seq() >= 20);
+    }
+
+    #[test]
+    fn same_address_always_gets_the_same_id() {
+        let mut s = PointStore::new();
+        let a = s.ensure_id("modbus", " modbus/plc::hr:0 ");
+        let b = s.ensure_id("modbus", "modbus/plc::hr:0");
+        assert_eq!(a, b, "trimmed address is the key");
+        assert_eq!(s.export_bindings().len(), 1);
+    }
+
+    #[test]
+    fn blank_ids_and_sources_are_ignored() {
+        let mut s = PointStore::new();
+        s.bind("", "mqtt/local/a");
+        s.bind("mqtt_1", "  ");
+        assert!(s.export_bindings().is_empty());
+        assert!(s.is_empty());
+    }
+}

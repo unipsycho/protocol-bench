@@ -401,6 +401,11 @@ fn status_row(
     err: Option<&str>,
     p: &ThemePalette,
 ) {
+    // Title · address · state on one line when they fit, else the address drops below
+    // (in a narrow pane the right-aligned state used to paint over the address).
+    let width = |t: &str, size: f32| ui.fonts(|f| f.layout_no_wrap(t.to_string(), font_ui(size), p.text).size().x);
+    let one_line = width(title, 12.5) + width(detail, 12.0) + width(state, 12.0) + space::ITEM_X * 3.0
+        <= ui.available_width();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = space::ITEM_X;
         ui.label(
@@ -408,11 +413,13 @@ fn status_row(
                 .font(font_ui(12.5))
                 .color(p.text),
         );
-        ui.label(
-            RichText::new(detail)
-                .font(font_ui(12.0))
-                .color(p.muted),
-        );
+        if one_line {
+            ui.label(
+                RichText::new(detail)
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            );
+        }
         ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 RichText::new(state)
@@ -421,6 +428,9 @@ fn status_row(
             );
         });
     });
+    if !one_line && !detail.is_empty() {
+        ui.label(RichText::new(detail).font(font_ui(12.0)).color(p.muted));
+    }
     if let Some(e) = err {
         if !e.is_empty() {
             ui.label(

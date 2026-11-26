@@ -352,6 +352,7 @@ pub fn call_tool(name: &str, args: &Value, rt: &Arc<Mutex<Runtime>>) -> Result<V
             let auto = args.get("auto_run_hubs").and_then(|v| v.as_bool()).unwrap_or(rt.auto_run_hubs);
             rt.stop_all_hubs();
             rt.load_project_file(&path, auto)?;
+            let _ = pb_ipc::write_last_project(&path);
             Ok(json!({"ok": true, "path": path.display().to_string()}))
         }
         "stop_all_hubs" => {
@@ -401,7 +402,15 @@ mod tests {
         assert_eq!(hs[0]["inputs"][0]["protocol"], "Dnp3");
         assert_eq!(hs[0]["inputs"][0]["binds"], 1);
         // Point materialised from the hub bind is listed.
-        let pts = call(&rt, 4, "tools/call", json!({"name":"list_points","arguments":{"filter":"dnp3"}}));
+        // The host thread publishes snapshots on its own tick: wait for the first one.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let pts = loop {
+            let pts = call(&rt, 4, "tools/call", json!({"name":"list_points","arguments":{"filter":"dnp3"}}));
+            if !pts["result"]["structuredContent"]["points"][0].is_null() || std::time::Instant::now() > deadline {
+                break pts;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert_eq!(pts["result"]["structuredContent"]["points"][0]["source"], "dnp3/rtu::analog:0");
         // Add a connection: applied and saved to disk.
         let add = call(&rt, 5, "tools/call", json!({"name":"add_connection","arguments":{"protocol":"dnp3","connection":{"id":"rtu","host":"10.0.0.5","port":20000}}}));

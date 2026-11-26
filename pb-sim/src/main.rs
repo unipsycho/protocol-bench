@@ -16,6 +16,7 @@
 
 mod devices;
 mod frac;
+mod perf;
 mod bottling;
 mod watch;
 mod water;
@@ -28,6 +29,7 @@ const HELP: &str = "pb-sim — Protocol Bench demo field devices
 USAGE: pb-sim <frac | bottling | water | all>
        pb-sim watch [point …]           live point table from the running service
        pb-sim check <point …> [--timeout S]  exit 0 once every point is good (smokes / CI)
+       pb-sim perf <pid …> [--secs N] [--label T]  CPU % / RSS / threads / fds from /proc (Linux)
 
 frac      Frac pumps 1-4   Modbus TCP 127.0.0.1:5021-5024 (unit 1)
           Blender          Modbus TCP 127.0.0.1:5025
@@ -45,6 +47,9 @@ water     Lift station RTU DNP3 TCP 127.0.0.1:20001 (outstation 20, master 1)
 
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
+    if arg == "perf" {
+        std::process::exit(perf::run(std::env::args().skip(2).collect()));
+    }
     if arg == "watch" || arg == "check" {
         std::process::exit(watch::run(arg == "check", std::env::args().skip(2).collect()));
     }

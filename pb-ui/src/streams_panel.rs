@@ -191,14 +191,10 @@ impl StreamsPanelState {
             .collect()
     }
 
+    /// Keep the selection in range. An empty list stays empty (and is saved that way).
     fn ensure_endpoints(&mut self) {
-        if self.endpoints.is_empty() {
-            self.endpoints.push(StreamEndpoint::default_serial());
+        if self.selected.is_some_and(|i| i >= self.endpoints.len()) {
             self.selected = None;
-        } else if let Some(i) = self.selected {
-            if i >= self.endpoints.len() {
-                self.selected = None;
-            }
         }
     }
 
@@ -386,7 +382,7 @@ fn edit_serial(ui: &mut egui::Ui, state: &mut StreamsPanelState, p: &ThemePalett
         let mut port = e.serial_port.clone();
         egui::ComboBox::from_id_salt("pb_stream_serial_port")
             .selected_text(&port)
-            .width(200.0)
+            .width((ui.available_width() - 8.0).clamp(64.0, 200.0))
             .show_ui(ui, |ui| {
                 for pth in &ports {
                     ui.selectable_value(&mut port, pth.clone(), pth);

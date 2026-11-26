@@ -131,14 +131,10 @@ impl HttpPanelState {
         self.clients.iter().find(|c| c.id == id)
     }
 
+    /// Keep the selection in range. An empty list is allowed (and saved as empty).
     fn ensure_clients(&mut self) {
-        if self.clients.is_empty() {
-            self.clients.push(HttpClient::default_local());
+        if self.selected.is_some_and(|i| i >= self.clients.len()) {
             self.selected = None;
-        } else if let Some(i) = self.selected {
-            if i >= self.clients.len() {
-                self.selected = None;
-            }
         }
     }
 
@@ -531,7 +527,7 @@ fn password(ui: &mut egui::Ui, label: &str, value: &mut String, p: &ThemePalette
                     .color(p.muted),
             ),
         );
-        let w = (ui.available_width() - 8.0).clamp(140.0, 420.0);
+        let w = (ui.available_width() - 8.0).clamp(64.0, 420.0);
         if ui
             .add(
                 egui::TextEdit::singleline(value)

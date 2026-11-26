@@ -5,10 +5,11 @@ Always-on Protocol Bench host: loads protocol packs, owns `project.json`, serves
 ## Linux (first)
 
 ```bash
-cargo build -p pb-mqtt -p pb-opcua -p pb-streams -p pb-http -p pb-modbus -p pb-files -p pb-snmp -p pb-las -p pb-service
+cargo build -p pb-mqtt -p pb-opcua -p pb-streams -p pb-http -p pb-modbus -p pb-files -p pb-snmp -p pb-las \
+            -p pb-wits -p pb-websocket -p pb-sparkplug -p pb-dnp3 -p pb-can -p pb-service
 mkdir -p modules && cp target/debug/libpb_*.so modules/
 PB_MODULES=$PWD/modules cargo run -p pb-service
-# optional: PB_IPC_PORT=17500 PB_PROJECT=/path/to/project.json
+# optional: PB_IPC_PORT=17500 PB_PROJECT=/path/to/project.json PB_NO_TRAY=1
 ```
 
 Writes `~/.config/protocolbench/ipc.json` + `ipc.token`. UI connects with those files (no in-process engine).
@@ -26,6 +27,10 @@ Length-prefixed JSON (`u32` LE + body). Methods: `hello`, `ping`, `status`, `sna
 `open_project` stops every embedded hub and client the previous project started before the new project's config is applied. `stop_all` does the same without loading anything (project file untouched); the UI's "Stop all and quit" and the tray's "Stop all hubs" use it.
 
 ## Project lifecycle
+
+- **Start-up project:** `PB_PROJECT`, else the project in `<config dir>/last-project` (written whenever a project is opened or saved under a new path, by the UI or MCP) if that file still exists, else `<config dir>/project.json`. A killed or crashed service therefore comes back on the same project.
+- `open_project` on a file that is not valid JSON (or not an object) returns an error naming the file and leaves the current project and its path unchanged. A path that does not exist yet starts a new project there (`{"version": 7}` until the first save).
+- An error reply keeps the IPC connection open; only transport failures drop it.
 
 - The service holds one active project. A starting UI **attaches** to it (`status.project_path` + `get_project`) instead of re-opening the default, so what is running is what you see. A service with nothing live is asked to open the project so auto-run still applies.
 - Closing the UI leaves everything running. The UI warns on quit (window close, Alt+F4 or File > Quit) when hubs are live and offers **Quit, keep running**, **Stop all and quit** or **Stay**.

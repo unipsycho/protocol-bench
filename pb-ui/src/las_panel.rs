@@ -183,14 +183,10 @@ impl LasPanelState {
             .collect()
     }
 
+    /// Keep the selection in range. An empty list stays empty (and is saved that way).
     fn ensure_endpoints(&mut self) {
-        if self.endpoints.is_empty() {
-            self.endpoints.push(LasEndpoint::default_incoming());
+        if self.selected.is_some_and(|i| i >= self.endpoints.len()) {
             self.selected = None;
-        } else if let Some(i) = self.selected {
-            if i >= self.endpoints.len() {
-                self.selected = None;
-            }
         }
     }
 
@@ -342,7 +338,7 @@ fn edit_endpoint(ui: &mut egui::Ui, state: &mut LasPanelState, p: &ThemePalette,
             let mut role = e.role;
             egui::ComboBox::from_id_salt("pb_las_role")
                 .selected_text(role.label())
-                .width(180.0)
+                .width((ui.available_width() - 8.0).clamp(64.0, 180.0))
                 .show_ui(ui, |ui| {
                     for r in [LasRole::Incoming, LasRole::Outgoing] {
                         ui.selectable_value(&mut role, r, r.label());

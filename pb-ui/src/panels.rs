@@ -165,8 +165,19 @@ fn protocols_header(
         let (icon, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
         art::paint_pane_icon(ui.painter(), icon, current, current.ink(p.is_light));
         let popped_now = view.popped.contains(&current);
+        // Leave room for the "Pop out" / "Go to panel" button on the right in narrow panes.
+        let button_w = ui.fonts(|f| {
+            f.layout_no_wrap(if popped_now { "Go to panel" } else { "Pop out" }.into(), font_ui(12.5), p.text)
+                .size()
+                .x
+        }) + 24.0;
+        let combo_w = (ui.available_width() - button_w - space::ITEM_X * 3.0 - 8.0).clamp(110.0, 220.0);
+        // Tall enough for every protocol (13 packs + captions) without an inner scroll.
+        let below = ui.ctx().screen_rect().max.y - ui.next_widget_position().y - 48.0;
+        let list_h = below.clamp(240.0, 640.0);
         egui::ComboBox::from_id_salt("pb_protocols_pick")
-            .width(220.0)
+            .width(combo_w)
+            .height(list_h)
             .selected_text(protocol_entry(current, states.count(current), popped_now, host, p))
             .show_ui(ui, |ui| {
                 for (caption, list) in [("IN THIS PROJECT", &used), ("AVAILABLE", &rest)] {
@@ -405,7 +416,7 @@ fn points_panel_body(
                     .color(p.muted),
             ),
         );
-        let w = (ui.available_width() - 8.0).clamp(140.0, 360.0);
+        let w = (ui.available_width() - 8.0).clamp(64.0, 360.0);
         ui.add(
             egui::TextEdit::singleline(&mut state.filter)
                 .desired_width(w)

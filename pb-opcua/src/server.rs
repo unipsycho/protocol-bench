@@ -458,30 +458,46 @@ mod listen_probe {
         }
     }
 
+    /// A port nothing is listening on (fixed ports collide with parallel test runs).
+    /// The listener may come up a moment after `start` returns on a loaded machine.
+    fn connects(port: u16) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let addr = format!("127.0.0.1:{port}").parse().unwrap();
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)).is_ok() {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
     #[test]
     fn start_binds_tcp() {
         let dir = std::env::temp_dir().join(format!("pb-opcua-probe-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let server = EmbeddedServer::start(cfg(4847, "127.0.0.1", &dir.to_string_lossy())).expect("start");
+        let port = free_port();
+        let server = EmbeddedServer::start(cfg(port, "127.0.0.1", &dir.to_string_lossy())).expect("start");
         assert!(server.live.lock().map(|g| g.is_some()).unwrap_or(false));
-        assert!(std::net::TcpStream::connect_timeout(
-            &"127.0.0.1:4847".parse().unwrap(),
-            std::time::Duration::from_millis(500),
-        )
-        .is_ok());
+        assert!(connects(port), "listener on {port}");
         server.stop();
     }
 
     #[test]
     fn start_binds_tcp_zerohost_app_pki() {
-        let dir = "/home/mike/.local/share/protocolbench/opcua-pki";
-        let _ = std::fs::create_dir_all(dir);
-        let server = EmbeddedServer::start(cfg(4848, "0.0.0.0", dir)).expect("start");
-        assert!(std::net::TcpStream::connect_timeout(
-            &"127.0.0.1:4848".parse().unwrap(),
-            std::time::Duration::from_millis(500),
-        )
-        .is_ok());
+        // Own temp PKI: never touch the user's real certificate store from a test.
+        let dir_buf = std::env::temp_dir().join(format!("pb-opcua-probe0-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir_buf);
+        let dir = dir_buf.to_str().unwrap();
+        let port = free_port();
+        let server = EmbeddedServer::start(cfg(port, "0.0.0.0", dir)).expect("start");
+        assert!(connects(port), "listener on {port}");
         server.stop();
     }
 }
