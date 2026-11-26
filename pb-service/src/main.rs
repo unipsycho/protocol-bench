@@ -11,6 +11,7 @@
 //! Endpoint/token: `…/ProtocolBench/ipc.json` + `ipc.token`
 //! Windows Service entry is scaffolded under `windows_service` (follows Linux IPC).
 
+mod mcp;
 mod runtime;
 mod server;
 mod tray;
@@ -78,5 +79,6 @@ pub(crate) fn run_foreground() -> Result<(), String> {
     });
 
     tray::spawn(Arc::clone(&runtime));
+    mcp::spawn(Arc::clone(&runtime));
     server::serve(runtime, port)
 }

@@ -1,0 +1,19 @@
+[package]
+name = "pb-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Protocol Bench demo field devices: frac spread, bottling line, water lift station"
+
+[[bin]]
+name = "pb-sim"
+path = "src/main.rs"
+
+[dependencies]
+pb-modbus = { workspace = true }
+pb-proto = { workspace = true }
+rumqttc = { workspace = true }
+ctrlc = { workspace = true }
+pb-ipc = { workspace = true }

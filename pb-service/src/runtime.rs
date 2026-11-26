@@ -31,8 +31,10 @@ impl Runtime {
             last_error: String::new(),
             auto_run_hubs: false,
         };
+        // Headless / demo hosts: start embedded brokers and servers without a UI attaching.
+        let auto_run = std::env::var("PB_AUTO_RUN_HUBS").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"));
         if project_path.is_file() {
-            if let Err(err) = rt.load_project_file(&project_path, false) {
+            if let Err(err) = rt.load_project_file(&project_path, auto_run) {
                 rt.last_error = err;
             }
         }
@@ -91,7 +93,10 @@ impl Runtime {
             (EngineId::Snmp, build_snmp_configure(&empty, None)),
             (EngineId::Las, build_las_configure(&empty, None, None)),
         ];
-        for (id, json) in configs {
+        let ext = pb_points::addr::EXT_PROTOCOLS
+            .iter()
+            .filter_map(|spec| Some((EngineId::from_ext(spec.id)?, build_ext_configure(spec, &empty, None))));
+        for (id, json) in configs.into_iter().chain(ext) {
             self.engine
                 .submit(id, pb_engine::EngineCommand::Configure { json });
         }
@@ -252,6 +257,13 @@ impl Runtime {
                 pb_engine::EngineCommand::Configure { json },
             );
         }
+        // Ext protocols (WITS, WebSocket, Sparkplug B, DNP3, CAN) share one config shape.
+        for spec in pb_points::addr::EXT_PROTOCOLS {
+            let Some(id) = EngineId::from_ext(spec.id) else { continue };
+            let section = value.get(spec.id).cloned().unwrap_or_else(|| serde_json::json!({}));
+            let json = build_ext_configure(spec, &section, value.get("hubs"));
+            self.engine.submit(id, pb_engine::EngineCommand::Configure { json });
+        }
         self.last_error.clear();
         Ok(())
     }
@@ -399,6 +411,19 @@ fn materialize_hub_binds_json(value: &serde_json::Value, store: &mut PointStore)
                         let point = bind.get("point").and_then(|v| v.as_str()).unwrap_or("");
                         if point.is_empty() {
                             let _ = store.ensure_id("las", &source);
+                        } else {
+                            store.bind(point, &source);
+                        }
+                    }
+                }
+                if let Some(spec) = pb_points::addr::ext_spec(str_of(port, "protocol")) {
+                    let conn = str_of(port, "ext_connection");
+                    for bind in port.get("ext_inputs").and_then(|v| v.as_array()).into_iter().flatten() {
+                        let Some(leaf) = pb_points::addr::ext_leaf(spec, |k| json_field_text(bind, k)) else { continue };
+                        let source = pb_points::addr::ext_bind_source(spec, conn, &leaf);
+                        let point = str_of(bind, "point").trim();
+                        if point.is_empty() {
+                            let _ = store.ensure_id(spec.prefix, &source);
                         } else {
                             store.bind(point, &source);
                         }
@@ -1110,6 +1135,115 @@ fn build_files_configure(files: &serde_json::Value, hubs: Option<&serde_json::Va
 
 fn str_of<'a>(v: &'a serde_json::Value, k: &str) -> &'a str {
     v.get(k).and_then(|x| x.as_str()).unwrap_or("")
+}
+
+/// A bind field as text whether it was saved as a string, number or bool.
+fn json_field_text(v: &serde_json::Value, k: &str) -> String {
+    match v.get(k) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Configure JSON for an ext protocol pack:
+/// `{connections, inputs: [{connection, interval_secs, binds: [{…, source}]}], outputs: [{connection, interval_secs, binds}]}`.
+/// Connections are passed through (unset `enabled` = on); hub ports of this protocol become
+/// inputs (Input nodes, each bind gets its wire `source`) and outputs (Output nodes, binds
+/// without a point are dropped).
+fn build_ext_configure(spec: &pb_points::addr::ExtSpec, section: &serde_json::Value, hubs: Option<&serde_json::Value>) -> String {
+    let connections: Vec<serde_json::Value> = section
+        .get("connections")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| !str_of(c, "id").trim().is_empty())
+        .map(|mut c| {
+            if c.get("enabled").is_none() {
+                c["enabled"] = serde_json::json!(true);
+            }
+            c
+        })
+        .collect();
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    for hub in hubs.and_then(|h| h.get("hubs")).and_then(|v| v.as_array()).into_iter().flatten() {
+        for key in ["sources", "outputs"] {
+            let incoming = key == "sources";
+            for port in hub.get(key).and_then(|v| v.as_array()).into_iter().flatten() {
+                if !str_of(port, "protocol").eq_ignore_ascii_case(spec.id) {
+                    continue;
+                }
+                let conn = str_of(port, "ext_connection").trim().to_string();
+                if conn.is_empty() {
+                    continue;
+                }
+                let interval = port.get("ext_interval_secs").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let list = port.get(if incoming { "ext_inputs" } else { "ext_outputs" }).and_then(|v| v.as_array());
+                let mut binds = Vec::new();
+                for b in list.into_iter().flatten() {
+                    if incoming {
+                        let Some(leaf) = pb_points::addr::ext_leaf(spec, |k| json_field_text(b, k)) else { continue };
+                        let mut b = b.clone();
+                        b["source"] = serde_json::json!(pb_points::addr::ext_bind_source(spec, &conn, &leaf));
+                        binds.push(b);
+                    } else if !str_of(b, "point").trim().is_empty() {
+                        binds.push(b.clone());
+                    }
+                }
+                if binds.is_empty() {
+                    continue;
+                }
+                let entry = serde_json::json!({ "connection": conn, "interval_secs": interval, "binds": binds });
+                if incoming {
+                    inputs.push(entry);
+                } else {
+                    outputs.push(entry);
+                }
+            }
+        }
+    }
+    serde_json::json!({ "connections": connections, "inputs": inputs, "outputs": outputs }).to_string()
+}
+
+#[cfg(test)]
+mod ext_tests {
+    use super::*;
+
+    #[test]
+    fn ext_config_splits_ports_and_adds_sources() {
+        let spec = pb_points::addr::ext_spec("wits").unwrap();
+        let section = serde_json::json!({"connections":[{"id":"van","transport":"tcp_listen","port":5100},{"id":""}]});
+        let hubs = serde_json::json!({"hubs":[{"protocol":"Modbus",
+            "sources":[{"protocol":"Wits","ext_connection":"van","ext_interval_secs":2.0,
+                        "ext_inputs":[{"item":"0108","point":""},{"item":" ","point":""}]},
+                       {"protocol":"Modbus","ext_connection":"van","ext_inputs":[{"item":"0110"}]}],
+            "outputs":[{"protocol":"Wits","ext_connection":"van","ext_outputs":[{"item":"0121","point":"modbus_1"},{"item":"0122","point":""}]},
+                       {"protocol":"Wits","ext_connection":"","ext_outputs":[{"item":"0121","point":"x"}]}]}]});
+        let out: serde_json::Value = serde_json::from_str(&build_ext_configure(spec, &section, Some(&hubs))).unwrap();
+        assert_eq!(out["connections"].as_array().unwrap().len(), 1);
+        assert_eq!(out["connections"][0]["enabled"], true);
+        assert_eq!(out["inputs"].as_array().unwrap().len(), 1);
+        assert_eq!(out["inputs"][0]["interval_secs"], 2.0);
+        assert_eq!(out["inputs"][0]["binds"].as_array().unwrap().len(), 1);
+        assert_eq!(out["inputs"][0]["binds"][0]["source"], "wits/van::0108");
+        assert_eq!(out["outputs"].as_array().unwrap().len(), 1);
+        assert_eq!(out["outputs"][0]["binds"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn materialize_allocates_ext_ids_with_numeric_fields() {
+        let mut store = PointStore::new();
+        let value = serde_json::json!({"hubs":{"hubs":[{"sources":[
+            {"protocol":"Dnp3","ext_connection":"rtu","ext_inputs":[{"kind":"analog","index":3,"point":""}]},
+            {"protocol":"Sparkplug","ext_connection":"line","ext_inputs":[{"device":"Robot1","metric":"Torque","point":"robot_torque"}]}],
+            "outputs":[]}]}});
+        materialize_hub_binds_json(&value, &mut store);
+        assert_eq!(store.id_for_source("dnp3/rtu::analog:3"), Some("dnp3_1"));
+        assert_eq!(store.id_for_source("sparkplug/line::Robot1:Torque"), Some("robot_torque"));
+    }
 }
 
 /// Build SNMP pack configure JSON from the `snmp` targets + hub SNMP Input ports.

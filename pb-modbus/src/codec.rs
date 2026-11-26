@@ -250,10 +250,20 @@ pub fn decode(dt: DataType, order: ByteOrder, words: &[u16]) -> Result<Value, Co
         DataType::I32 => Value::Int(i32::from_be_bytes(b[..4].try_into().unwrap()) as i64),
         DataType::U64 => Value::UInt(u64::from_be_bytes(b[..8].try_into().unwrap())),
         DataType::I64 => Value::Int(i64::from_be_bytes(b[..8].try_into().unwrap())),
-        DataType::F32 => Value::Float(f32::from_be_bytes(b[..4].try_into().unwrap()) as f64),
+        DataType::F32 => Value::Float(f32_to_f64(f32::from_be_bytes(b[..4].try_into().unwrap()))),
         DataType::F64 => Value::Float(f64::from_be_bytes(b[..8].try_into().unwrap())),
         DataType::Bool | DataType::Bit(_) | DataType::Str(_) => unreachable!(),
     })
+}
+
+/// Widen an f32 to the f64 with the same shortest decimal form (`21.7f32` → `21.7`, not
+/// `21.700000762939453`), so float registers read the way the device documents them.
+pub fn f32_to_f64(x: f32) -> f64 {
+    if x.is_finite() {
+        format!("{x}").parse().unwrap_or(x as f64)
+    } else {
+        x as f64
+    }
 }
 
 /// A coil / discrete input is already a bool.
@@ -393,6 +403,75 @@ pub fn parse_point_value(dt: DataType, raw: &str) -> Result<Value, CodecError> {
 }
 
 // ---------------------------------------------------------------------------
+// Engineering scaling (optional, per bind)
+// ---------------------------------------------------------------------------
+
+/// Linear engineering scaling: `engineering = raw × scale + offset`. Identity (1, 0) is the
+/// default and keeps the decoded type untouched (type-preserving copy).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Scaling {
+    pub scale: f64,
+    pub offset: f64,
+}
+
+impl Default for Scaling {
+    fn default() -> Self {
+        Self { scale: 1.0, offset: 0.0 }
+    }
+}
+
+impl Scaling {
+    pub fn new(scale: f64, offset: f64) -> Self {
+        let scale = if scale.is_finite() && scale != 0.0 { scale } else { 1.0 };
+        let offset = if offset.is_finite() { offset } else { 0.0 };
+        Self { scale, offset }
+    }
+
+    /// True when scaling does nothing.
+    pub fn is_identity(&self) -> bool {
+        self.scale == 1.0 && self.offset == 0.0
+    }
+
+    /// Raw decoded value → engineering value. Numbers become floats when scaling applies;
+    /// bools and text pass through unchanged.
+    pub fn apply(&self, v: Value) -> Value {
+        if self.is_identity() {
+            return v;
+        }
+        let raw = match v {
+            Value::Int(n) => n as f64,
+            Value::UInt(n) => n as f64,
+            Value::Float(x) => x,
+            other => return other,
+        };
+        let eng = raw * self.scale + self.offset;
+        // Trim float noise (0.1 × 3 = 0.30000000000000004) to 12 significant digits.
+        let rounded = if eng != 0.0 && eng.is_finite() {
+            let mag = 10f64.powi(12 - eng.abs().log10().ceil() as i32);
+            (eng * mag).round() / mag
+        } else {
+            eng
+        };
+        Value::Float(rounded)
+    }
+
+    /// Engineering text (a host point value) → raw text suitable for [`parse_point_value`].
+    /// Integer register types are rounded to the nearest whole count.
+    pub fn unapply_text(&self, dt: DataType, eng: &str) -> Result<String, CodecError> {
+        if self.is_identity() || matches!(dt, DataType::Bool | DataType::Bit(_) | DataType::Str(_)) {
+            return Ok(eng.to_string());
+        }
+        let t = eng.trim();
+        let x: f64 = t.parse().map_err(|_| CodecError::Value(format!("\"{t}\" is not a number")))?;
+        let raw = (x - self.offset) / self.scale;
+        Ok(match dt {
+            DataType::F32 | DataType::F64 => format!("{raw}"),
+            _ => format!("{}", raw.round() as i128),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Read planning
 // ---------------------------------------------------------------------------
 
@@ -488,6 +567,27 @@ pub fn plan_reads(items: &[ReadItem], max_gap: u16) -> Vec<ReadBlock> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn scaling_applies_and_inverts() {
+        let s = Scaling::new(0.1, 0.0);
+        assert_eq!(s.apply(Value::UInt(1234)), Value::Float(123.4));
+        assert_eq!(s.apply(Value::Int(-5)), Value::Float(-0.5));
+        assert_eq!(s.apply(Value::Bool(true)), Value::Bool(true));
+        assert_eq!(s.unapply_text(DataType::U16, "123.4").unwrap(), "1234");
+        assert_eq!(s.unapply_text(DataType::Bit(2), "true").unwrap(), "true");
+        let t = Scaling::new(2.0, -40.0);
+        assert_eq!(t.apply(Value::UInt(50)), Value::Float(60.0));
+        assert_eq!(t.unapply_text(DataType::F32, "60").unwrap(), "50");
+        assert!(t.unapply_text(DataType::I16, "abc").is_err());
+        // Identity keeps the decoded type (type-preserving copy).
+        assert_eq!(Scaling::default().apply(Value::UInt(7)), Value::UInt(7));
+        // Zero / NaN scale falls back to 1.
+        assert!(Scaling::new(0.0, 0.0).is_identity());
+        assert!(Scaling::new(f64::NAN, 0.0).is_identity());
+        // Float noise is trimmed.
+        assert_eq!(Scaling::new(0.1, 0.0).apply(Value::UInt(3)), Value::Float(0.3));
+    }
+
     const ALL_TYPES: [DataType; 11] = [
         DataType::U16,
         DataType::I16,
@@ -522,16 +622,16 @@ mod tests {
         // 123.456f32 = 0x42F6E979
         assert_eq!(
             decode(DataType::F32, ByteOrder::Abcd, &[0x42F6, 0xE979]).unwrap(),
-            Value::Float(123.456f32 as f64)
+            Value::Float(123.456)
         );
         // Same float from a CDAB device.
         assert_eq!(
             decode(DataType::F32, ByteOrder::Cdab, &[0xE979, 0x42F6]).unwrap(),
-            Value::Float(123.456f32 as f64)
+            Value::Float(123.456)
         );
         assert_eq!(
             decode(DataType::F32, ByteOrder::Dcba, &[0x79E9, 0xF642]).unwrap(),
-            Value::Float(123.456f32 as f64)
+            Value::Float(123.456)
         );
     }
 

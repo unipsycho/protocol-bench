@@ -33,10 +33,15 @@ pub fn is_draggable_point_id(id: &str) -> bool {
 const ROW_H: f32 = 18.0;
 const GAP: f32 = 5.0;
 const DOT: f32 = 12.0;
-const NAME: f32 = 78.0;
-const VALUE: f32 = 78.0;
-const UPDATED: f32 = 110.0;
 const REMOVE: f32 = 18.0;
+/// Breathing room added to each measured column.
+const CELL_PAD: f32 = 8.0;
+/// Source is the flex column: it absorbs slack and is cropped first.
+const SOURCE_MIN: f32 = 48.0;
+/// Name only gives ground once Source is at its floor.
+const NAME_MIN: f32 = 72.0;
+const CELL_FONT: f32 = 12.0;
+const HEADER_FONT: f32 = 10.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PointsSort {
@@ -77,20 +82,46 @@ pub struct PointsCols {
 }
 
 impl PointsCols {
-    pub fn from_width(avail: f32, with_remove: bool) -> Self {
+    /// Auto-fit columns to their content. Value and Updated always get their
+    /// full measured width; Source absorbs slack and is cropped first, then
+    /// Name down to [`NAME_MIN`]. If even that does not fit, the row grows
+    /// past `avail` (the caller's scroll area handles overflow).
+    pub fn fit(ui: &egui::Ui, avail: f32, rows: &[PointsTableRow], with_remove: bool) -> Self {
+        let cell = font_ui(CELL_FONT);
+        let head = font_ui(HEADER_FONT);
+        let measure = |text: &str, font: &FontId| text_width(ui, text, font);
+        // Headers measured with a sort mark so widths don't jump on sort.
+        let mut name = measure("NAME ▼", &head);
+        let mut value = measure("VALUE ▼", &head);
+        let mut updated = measure("UPDATED ▼", &head);
+        for row in rows {
+            name = name.max(measure(&row.id, &cell));
+            value = value.max(measure(&flat(&row.value), &cell));
+            updated = updated.max(measure(&row.updated, &cell));
+        }
+        name += CELL_PAD;
+        value += CELL_PAD;
+        updated += CELL_PAD;
+
         let remove = if with_remove { REMOVE } else { 0.0 };
-        let row_w = avail.max(1.0);
-        let source = (row_w - DOT - NAME - VALUE - UPDATED - remove - GAP * 4.0
-            - if with_remove { GAP } else { 0.0 })
-        .max(40.0);
+        let gaps = GAP * if with_remove { 5.0 } else { 4.0 };
+        let avail = avail.max(1.0);
+        let mut source = avail - DOT - name - value - updated - remove - gaps;
+        if source < SOURCE_MIN {
+            let deficit = SOURCE_MIN - source;
+            source = SOURCE_MIN;
+            let give = deficit.min((name - NAME_MIN).max(0.0));
+            name -= give;
+        }
+        let row_w = DOT + name + value + source + updated + remove + gaps;
         Self {
-            row_w,
+            row_w: row_w.max(avail),
             gap: GAP,
             dot: DOT,
-            name: NAME,
-            value: VALUE,
-            source,
-            updated: UPDATED,
+            name,
+            value,
+            source: source + (avail - row_w).max(0.0),
+            updated,
             remove,
         }
     }
@@ -222,7 +253,7 @@ pub fn paint_points_table_ex(
     let id_salt = id_salt.into();
     sort_table_rows(rows, state);
 
-    let cols = PointsCols::from_width(ui.available_width(), with_remove);
+    let cols = PointsCols::fit(ui, ui.available_width(), rows, with_remove);
     ui.set_min_width(cols.row_w);
 
     if let Some(col) = paint_points_header(ui, cols, state, p, id_salt) {
@@ -333,7 +364,7 @@ fn paint_points_header(
 ) -> Option<PointsSort> {
     let (row, _) = ui.allocate_exact_size(Vec2::new(cols.row_w, ROW_H), Sense::hover());
     let (_dot, name_r, value_r, source_r, updated_r, _rm) = cols.cell_rects(row);
-    let font = font_ui(10.5);
+    let font = font_ui(HEADER_FONT);
     let mut clicked = None;
 
     if header_label(
@@ -452,21 +483,19 @@ pub fn paint_full_row(
         paint_quality_dot(ui, dot_r, quality, row.id, p);
     }
 
-    let font = font_ui(12.0);
-    paint_cell_text(ui, name_r, row.id, font.clone(), p.text, false);
-    if let Some(value) = row.value {
-        paint_cell_text(
-            ui,
-            value_r,
-            &truncate_chars(value, 14),
-            font.clone(),
-            p.text,
-            false,
-        )
-        .on_hover_text(value);
+    let font = font_ui(CELL_FONT);
+    let fit_w = |r: Rect| (r.width() - CELL_PAD * 0.5).max(1.0);
+    let name_shown = fit_text_end(ui, row.id, &font, fit_w(name_r));
+    let name_resp = paint_cell_text(ui, name_r, &name_shown, font.clone(), p.text, false);
+    if name_shown != row.id {
+        name_resp.on_hover_text(row.id);
     }
-    let max_chars = ((cols.source / 7.0) as usize).max(6);
-    let shown = truncate_keep_end(row.source, max_chars);
+    if let Some(value) = row.value {
+        // Columns are sized so the value is never cropped.
+        paint_cell_text(ui, value_r, &flat(value), font.clone(), p.text, false)
+            .on_hover_text(value);
+    }
+    let shown = fit_text_keep_end(ui, row.source, &font, fit_w(source_r));
     paint_cell_text(ui, source_r, &shown, font.clone(), p.muted, false).on_hover_text(row.source);
     if let Some(updated) = row.updated {
         paint_cell_text(ui, updated_r, updated, font, p.muted, true);
@@ -744,6 +773,29 @@ pub fn rows_for_points_panel(
                         });
                     }
                 }
+                HubProto::Wits | HubProto::WebSocket | HubProto::Sparkplug | HubProto::Dnp3 | HubProto::Can => {
+                    let Some(e) = port.protocol.ext() else { continue };
+                    for bind in &port.ext_inputs {
+                        let Some(source) = crate::ext_proto::bind_source(e, &port.ext_connection, bind) else { continue };
+                        let point = crate::ext_proto::text_of(bind, "point");
+                        let id = if point.trim().is_empty() { format!("{}_N", e.core().prefix) } else { point.trim().to_string() };
+                        if seen.contains(&id) {
+                            continue;
+                        }
+                        seen.insert(id.clone());
+                        rows.push(PointsTableRow {
+                            id,
+                            source,
+                            value: "—".into(),
+                            quality: "uncertain".into(),
+                            updated: "—".into(),
+                            updated_ms: 0,
+                            bind_index: None,
+                            topic: String::new(),
+                            path: crate::ext_proto::bind_label(e, bind),
+                        });
+                    }
+                }
                 HubProto::Las => {
                     let endpoint = port.las_endpoint.as_str();
                     for bind in &port.las_inputs {
@@ -913,27 +965,61 @@ pub fn paint_cell_text(
     resp
 }
 
-/// Ellipsis at the start so the end of a long path stays visible.
-pub fn truncate_keep_end(value: &str, max_chars: usize) -> String {
-    let flat = value.replace('\n', " ");
-    let count = flat.chars().count();
-    if count <= max_chars {
-        return flat;
-    }
-    let keep = max_chars.saturating_sub(1);
-    let end: String = flat.chars().skip(count.saturating_sub(keep)).collect();
-    format!("…{end}")
+fn flat(value: &str) -> String {
+    value.replace('\n', " ")
 }
 
-pub fn truncate_chars(value: &str, max_chars: usize) -> String {
-    let flat = value.replace('\n', " ");
-    if flat.chars().count() <= max_chars {
-        flat
-    } else {
-        let mut out: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
-        out.push('…');
-        out
+fn text_width(ui: &egui::Ui, text: &str, font: &FontId) -> f32 {
+    ui.fonts(|f| {
+        f.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+    })
+}
+
+/// Pixel-accurate crop with a leading ellipsis (keeps the end of a path).
+fn fit_text_keep_end(ui: &egui::Ui, text: &str, font: &FontId, max_w: f32) -> String {
+    let flat = flat(text);
+    if text_width(ui, &flat, font) <= max_w {
+        return flat;
     }
+    let chars: Vec<char> = flat.chars().collect();
+    // Binary search the longest suffix that fits after "…".
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let cand: String = std::iter::once('…')
+            .chain(chars[chars.len() - mid..].iter().copied())
+            .collect();
+        if text_width(ui, &cand, font) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    std::iter::once('…')
+        .chain(chars[chars.len() - lo..].iter().copied())
+        .collect()
+}
+
+/// Pixel-accurate crop with a trailing ellipsis.
+fn fit_text_end(ui: &egui::Ui, text: &str, font: &FontId, max_w: f32) -> String {
+    let flat = flat(text);
+    if text_width(ui, &flat, font) <= max_w {
+        return flat;
+    }
+    let chars: Vec<char> = flat.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let cand: String = chars[..mid].iter().copied().chain(std::iter::once('…')).collect();
+        if text_width(ui, &cand, font) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    chars[..lo].iter().copied().chain(std::iter::once('…')).collect()
 }
 
 pub fn format_updated(updated_ms: u64) -> String {

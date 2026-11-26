@@ -765,31 +765,39 @@ impl PackState {
     }
 
     /// Publish via output binding if `point` matches.
-    /// No matching bind → Ok (Input-only points). Bound but disconnected → Err (retry).
+    /// Every matching bind on every client publishes (a point may feed several Outputs /
+    /// topics). No matching bind → Ok (Input-only points). Ok if at least one publish
+    /// succeeded; Err only when every matching bind failed (e.g. not connected → retry).
     fn publish_for_point(&mut self, point: &str, payload: &[u8]) -> Result<(), String> {
         let known = self.known_client_ids();
         let default = known.first().cloned().unwrap_or_else(|| "default".into());
         let point = migrate_point_id(point, &known, &default);
         let mut last_err: Option<String> = None;
         let mut matched = false;
+        let mut published = false;
         for rt in self.clients.values() {
-            let Some(out) = rt.config.outputs.iter().find(|o| {
-                migrate_point_id(&o.point, &known, &default) == point
-            }) else {
-                continue;
-            };
-            matched = true;
-            let Some(session) = rt.session.as_ref() else {
-                last_err = Some(format!("output: '{}' not connected", rt.config.id));
-                continue;
-            };
-            return session.publish(&out.topic, payload, out.qos, out.retain);
+            for out in rt
+                .config
+                .outputs
+                .iter()
+                .filter(|o| migrate_point_id(&o.point, &known, &default) == point)
+            {
+                matched = true;
+                let Some(session) = rt.session.as_ref() else {
+                    last_err = Some(format!("output: '{}' not connected", rt.config.id));
+                    continue;
+                };
+                match session.publish(&out.topic, payload, out.qos, out.retain) {
+                    Ok(()) => published = true,
+                    Err(e) => last_err = Some(e),
+                }
+            }
         }
-        if matched {
-            return Err(last_err.unwrap_or_else(|| "output: not connected".into()));
+        if !matched || published {
+            // No Output bind for this point — quiet success (host egress walks all points).
+            return Ok(());
         }
-        // No Output bind for this point — quiet success (host egress walks all points).
-        Ok(())
+        Err(last_err.unwrap_or_else(|| "output: not connected".into()))
     }
 }
 

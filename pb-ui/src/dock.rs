@@ -1,9 +1,10 @@
 //! Dock pane ids. The left rail, menus, and layout tree all use this list.
 
 use egui::Color32;
-use pb_engine::EngineId;
+use pb_engine::{EngineId, HostSnapshot};
 use serde::{Deserialize, Serialize};
 
+use crate::ext_proto::ExtProto;
 use crate::theme::Proto;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -27,16 +28,37 @@ pub enum DockPane {
     Las,
     /// SNMP agents (Input poll). Pack later — no EngineId yet.
     Snmp,
+    /// WITS level 0 record streams.
+    Wits,
+    /// WebSocket JSON client / server.
+    WebSocket,
+    /// Sparkplug B host / edge node.
+    Sparkplug,
+    /// DNP3 master.
+    Dnp3,
+    /// CAN bus (SocketCAN).
+    Can,
+    /// One pane that hosts every protocol's config behind a dropdown.
+    Protocols,
+    /// In-app user guide.
+    Help,
 }
 
 impl DockPane {
-    /// Rail order: bench views, then protocol links.
-    pub const ALL: [DockPane; 13] = [
+    /// Rail order. Protocol panes are not on the rail: they live inside [`DockPane::Protocols`]
+    /// and only enter the layout when popped out.
+    pub const ALL: [DockPane; 7] = [
         DockPane::Project,
         DockPane::Hubs,
         DockPane::Points,
         DockPane::Mappings,
         DockPane::Traffic,
+        DockPane::Protocols,
+        DockPane::Help,
+    ];
+
+    /// Every protocol pane, in dropdown order.
+    pub const PROTOCOLS: [DockPane; 13] = [
         DockPane::Streams,
         DockPane::Modbus,
         DockPane::Mqtt,
@@ -45,7 +67,58 @@ impl DockPane {
         DockPane::Http,
         DockPane::Las,
         DockPane::Snmp,
+        DockPane::Wits,
+        DockPane::WebSocket,
+        DockPane::Sparkplug,
+        DockPane::Dnp3,
+        DockPane::Can,
     ];
+
+    /// True for a protocol pane (one shown inside Protocols or popped out).
+    pub fn is_protocol(self) -> bool {
+        self.engine().is_some()
+    }
+
+    /// True when the service reports this protocol's pack as loaded.
+    pub fn pack_loaded(self, host: &HostSnapshot) -> bool {
+        self.engine()
+            .and_then(|e| e.pack_id())
+            .is_some_and(|id| host.packs_loaded.iter().any(|p| p == id))
+    }
+
+    /// Protocols the dropdown offers. With no service connected the pack list is unknown, so
+    /// every protocol is offered and config can still be edited offline.
+    pub fn available_protocols(host: &HostSnapshot) -> Vec<DockPane> {
+        if !host.alive {
+            return Self::PROTOCOLS.to_vec();
+        }
+        Self::PROTOCOLS
+            .into_iter()
+            .filter(|pane| pane.pack_loaded(host))
+            .collect()
+    }
+
+    /// The ext protocol behind this pane, if any.
+    pub fn ext(self) -> Option<ExtProto> {
+        match self {
+            Self::Wits => Some(ExtProto::Wits),
+            Self::WebSocket => Some(ExtProto::WebSocket),
+            Self::Sparkplug => Some(ExtProto::Sparkplug),
+            Self::Dnp3 => Some(ExtProto::Dnp3),
+            Self::Can => Some(ExtProto::Can),
+            _ => None,
+        }
+    }
+
+    pub fn from_ext(p: ExtProto) -> DockPane {
+        match p {
+            ExtProto::Wits => Self::Wits,
+            ExtProto::WebSocket => Self::WebSocket,
+            ExtProto::Sparkplug => Self::Sparkplug,
+            ExtProto::Dnp3 => Self::Dnp3,
+            ExtProto::Can => Self::Can,
+        }
+    }
 
     pub fn title(self) -> &'static str {
         match self {
@@ -63,6 +136,9 @@ impl DockPane {
             Self::Http => "HTTP / REST",
             Self::Las => "LAS",
             Self::Snmp => "SNMP",
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can => self.ext().map(|e| e.title()).unwrap_or(""),
+            Self::Protocols => "Protocols",
+            Self::Help => "Help",
         }
     }
 
@@ -82,6 +158,9 @@ impl DockPane {
             Self::Http => "http",
             Self::Las => "las",
             Self::Snmp => "snmp",
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can => self.ext().map(|e| e.id()).unwrap_or(""),
+            Self::Protocols => "protocols",
+            Self::Help => "help",
         }
     }
 
@@ -96,6 +175,7 @@ impl DockPane {
             Self::Http => Some(EngineId::Http),
             Self::Las => Some(EngineId::Las),
             Self::Snmp => Some(EngineId::Snmp),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can => self.ext().map(|e| e.engine()),
             _ => None,
         }
     }
@@ -117,6 +197,9 @@ impl DockPane {
             Self::Http => Proto::HTTP,
             Self::Las => Proto::LAS,
             Self::Snmp => Proto::SNMP,
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can => self.ext().map(|e| e.ink_core()).unwrap_or(Proto::TEAL),
+            Self::Protocols => Proto::COPPER,
+            Self::Help => Proto::TEAL,
         }
     }
 
@@ -140,6 +223,9 @@ impl DockPane {
             Self::Http => Proto::HTTP_DEEP,
             Self::Las => Proto::LAS_DEEP,
             Self::Snmp => Proto::SNMP_DEEP,
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can => self.ext().map(|e| e.ink_deep()).unwrap_or(Proto::TEAL_DEEP),
+            Self::Protocols => Proto::COPPER_DEEP,
+            Self::Help => Proto::TEAL_DEEP,
         }
     }
 }

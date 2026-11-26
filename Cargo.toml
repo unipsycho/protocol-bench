@@ -15,6 +15,14 @@ members = [
     "pb-files",
     "pb-snmp",
     "pb-las",
+    "pb-extkit",
+    "pb-proto",
+    "pb-wits",
+    "pb-websocket",
+    "pb-sparkplug",
+    "pb-dnp3",
+    "pb-can",
+    "pb-sim",
     "pb-service",
     "pb-ui",
 ]
@@ -41,6 +49,8 @@ pb-modbus = { path = "pb-modbus" }
 pb-tail = { path = "pb-tail" }
 pb-snmp = { path = "pb-snmp" }
 pb-las = { path = "pb-las" }
+pb-extkit = { path = "pb-extkit" }
+pb-proto = { path = "pb-proto" }
 serialport = { version = "4", default-features = false }
 regex = "1"
 ureq = { version = "2.12", features = ["json"] }

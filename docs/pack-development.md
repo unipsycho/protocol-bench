@@ -1,6 +1,6 @@
 # Writing and maintaining a protocol pack
 
-How the eight in-tree packs (`pb-mqtt`, `pb-opcua`, `pb-streams`, `pb-http`, `pb-modbus`, `pb-files`, `pb-snmp`, `pb-las`) are built, and the rules that are not obvious from reading one of them. Background on *why* packs are `cdylib`s loaded by the service is in [protocol-pack-loading.md](protocol-pack-loading.md).
+How the thirteen in-tree packs (`pb-mqtt`, `pb-opcua`, `pb-streams`, `pb-http`, `pb-modbus`, `pb-files`, `pb-snmp`, `pb-las`, and the ext packs `pb-wits`, `pb-websocket`, `pb-sparkplug`, `pb-dnp3`, `pb-can`) are built, and the rules that are not obvious from reading one of them. Background on *why* packs are `cdylib`s loaded by the service is in [protocol-pack-loading.md](protocol-pack-loading.md).
 
 ## Shape of a pack
 
@@ -43,6 +43,17 @@ Set `const SUBSCRIBE` / `PUBLISH` only if the pack really has those entry points
 
 **Worker threads.** One thread per connection / file / target, each with an `Arc<AtomicBool>` stop flag and an `Arc<Mutex<Status>>` the main thread reads for `detail_json`. Use `pb_abi::worker::{sleep_stop, update_status, sanitize_id}`. Sleep in short slices (`sleep_stop`) so Stop is prompt.
 
+## Ext packs: the short way to add a protocol
+
+WITS, WebSocket, Sparkplug B, DNP3 and CAN are "ext" protocols: one generic path end to end.
+
+1. **Address** — add an `ExtSpec` (section id, point prefix, leaf fields, required fields) to `EXT_PROTOCOLS` in `pb-points/src/addr.rs`.
+2. **Engine slot** — add an `EngineId` variant (`pb-engine`), its title, pack id and note.
+3. **Pack** — a crate with `pack.rs` holding `fn run(ctx: LinkCtx)` (the protocol), `endpoint` and `check`, then `pb_extkit::ext_pack_impl!` + `pb_abi::export_pack!`. `pb-extkit` owns workers, config diffing, output routing (`ctx.drain_writes()` / `ctx.latest`), quality helpers (`ctx.up / down / publish / publish_bad`) and the `seen` table the UI turns into one-click binds. Pure codecs go in `pb-proto` so tests and `pb-sim` can use them.
+4. **UI** — add an `ExtProto` variant with a `UiSpec` (connection / Input / Output fields) in `pb-ui/src/ext_proto.rs`, plus `DockPane` / `HubProto` variants. Panel, hub inspector, persistence (`<id>` section of `project.json`), point allocation, Points and Mappings rows come for free.
+5. **Service** — nothing: `build_ext_configure` turns hub ports (`ext_connection`, `ext_interval_secs`, `ext_inputs`, `ext_outputs`) into `{connections, inputs, outputs}` for every spec.
+6. **Help** — an article in `help_catalog.rs`, and a device in `pb-sim` if the demos should use it.
+
 ## How config reaches a pack
 
 The UI owns the editable project (connections in panels, binds on hub Input/Output nodes). The **service** turns that into each pack's configure JSON — `build_*_configure` in [pb-service/src/runtime.rs](../pb-service/src/runtime.rs) — so the pack never sees hub structure, only `{connections, inputs[], outputs[]}`. When you add a bind field you touch: the UI bind struct (`pb-ui/src/hubs.rs`), the `build_*_configure` function, the pack's config struct, and a unit test in `runtime.rs` that pins the JSON.
@@ -64,4 +75,6 @@ These are deliberate or not-yet-fixed behaviours a reader would otherwise redisc
 * **Hub-broker MQTT outputs need a client.** An Output bound to the embedded broker's own connection id cannot publish (the broker has no publisher session). Bind the Output to a normal MQTT client — e.g. a loopback client on the broker's port, as `edge-logger.json` does.
 * **`ipc.json` / `ipc.token` are not projects.** They are how the UI finds the service. The UI refuses to open or save a project over them, because the file dialog opens in that folder and overwriting `ipc.json` leaves the UI permanently "disconnected".
 * **`project::load` / `project::save` in `pb-ui`** are legacy local-file helpers; the service owns `project.json` now and the UI goes through IPC. They are kept only until the remaining callers are removed.
+* **Egress fan-out.** The engine sends point writes to every *connected* pack whose slot `takes_egress()`; a pack that connects later gets every current value once, then changes.
+* **DNP3** is a TCP master only (no serial, no secure authentication, no outstation role). **Sparkplug B** handles scalar metrics (no DataSets / Templates) and does not publish a primary-host STATE. **CAN** needs Linux SocketCAN; the vcan test is skipped when `vcan0` is absent.
 * **SNMP**: v1/v2c GET only (no v3, SET, walk or traps). **LAS**: `WRAP YES` files are refused; `STOP` is not rewritten while a log is being written; time-indexed logs use epoch seconds. **File follow**: CSV is one physical line per row. Windows file replacement is detected by shrink only (no inode there). New packs have only been run on Linux.

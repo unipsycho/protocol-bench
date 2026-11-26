@@ -1045,7 +1045,7 @@ fn start_embedded_broker(
 }
 
 /// Mirror pack hub-broker state into the panel so Stop/Start stay honest after reload.
-fn sync_broker_running_from_host(host: &HostSnapshot, state: &mut MqttPanelState) {
+pub fn sync_broker_running_from_host(host: &HostSnapshot, state: &mut MqttPanelState) {
     let Some(slot) = host.slot(EngineId::Mqtt) else {
         return;
     };

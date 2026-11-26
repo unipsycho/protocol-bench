@@ -4,7 +4,7 @@ Date: 2026-11-13. Reviewed against the code: 2026-11-19. Status: living draft. B
 
 Research: competitive landscape and protocol notes live in the research store (not in this repo). Free vs paid isolation: [free-vs-paid-isolation.md](free-vs-paid-isolation.md). Pack loading: [protocol-pack-loading.md](protocol-pack-loading.md).
 
-Checkout: `/home/mike/Documents/AAI-Projects/protocolbench` — run instructions in [../README.md](../README.md). Workspace: `pb-abi`, `pb-points`, `pb-engine`, `pb-ipc`, `pb-mqtt`, `pb-opcua`, `pb-streams`, `pb-http`, `pb-service`, `pb-ui`.
+Checkout: `/home/mike/Documents/AAI-Projects/protocolbench` — run instructions in [../README.md](../README.md). Workspace: `pb-abi`, `pb-points`, `pb-engine`, `pb-ipc`, `pb-extkit`, `pb-proto`, protocol packs (`pb-mqtt`, `pb-opcua`, `pb-streams`, `pb-http`, `pb-modbus`, `pb-files`, `pb-snmp`, `pb-las`, `pb-wits`, `pb-websocket`, `pb-sparkplug`, `pb-dnp3`, `pb-can`), `pb-service`, `pb-ui`, `pb-sim`.
 
 ## Product
 
@@ -37,7 +37,7 @@ Moving a value between a serial instrument, a Modbus device, a growing CSV, an M
 - **Quit:** closing the UI leaves the service running. When hubs are live the UI asks first: **Quit, keep running**, **Stop all and quit** (stops hubs, disconnects clients) or **Stay**.
 - **Project panel:** the HUBS tile and the Hubs inventory rows have Start / Stop controls for the embedded MQTT broker and OPC UA server.
 - **Tray (Linux):** the service shows a tray icon (Protocol Bench mark, green dot when hubs are live) listing the project and running hubs, with Stop all hubs / Quit service.
-- Panels: Project, Hubs, Points, Mappings (read-only route list derived from hub Outputs), Traffic, Streams / TCP, Modbus, MQTT, OPC UA, File follow, HTTP / REST, LAS, SNMP. Each protocol panel owns **connections / endpoints**; hub Input / Output nodes own the binds.
+- Panels: Project, Hubs, Points, Mappings (read-only route list derived from hub Outputs), Traffic, Streams / TCP, Modbus, MQTT, OPC UA, File follow, HTTP / REST, LAS, SNMP, WITS, WebSocket, Sparkplug B, DNP3, CAN bus. Each protocol panel owns **connections / endpoints**; hub Input / Output nodes own the binds.
 
 ## MCP server on the service
 
@@ -45,7 +45,7 @@ Moving a value between a serial instrument, a Modbus device, a growing CSV, an M
 
 - Lives on the **service**, not in the UI process.
 - Scope is product-wide configuration and operation the service already owns (channels, points, mappings, hubs, project setup, and related actions) — agent-driven setup alongside the separate config/monitor UI.
-- Tool schema, transport, and auth are **not** specified yet; this is intent / direction only.
+- **Built:** MCP Streamable HTTP (`POST /mcp`, JSON responses) on 127.0.0.1, bearer auth with the IPC token, URL in `mcp.json`. Tools: status, protocols, points (list / read / write), hubs, project (get / set section / add connection), open project, stop all hubs. See `pb-service/README.md`.
 
 ## Engines
 
@@ -95,7 +95,7 @@ Rules:
 | **Hub Output node** | Pick a Client connection; bind a host point → coil / holding register (write) |
 | **Modbus hub** | Picks **one** Server connection to listen on |
 
-Data types per bind: `bool` (coil / discrete), `u16 i16 u32 i32 u64 i64 f32 f64`, `bit0..15` (one bit of a register), `strN` (ASCII over N registers). Multi-byte types carry a **byte / word order** — `abcd` (big-endian), `cdab` (word swap), `badc` (byte swap), `dcba` (little-endian). Type-preserving only; no scaling. The register codec lives in `pb-modbus` (`codec.rs`, unit-tested). The `pb-modbus` pack runs one worker per Client connection (batched polling, bad quality + reconnect backoff, retries, typed writes) and serves each Server connection a register image mirrored with host points: host point changes update the image, master writes update the points. A Server connection runs only when a Modbus hub picks it. Unmapped addresses return exception 2. TCP servers answer the configured unit and 255; RTU slaves answer the configured unit and accept unit-0 broadcast writes.
+Data types per bind: `bool` (coil / discrete), `u16 i16 u32 i32 u64 i64 f32 f64`, `bit0..15` (one bit of a register), `strN` (ASCII over N registers). Multi-byte types carry a **byte / word order** — `abcd` (big-endian), `cdab` (word swap), `badc` (byte swap), `dcba` (little-endian). Each register may carry a **tag name**, **units** and optional **scale / offset** (`value = raw × scale + offset`; writes and server-map pushes divide it back out; identity keeps the decoded type). Register lists are built in the **register map editor** (shared by Input, Output and Server maps): + Register / + Block, device templates, CSV import / export, Modicon (40001) addressing, a memory strip per area, live values and an edit card per row. The register codec lives in `pb-modbus` (`codec.rs`, unit-tested). The `pb-modbus` pack runs one worker per Client connection (batched polling, bad quality + reconnect backoff, retries, typed writes) and serves each Server connection a register image mirrored with host points: host point changes update the image, master writes update the points. A Server connection runs only when a Modbus hub picks it. Unmapped addresses return exception 2. TCP servers answer the configured unit and 255; RTU slaves answer the configured unit and accept unit-0 broadcast writes.
 
 ### SNMP model (live: v1 / v2c GET)
 
@@ -112,11 +112,27 @@ Data types per bind: `bool` (coil / discrete), `u16 i16 u32 i32 u64 i64 f32 f64`
 
 **File follow panel** owns sources (path, CSV or JSON-lines parser, delimiter / header row, poll, start at beginning or end, rotation handling). A hub **Files Input** picks a source and binds CSV column / JSON path → `file_N`. The `pb-files` pack runs one worker per followed source: it reads only **complete lines** past a saved byte offset (a half-written row waits for its newline), keeps that offset on disk (`<config dir>/file-follow/<source>.json`, with the file's identity) so a restart resumes where it stopped — rows written while the service was down are caught up, seen rows are never re-read — and restarts from byte 0 with a fresh header when the file is truncated or replaced (log rotation). Cells are typed (bool / integer / float / text); JSON lines use dotted paths with `[n]` indices. A missing file turns its points bad (last value held) and recovers when it reappears. **Column picker:** the pack reports the header names (or JSON leaf paths) with the latest row's values — even for a source with no binds yet (preview mode) — and the hub Files Input shows them as clickable chips, so it also works when the service runs on another machine. One physical line = one row (no multi-line quoted CSV fields); the path is read on the machine running the service.
 
+### Ext protocols (live: WITS, WebSocket, Sparkplug B, DNP3, CAN)
+
+One schema-driven path for the five newer protocols: a protocol panel (connections, status, "seen on the wire"), hub Input / Output inspectors with one-click binds from what the link has seen, `wits` / `websocket` / `sparkplug` / `dnp3` / `can` project sections, generic service config (`build_ext_configure`) and the shared pack runtime `pb-extkit`.
+
+| Protocol | Input → point | Output |
+| --- | --- | --- |
+| **WITS** level 0 (TCP client / listen, serial) | item code `0108` → `wits_N`; null values and a quiet sender → bad | host points → one block per interval |
+| **WebSocket** (client / server) | JSON path → `ws_N` | JSON object of keys, or one message per change; servers feed browsers |
+| **Sparkplug B** (host / edge node) | device + metric → `spb_N` (aliases from BIRTH, DEATH → bad) | host: NCMD / DCMD · edge: NBIRTH / DBIRTH + NDATA / DDATA, NDEATH will |
+| **DNP3** TCP master | type + index → `dnp3_N` (class 0 + events, ONLINE flag → quality) | CROB latch on / off, analog output g41v1 / v3 |
+| **CAN** (SocketCAN, Linux) | frame id / J1939 `pgn:N` + DBC-style signal → `can_N` | signals packed into frames sent each interval |
+
+## Demo plants
+
+`pb-sim` (Rust) simulates the devices of three industrial demo projects — a frac spread, a bottling line and a wastewater lift station — that use every protocol above. `scripts/demo-smoke.sh` runs them end to end; `PB_AUTO_RUN_HUBS=1` lets the service run them headless for web demos.
+
 ## What runs today, and what does not
 
-Today: the window, layout, themes, the hub diagram with Input/Output binds for every protocol, the engine thread boundary, host point store (`pb-points`), pack loader, headless `pb-service` with localhost IPC, and live packs for **MQTT** (client + embedded broker; TCP / TLS / WS / WSS), **OPC UA** (client + server), **Streams** (serial / TCP), **HTTP / REST**, **Modbus** (TCP / RTU, client + server), **File follow** (CSV / JSON lines), **SNMP** (v1 / v2c GET) and **LAS** (2.0 follow + write).
+Today: the window, layout, themes, the hub diagram with Input/Output binds for every protocol, the engine thread boundary, host point store (`pb-points`), pack loader, headless `pb-service` with localhost IPC and an MCP server, and live packs for **MQTT** (client + embedded broker; TCP / TLS / WS / WSS), **OPC UA** (client + server), **Streams** (serial / TCP), **HTTP / REST**, **Modbus** (TCP / RTU, client + server, register maps with scaling), **File follow** (CSV / JSON lines), **SNMP** (v1 / v2c GET), **LAS** (2.0 follow + write), **WITS** (level 0 in / out), **WebSocket** (client + server), **Sparkplug B** (host + edge), **DNP3** (TCP master) and **CAN** (SocketCAN).
 
-Not yet: Sparkplug, DNP3, WebSocket, CAN, WITS, license signing enforcement, MSI, MCP server. Embedded MQTT broker (rumqttd) Start/Stop is live in the MQTT panel. Project open/save uses a native file requester (`rfd`) on a worker thread so the egui loop never blocks (Hyprland stalls if the dialog runs on the UI thread).
+Not yet: license signing enforcement, MSI, DNP3 serial / outstation, SNMPv3 / SET, WITSML. Embedded MQTT broker (rumqttd) Start/Stop is live in the MQTT panel. Project open/save uses a native file requester (`rfd`) on a worker thread so the egui loop never blocks (Hyprland stalls if the dialog runs on the UI thread).
 
 ## Protocols
 
@@ -128,7 +144,7 @@ Already named in the shell:
 - OPC UA — first build: **client and server**
 - File follow — first build parsers: **CSV and JSON lines**
 
-Also in the product (HTTP, SNMP and LAS have panels; the rest do not yet):
+Also in the product (all have panels and live packs):
 
 1. Serial ASCII and custom line protocols
 2. HTTP REST / JSON gateways

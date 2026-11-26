@@ -21,6 +21,7 @@ if [[ $QUICK -eq 0 ]]; then
   run "modbus RTU over virtual serial pair" ./scripts/modbus-rtu-smoke.sh
   run "file follow smoke" ./scripts/files-smoke.sh
   run "snmp + las smoke" ./scripts/snmp-las-smoke.sh
+  run "industrial demos (pb-sim → every pack)" ./scripts/demo-smoke.sh
 fi
 
 echo

@@ -32,6 +32,9 @@ pub struct UiState {
     /// Most-recently-used project paths (absolute when possible), newest first.
     #[serde(default)]
     pub recent_projects: Vec<String>,
+    /// Protocol the Protocols pane shows (a protocol pane id).
+    #[serde(default)]
+    pub protocols_selected: Option<DockPane>,
 }
 
 fn default_theme() -> String {
@@ -48,6 +51,7 @@ impl Default for UiState {
             hubs: HubModel::sample(),
             auto_run_embedded_hubs: false,
             recent_projects: Vec::new(),
+            protocols_selected: None,
         }
     }
 }
@@ -151,6 +155,109 @@ impl UiState {
         self.hidden_panes.retain(|item| *item != pane);
     }
 
+    /// Tab / header text. The Protocols pane names the protocol it is showing.
+    pub fn pane_label(&self, pane: DockPane) -> String {
+        match (pane, self.protocols_selected) {
+            (DockPane::Protocols, Some(sel)) => format!("Protocols \u{00B7} {}", sel.title()),
+            _ => pane.title().to_string(),
+        }
+    }
+
+    /// Protocol panes that have their own tile (popped out of Protocols).
+    pub fn popped_protocols(&self) -> Vec<DockPane> {
+        DockPane::PROTOCOLS
+            .into_iter()
+            .filter(|pane| self.pane_visible(*pane))
+            .collect()
+    }
+
+    /// Bring a pane forward. A protocol goes to its own tile when popped out, else it is
+    /// picked in the Protocols pane.
+    pub fn open_pane(&mut self, pane: DockPane) -> DockPane {
+        let target = if pane.is_protocol() && !self.pane_visible(pane) {
+            self.protocols_selected = Some(pane);
+            DockPane::Protocols
+        } else {
+            pane
+        };
+        self.reveal_pane(target);
+        self.tree.set_active(target);
+        if self.maximized.is_some() {
+            self.maximized = Some(target);
+        }
+        target
+    }
+
+    /// Give a protocol its own tile beside the Protocols pane.
+    pub fn pop_out_protocol(&mut self, pane: DockPane) {
+        if !pane.is_protocol() {
+            return;
+        }
+        let beside = if self.pane_visible(DockPane::Protocols) {
+            DockPane::Protocols
+        } else {
+            DockPane::Project
+        };
+        self.tree.ensure_pane(pane, beside, TileEdge::East);
+        self.hidden_panes.retain(|item| *item != pane);
+        if self.protocols_selected == Some(pane) {
+            // The Protocols pane moves on to another protocol.
+            self.protocols_selected = None;
+        }
+        if self.maximized.is_some() {
+            self.maximized = None;
+        }
+    }
+
+    /// Close a popped-out protocol's tile and show it in the Protocols pane again.
+    pub fn dock_back_protocol(&mut self, pane: DockPane) {
+        if !pane.is_protocol() {
+            return;
+        }
+        if !self.tree.remove_leaf(pane) {
+            // Lone root tab: keep the tree non-empty by putting Protocols there first.
+            self.tree.replace_pane(pane, DockPane::Protocols);
+        }
+        self.hidden_panes.retain(|item| *item != pane);
+        if self.maximized == Some(pane) {
+            self.maximized = None;
+        }
+        self.open_pane(pane);
+    }
+
+    /// Older layouts held one tile per protocol. Fold them into a single Protocols pane where
+    /// the first one sat, keeping the protocol that was on top as the pick.
+    fn migrate_protocol_panes(&mut self) {
+        if self.tree.contains_pane(DockPane::Protocols) {
+            return;
+        }
+        let mut panes = Vec::new();
+        self.tree.collect_panes(&mut panes);
+        let protos: Vec<DockPane> = panes.into_iter().filter(|pane| pane.is_protocol()).collect();
+        let Some(&first) = protos.first() else {
+            return;
+        };
+        let on_top = self
+            .tree
+            .group_of(first)
+            .map(|group| group.active_pane())
+            .filter(|pane| pane.is_protocol() && !self.hidden_panes.contains(pane));
+        let was_active = on_top.is_some();
+        self.tree.replace_pane(first, DockPane::Protocols);
+        for pane in protos.iter().skip(1) {
+            let _ = self.tree.remove_leaf(*pane);
+        }
+        if self.maximized.is_some_and(|pane| pane.is_protocol()) {
+            self.maximized = Some(DockPane::Protocols);
+        }
+        if was_active {
+            self.tree.set_active(DockPane::Protocols);
+        }
+        if self.protocols_selected.is_none() {
+            self.protocols_selected = on_top;
+        }
+    }
+
     /// Hide or show a rail pane. Refuses to hide the last visible one.
     pub fn toggle_pane_visible(&mut self, pane: DockPane) -> bool {
         if self.pane_visible(pane) {
@@ -183,6 +290,21 @@ impl UiState {
             .retain(|pane| *pane != DockPane::Calculations);
         if self.maximized == Some(DockPane::Calculations) {
             self.maximized = None;
+        }
+        self.migrate_protocol_panes();
+        // Protocol tiles are never hidden, only docked back: drop hidden ones from the tree.
+        let hidden_protos: Vec<DockPane> = self
+            .hidden_panes
+            .iter()
+            .copied()
+            .filter(|pane| pane.is_protocol())
+            .collect();
+        for pane in hidden_protos {
+            let _ = self.tree.remove_leaf(pane);
+        }
+        self.hidden_panes.retain(|pane| !pane.is_protocol());
+        if self.protocols_selected.is_some_and(|pane| !pane.is_protocol()) {
+            self.protocols_selected = None;
         }
         for pane in DockPane::ALL {
             self.tree
@@ -238,8 +360,82 @@ mod tests {
         let state = UiState::default();
         let text = toml::to_string_pretty(&state).expect("toml");
         let back: UiState = toml::from_str(&text).expect("parse");
-        assert!(back.tree.contains_pane(DockPane::Modbus));
+        assert!(back.tree.contains_pane(DockPane::Protocols));
+        assert!(!back.tree.contains_pane(DockPane::Modbus));
         assert_eq!(back.theme_id, "copper");
+    }
+
+    /// An old ui.toml tree with one tab per protocol (Modbus on top).
+    fn legacy_state() -> UiState {
+        use crate::layout::TabGroup;
+        let mut state = UiState::default();
+        state.tree = LayoutNode::Split {
+            dir: crate::layout::SplitDir::Row,
+            ratio: 0.4,
+            first: Box::new(LayoutNode::Leaf(TabGroup::single(DockPane::Project))),
+            second: Box::new(LayoutNode::Split {
+                dir: crate::layout::SplitDir::Col,
+                ratio: 0.5,
+                first: Box::new(LayoutNode::Leaf(TabGroup {
+                    tabs: vec![DockPane::Streams, DockPane::Modbus, DockPane::Mqtt],
+                    active: 1,
+                })),
+                second: Box::new(LayoutNode::Leaf(TabGroup::single(DockPane::OpcUa))),
+            }),
+        };
+        state.hidden_panes = vec![DockPane::Mqtt];
+        state
+    }
+
+    #[test]
+    fn legacy_protocol_tabs_fold_into_one_protocols_pane() {
+        let mut state = legacy_state();
+        state.sanitize();
+        let mut panes = Vec::new();
+        state.tree.collect_panes(&mut panes);
+        assert!(panes.iter().all(|pane| !pane.is_protocol()), "{panes:?}");
+        assert_eq!(panes.iter().filter(|p| **p == DockPane::Protocols).count(), 1);
+        // Protocols took the first protocol tab's place and is on top there.
+        let group = state.tree.group_of(DockPane::Protocols).unwrap();
+        assert_eq!(group.active_pane(), DockPane::Protocols);
+        assert_eq!(state.protocols_selected, Some(DockPane::Modbus));
+        assert!(state.hidden_panes.iter().all(|pane| !pane.is_protocol()));
+        for pane in DockPane::ALL {
+            assert!(state.tree.contains_pane(pane), "{pane:?}");
+        }
+        // Runs once: a second pass changes nothing.
+        let before = state.tree.clone();
+        state.sanitize();
+        assert_eq!(state.tree, before);
+    }
+
+    #[test]
+    fn pop_out_and_dock_back() {
+        let mut state = UiState::default();
+        state.sanitize();
+        state.protocols_selected = Some(DockPane::Modbus);
+        state.pop_out_protocol(DockPane::Modbus);
+        assert!(state.pane_visible(DockPane::Modbus));
+        assert_eq!(state.popped_protocols(), vec![DockPane::Modbus]);
+        assert_eq!(state.protocols_selected, None);
+        // Popped tiles survive sanitize (they are not migrated away).
+        state.sanitize();
+        assert!(state.pane_visible(DockPane::Modbus));
+        // Opening a popped protocol focuses its tile; an unpopped one is picked in Protocols.
+        assert_eq!(state.open_pane(DockPane::Modbus), DockPane::Modbus);
+        assert_eq!(state.open_pane(DockPane::Mqtt), DockPane::Protocols);
+        assert_eq!(state.protocols_selected, Some(DockPane::Mqtt));
+        state.dock_back_protocol(DockPane::Modbus);
+        assert!(!state.tree.contains_pane(DockPane::Modbus));
+        assert_eq!(state.protocols_selected, Some(DockPane::Modbus));
+        assert!(state.popped_protocols().is_empty());
+        assert_eq!(state.pane_label(DockPane::Protocols), "Protocols \u{00B7} Modbus");
+    }
+
+    #[test]
+    fn rail_never_lists_protocol_panes() {
+        assert!(DockPane::ALL.iter().all(|pane| !pane.is_protocol()));
+        assert!(DockPane::PROTOCOLS.iter().all(|pane| pane.is_protocol()));
     }
 
     #[test]

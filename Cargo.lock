@@ -3692,6 +3692,28 @@ name = "pb-abi"
 version = "0.1.0"
 
 [[package]]
+name = "pb-can"
+version = "0.1.0"
+dependencies = [
+ "pb-abi",
+ "pb-extkit",
+ "pb-proto",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pb-dnp3"
+version = "0.1.0"
+dependencies = [
+ "pb-abi",
+ "pb-extkit",
+ "pb-proto",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pb-engine"
 version = "0.1.0"
 dependencies = [
@@ -3700,6 +3722,16 @@ dependencies = [
  "pb-points",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pb-extkit"
+version = "0.1.0"
+dependencies = [
+ "pb-abi",
+ "serde",
+ "serde_json",
+ "serialport",
 ]
 
 [[package]]
@@ -3795,6 +3827,13 @@ name = "pb-points"
 version = "0.1.0"
 
 [[package]]
+name = "pb-proto"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "pb-service"
 version = "0.1.0"
 dependencies = [
@@ -3809,12 +3848,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "pb-sim"
+version = "0.1.0"
+dependencies = [
+ "ctrlc",
+ "pb-ipc",
+ "pb-modbus",
+ "pb-proto",
+ "rumqttc",
+]
+
+[[package]]
 name = "pb-snmp"
 version = "0.1.0"
 dependencies = [
  "pb-abi",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pb-sparkplug"
+version = "0.1.0"
+dependencies = [
+ "pb-abi",
+ "pb-extkit",
+ "pb-proto",
+ "rumqttc",
+ "rumqttd",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -3854,6 +3918,29 @@ dependencies = [
  "serde_json",
  "toml",
  "ureq",
+]
+
+[[package]]
+name = "pb-websocket"
+version = "0.1.0"
+dependencies = [
+ "pb-abi",
+ "pb-extkit",
+ "pb-json",
+ "serde",
+ "serde_json",
+ "tungstenite",
+]
+
+[[package]]
+name = "pb-wits"
+version = "0.1.0"
+dependencies = [
+ "pb-abi",
+ "pb-extkit",
+ "pb-proto",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5581,6 +5668,7 @@ dependencies = [
  "thiserror 1.0.69",
  "url",
  "utf-8",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

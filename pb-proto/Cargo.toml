@@ -1,0 +1,13 @@
+[package]
+name = "pb-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Pure protocol codecs (WITS, Sparkplug B, DNP3) shared by Protocol Bench packs and the demo simulator"
+
+[dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

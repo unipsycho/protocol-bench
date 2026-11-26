@@ -68,6 +68,9 @@ pub struct ProjectFile {
     /// File-follow sources (CSV / JSON lines). Absent on older files → defaults.
     #[serde(default)]
     pub files: FilesProject,
+    /// WITS / WebSocket / Sparkplug B / DNP3 / CAN connections (`wits`, `websocket`, … keys).
+    #[serde(flatten)]
+    pub ext: crate::ext_proto::ExtSections,
     /// Hub diagram + Input/Output MQTT binds. Absent on older files → keep ui.toml hubs.
     #[serde(default)]
     pub hubs: Option<HubModel>,
@@ -87,6 +90,9 @@ pub struct DockLayout {
     pub hidden_panes: Vec<DockPane>,
     #[serde(default)]
     pub maximized: Option<DockPane>,
+    /// Protocol shown in the Protocols pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocols_selected: Option<DockPane>,
 }
 
 impl DockLayout {
@@ -95,6 +101,7 @@ impl DockLayout {
             tree: state.tree.clone(),
             hidden_panes: state.hidden_panes.clone(),
             maximized: state.maximized,
+            protocols_selected: state.protocols_selected,
         }
     }
 
@@ -103,6 +110,9 @@ impl DockLayout {
         state.tree = self.tree.clone();
         state.hidden_panes = self.hidden_panes.clone();
         state.maximized = self.maximized;
+        if self.protocols_selected.is_some() {
+            state.protocols_selected = self.protocols_selected;
+        }
         state.sanitize();
     }
 }
@@ -141,6 +151,7 @@ impl Default for ProjectFile {
             snmp: SnmpProject::default(),
             modbus: ModbusProject::default(),
             files: FilesProject::default(),
+            ext: Default::default(),
             hubs: None,
             settings: ProjectSettings::default(),
             layout: None,
@@ -293,6 +304,7 @@ impl Default for ModbusProject {
             order: "abcd".into(),
             unit: 0,
             point: point.into(),
+            ..Default::default()
         };
         let plc = ModbusConn {
             id: "plc".into(),
@@ -1083,7 +1095,7 @@ fn default_transport() -> String {
 }
 
 impl MqttClientSerde {
-    fn default_local() -> Self {
+    pub(crate) fn default_local() -> Self {
         Self {
             id: "local".into(),
             label: "Local broker".into(),
@@ -1474,6 +1486,21 @@ HubProto::Modbus => {
                         }
                     }
                 }
+                HubProto::Wits | HubProto::WebSocket | HubProto::Sparkplug | HubProto::Dnp3 | HubProto::Can => {
+                    let Some(e) = port.protocol.ext() else { continue };
+                    let conn = port.ext_connection.clone();
+                    for bind in &mut port.ext_inputs {
+                        let Some(source) = crate::ext_proto::bind_source(e, &conn, bind) else { continue };
+                        let point = crate::ext_proto::text_of(bind, "point");
+                        if point.trim().is_empty() {
+                            let id = store.ensure_id(e.core().prefix, &source);
+                            bind.insert("point".into(), serde_json::Value::from(id));
+                            dirty = true;
+                        } else {
+                            store.bind(point.trim(), &source);
+                        }
+                    }
+                }
                 HubProto::Snmp => {
                     let target = port.snmp_target.clone();
                     for bind in &mut port.snmp_inputs {
@@ -1626,6 +1653,7 @@ mod tests {
             snmp: SnmpProject::default(),
             modbus: ModbusProject::default(),
             files: FilesProject::default(),
+            ext: Default::default(),
             hubs: None,
             settings: ProjectSettings {
                 name: "Plant".into(),
@@ -1750,6 +1778,7 @@ mod tests {
             order: "cdab".into(),
             unit: 0,
             point: String::new(),
+            ..Default::default()
         });
         let port = &mut hubs.hubs[0].sources[1];
         port.protocol = HubProto::Files;
@@ -1772,6 +1801,7 @@ mod tests {
             order: order.into(),
             unit,
             point: String::new(),
+            ..Default::default()
         };
         // Same literals asserted in pb-service `source_strings_match_the_ui_format`.
         assert_eq!(modbus_bind_source("plc", &b("holding", 100, "f32", "abcd", 0)), "modbus/plc::holding:100:f32");
@@ -1855,6 +1885,7 @@ mod tests {
                 order: order.into(),
                 unit: 0,
                 point: point.into(),
+                ..Default::default()
             };
             if order.is_empty() {
                 b.order = "abcd".into();

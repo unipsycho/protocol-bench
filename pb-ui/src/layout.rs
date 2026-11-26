@@ -94,7 +94,7 @@ impl Default for LayoutNode {
 
 impl LayoutNode {
     /// Opening arrangement: hubs across the top; project, points and mappings as tabs on the left;
-    /// every protocol pane as tabs in the middle; traffic on the right. Users can still drag tabs out.
+    /// the Protocols pane in the middle; traffic on the right. Users can still drag tabs out.
     pub fn default_tree() -> Self {
         fn tabs(panes: &[DockPane]) -> LayoutNode {
             LayoutNode::Leaf(TabGroup {
@@ -109,20 +109,11 @@ impl LayoutNode {
             split(
                 SplitDir::Row,
                 0.30,
-                tabs(&[DockPane::Project, DockPane::Points, DockPane::Mappings]),
+                tabs(&[DockPane::Project, DockPane::Points, DockPane::Mappings, DockPane::Help]),
                 split(
                     SplitDir::Row,
                     0.76,
-                    tabs(&[
-                        DockPane::Streams,
-                        DockPane::Mqtt,
-                        DockPane::Http,
-                        DockPane::Modbus,
-                        DockPane::OpcUa,
-                        DockPane::Files,
-                        DockPane::Las,
-                        DockPane::Snmp,
-                    ]),
+                    leaf(DockPane::Protocols),
                     leaf(DockPane::Traffic),
                 ),
             ),
@@ -182,8 +173,7 @@ impl LayoutNode {
         }
     }
 
-    /// Leaf order, first child then second, tabs left to right. Used by layout tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Leaf order, first child then second, tabs left to right.
     pub fn collect_panes(&self, out: &mut Vec<DockPane>) {
         match self {
             LayoutNode::Leaf(group) => out.extend(group.tabs.iter().copied()),
@@ -239,6 +229,15 @@ impl LayoutNode {
                 *pane = b;
             } else if *pane == b {
                 *pane = a;
+            }
+        });
+    }
+
+    /// Put `to` where `from` sits (same area, same tab slot).
+    pub fn replace_pane(&mut self, from: DockPane, to: DockPane) {
+        self.for_each_pane(&mut |pane| {
+            if *pane == from {
+                *pane = to;
             }
         });
     }
@@ -351,6 +350,188 @@ impl LayoutNode {
             return false;
         }
         true
+    }
+
+    /// Move `pane` within its own tab strip so it lands before the tab now at `index`
+    /// (`index == len` puts it last). The moved tab stays selected if it was.
+    pub fn reorder_tab(&mut self, pane: DockPane, index: usize) -> bool {
+        let Some(group) = self.leaf_mut(pane) else {
+            return false;
+        };
+        let Some(from) = group.tabs.iter().position(|item| *item == pane) else {
+            return false;
+        };
+        let index = index.min(group.tabs.len());
+        if index == from || index == from + 1 {
+            return false;
+        }
+        let active = group.active_pane();
+        group.tabs.remove(from);
+        let to = if index > from { index - 1 } else { index };
+        group.tabs.insert(to, pane);
+        group.active = group.tabs.iter().position(|item| *item == active).unwrap_or(0);
+        true
+    }
+
+    /// Like [`Self::tab_onto`], but inserts `moving` before the tab at `index` of the target strip.
+    pub fn tab_onto_at(&mut self, moving: DockPane, target: DockPane, index: usize) -> bool {
+        if moving == target || !self.contains_pane(moving) || !self.contains_pane(target) {
+            return false;
+        }
+        if self.same_group(moving, target) {
+            return false;
+        }
+        let backup = self.clone();
+        if !self.remove_leaf(moving) {
+            return false;
+        }
+        let Some(group) = self.leaf_mut(target) else {
+            *self = backup;
+            return false;
+        };
+        let at = index.min(group.tabs.len());
+        group.tabs.insert(at, moving);
+        group.active = at;
+        true
+    }
+
+    /// Mutable area that holds `pane`.
+    fn leaf_mut(&mut self, pane: DockPane) -> Option<&mut TabGroup> {
+        match self {
+            LayoutNode::Leaf(group) if group.contains(pane) => Some(group),
+            LayoutNode::Leaf(_) => None,
+            LayoutNode::Split { first, second, .. } => {
+                if first.contains_pane(pane) {
+                    first.leaf_mut(pane)
+                } else {
+                    second.leaf_mut(pane)
+                }
+            }
+        }
+    }
+
+    /// Remove the whole area holding `member`, collapsing its parent split. The root area stays.
+    fn remove_group(&mut self, member: DockPane) -> Option<TabGroup> {
+        match self {
+            LayoutNode::Leaf(_) => None,
+            LayoutNode::Split { first, second, .. } => {
+                if let LayoutNode::Leaf(group) = first.as_ref() {
+                    if group.contains(member) {
+                        let taken = group.clone();
+                        *self = second.as_ref().clone();
+                        return Some(taken);
+                    }
+                }
+                if let LayoutNode::Leaf(group) = second.as_ref() {
+                    if group.contains(member) {
+                        let taken = group.clone();
+                        *self = first.as_ref().clone();
+                        return Some(taken);
+                    }
+                }
+                if first.contains_pane(member) {
+                    first.remove_group(member)
+                } else {
+                    second.remove_group(member)
+                }
+            }
+        }
+    }
+
+    /// Move the whole area holding `member` (all its tabs) to `edge` of the area holding `target`.
+    pub fn dock_group(&mut self, member: DockPane, target: DockPane, edge: TileEdge) -> bool {
+        if self.same_group(member, target) || !self.contains_pane(target) {
+            return false;
+        }
+        let backup = self.clone();
+        let Some(moving) = self.remove_group(member) else {
+            return false;
+        };
+        if !self.split_at_with(target, LayoutNode::Leaf(moving), edge) {
+            *self = backup;
+            return false;
+        }
+        true
+    }
+
+    /// Move every tab of the area holding `member` into the strip holding `target`, before `index`.
+    pub fn merge_group(&mut self, member: DockPane, target: DockPane, index: usize) -> bool {
+        if self.same_group(member, target) || !self.contains_pane(target) {
+            return false;
+        }
+        let backup = self.clone();
+        let Some(moving) = self.remove_group(member) else {
+            return false;
+        };
+        let Some(group) = self.leaf_mut(target) else {
+            *self = backup;
+            return false;
+        };
+        let at = index.min(group.tabs.len());
+        let shown = moving.active_pane();
+        for (i, pane) in moving.tabs.iter().enumerate() {
+            group.tabs.insert(at + i, *pane);
+        }
+        group.active = group.tabs.iter().position(|item| *item == shown).unwrap_or(at);
+        true
+    }
+
+    /// Exchange two whole areas (tabs and selection) in place.
+    pub fn swap_groups(&mut self, a: DockPane, b: DockPane) -> bool {
+        if self.same_group(a, b) {
+            return false;
+        }
+        let (Some(ga), Some(gb)) = (self.group_of(a).cloned(), self.group_of(b).cloned()) else {
+            return false;
+        };
+        self.for_each_leaf(&mut |group| {
+            if *group == ga {
+                *group = gb.clone();
+            } else if *group == gb {
+                *group = ga.clone();
+            }
+        });
+        true
+    }
+
+    fn for_each_leaf(&mut self, f: &mut dyn FnMut(&mut TabGroup)) {
+        match self {
+            LayoutNode::Leaf(group) => f(group),
+            LayoutNode::Split { first, second, .. } => {
+                first.for_each_leaf(f);
+                second.for_each_leaf(f);
+            }
+        }
+    }
+
+    /// Split the area that holds `target`, putting `node` on `edge`.
+    fn split_at_with(&mut self, target: DockPane, node: LayoutNode, edge: TileEdge) -> bool {
+        match self {
+            LayoutNode::Leaf(group) if group.contains(target) => {
+                let keep = LayoutNode::Leaf(group.clone());
+                let (dir, first, second) = match edge {
+                    TileEdge::North => (SplitDir::Col, node, keep),
+                    TileEdge::South => (SplitDir::Col, keep, node),
+                    TileEdge::West => (SplitDir::Row, node, keep),
+                    TileEdge::East => (SplitDir::Row, keep, node),
+                };
+                *self = LayoutNode::Split {
+                    dir,
+                    ratio: 0.5,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                };
+                true
+            }
+            LayoutNode::Leaf(_) => false,
+            LayoutNode::Split { first, second, .. } => {
+                if first.contains_pane(target) {
+                    first.split_at_with(target, node, edge)
+                } else {
+                    second.split_at_with(target, node, edge)
+                }
+            }
+        }
     }
 
     /// Insert `pane` beside `beside` when it is not already in the tree.
@@ -554,22 +735,22 @@ mod tests {
     #[test]
     fn dock_moves_a_pane_and_keeps_the_rest() {
         let mut tree = LayoutNode::default_tree();
-        assert!(tree.dock_into(DockPane::Files, DockPane::Project, TileEdge::North));
+        assert!(tree.dock_into(DockPane::Traffic, DockPane::Project, TileEdge::North));
         for pane in DockPane::ALL {
             assert!(tree.contains_pane(pane));
         }
-        assert!(files_above_project(&tree));
+        assert!(traffic_above_project(&tree));
     }
 
-    fn files_above_project(node: &LayoutNode) -> bool {
+    fn traffic_above_project(node: &LayoutNode) -> bool {
         match node {
             LayoutNode::Split {
                 dir, first, second, ..
             } => {
                 let placed = *dir == SplitDir::Col
-                    && sole_tab(first, DockPane::Files)
+                    && sole_tab(first, DockPane::Traffic)
                     && second.contains_pane(DockPane::Project);
-                placed || files_above_project(first) || files_above_project(second)
+                placed || traffic_above_project(first) || traffic_above_project(second)
             }
             LayoutNode::Leaf(_) => false,
         }
@@ -588,6 +769,68 @@ mod tests {
                 split(SplitDir::Col, 0.5, leaf(DockPane::Files), leaf(DockPane::Traffic)),
             ),
         )
+    }
+
+    fn tabs_leaf(panes: &[DockPane], active: usize) -> LayoutNode {
+        LayoutNode::Leaf(TabGroup { tabs: panes.to_vec(), active })
+    }
+
+    #[test]
+    fn reorder_tab_moves_within_strip_and_keeps_selection() {
+        use DockPane::*;
+        let mut tree = split(SplitDir::Row, 0.5, tabs_leaf(&[Project, Points, Mappings], 1), leaf(Hubs));
+        assert!(!tree.reorder_tab(Project, 0), "same slot is a no-op");
+        assert!(!tree.reorder_tab(Project, 1), "slot right after itself is a no-op");
+        assert!(tree.reorder_tab(Project, 3));
+        let g = tree.group_of(Points).unwrap();
+        assert_eq!(g.tabs, vec![Points, Mappings, Project]);
+        assert_eq!(g.active_pane(), Points);
+        assert!(tree.reorder_tab(Project, 0));
+        assert_eq!(tree.group_of(Points).unwrap().tabs, vec![Project, Points, Mappings]);
+    }
+
+    #[test]
+    fn tab_onto_at_inserts_at_position() {
+        use DockPane::*;
+        let mut tree = split(SplitDir::Row, 0.5, tabs_leaf(&[Project, Points], 0), leaf(Hubs));
+        assert!(tree.tab_onto_at(Hubs, Project, 1));
+        let g = tree.group_of(Hubs).unwrap();
+        assert_eq!(g.tabs, vec![Project, Hubs, Points]);
+        assert_eq!(g.active_pane(), Hubs);
+    }
+
+    #[test]
+    fn group_dock_merge_and_swap() {
+        use DockPane::*;
+        let base = split(
+            SplitDir::Row,
+            0.5,
+            tabs_leaf(&[Project, Points], 1),
+            split(SplitDir::Col, 0.5, leaf(Hubs), tabs_leaf(&[Mqtt, Modbus], 0)),
+        );
+
+        let mut t = base.clone();
+        assert!(t.dock_group(Points, Hubs, TileEdge::South));
+        assert_eq!(t.group_of(Project).unwrap().tabs, vec![Project, Points]);
+        assert_eq!(t.group_of(Project).unwrap().active_pane(), Points);
+        assert!(!t.same_group(Project, Hubs));
+
+        let mut t = base.clone();
+        assert!(t.merge_group(Mqtt, Project, 1));
+        let g = t.group_of(Project).unwrap();
+        assert_eq!(g.tabs, vec![Project, Mqtt, Modbus, Points]);
+        assert_eq!(g.active_pane(), Mqtt);
+
+        let mut t = base.clone();
+        assert!(t.swap_groups(Project, Modbus));
+        let mut order = Vec::new();
+        t.collect_panes(&mut order);
+        assert_eq!(order, vec![Mqtt, Modbus, Hubs, Project, Points]);
+
+        let mut t = base.clone();
+        assert!(!t.dock_group(Project, Points, TileEdge::West), "cannot dock onto itself");
+        let mut lone = tabs_leaf(&[Project, Points], 0);
+        assert!(!lone.dock_group(Project, Points, TileEdge::East));
     }
 
     #[test]

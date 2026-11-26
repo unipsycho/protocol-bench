@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-PACKS=(pb-mqtt pb-opcua pb-streams pb-http pb-modbus pb-files pb-snmp pb-las)
+PACKS=(pb-mqtt pb-opcua pb-streams pb-http pb-modbus pb-files pb-snmp pb-las pb-wits pb-websocket pb-sparkplug pb-dnp3 pb-can)
 
 echo "==> stopping old service / UI"
 pkill -x protocol-bench 2>/dev/null || true

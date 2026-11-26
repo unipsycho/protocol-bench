@@ -33,6 +33,197 @@ pub struct PointsPanelState {
     pub table: PointsTableState,
 }
 
+/// What the Protocols pane needs from the layout: the pick, and which protocols already have
+/// their own tile.
+#[derive(Debug, Clone, Default)]
+pub struct ProtocolsView {
+    pub selected: Option<DockPane>,
+    pub popped: Vec<DockPane>,
+}
+
+/// Borrowed protocol panel states, for counts in the Protocols dropdown.
+struct ProtoStates<'a> {
+    mqtt: &'a MqttPanelState,
+    opcua: &'a OpcUaPanelState,
+    http: &'a HttpPanelState,
+    streams: &'a StreamsPanelState,
+    las: &'a LasPanelState,
+    snmp: &'a SnmpPanelState,
+    modbus: &'a ModbusPanelState,
+    files: &'a FilesPanelState,
+    ext: &'a crate::ext_proto::ExtPanels,
+}
+
+impl ProtoStates<'_> {
+    /// Configured connections / endpoints for one protocol.
+    fn count(&self, pane: DockPane) -> usize {
+        match pane {
+            DockPane::Mqtt => self.mqtt.clients.len(),
+            DockPane::OpcUa => self.opcua.clients.len(),
+            DockPane::Http => self.http.clients.len(),
+            DockPane::Streams => self.streams.endpoints.len(),
+            DockPane::Las => self.las.endpoints.len(),
+            DockPane::Snmp => self.snmp.targets.len(),
+            DockPane::Modbus => self.modbus.conns.len(),
+            DockPane::Files => self.files.sources.len(),
+            _ => pane.ext().map_or(0, |e| self.ext.get(e).conns.len()),
+        }
+    }
+}
+
+/// Which protocol the Protocols pane shows: the saved pick when it is still offered and not
+/// popped out, else the first offered one the project uses, else the first offered one.
+/// Popped-out protocols are only chosen when nothing else is offered.
+pub fn resolve_protocol(
+    selected: Option<DockPane>,
+    available: &[DockPane],
+    in_use: &[DockPane],
+    popped: &[DockPane],
+) -> Option<DockPane> {
+    let free = |pane: &DockPane| available.contains(pane) && !popped.contains(pane);
+    selected
+        .filter(free)
+        .or_else(|| in_use.iter().copied().find(free))
+        .or_else(|| available.iter().copied().find(free))
+        .or_else(|| available.first().copied())
+}
+
+/// Dropdown order: protocols the project uses first, then the rest, each in rail order.
+pub fn protocol_groups(available: &[DockPane], in_use: &[DockPane]) -> (Vec<DockPane>, Vec<DockPane>) {
+    available.iter().copied().partition(|pane| in_use.contains(pane))
+}
+
+/// Status lamp for a protocol slot: live, error, pack missing, or idle.
+fn protocol_dot(pane: DockPane, host: &HostSnapshot, p: &ThemePalette) -> Color32 {
+    let Some(slot) = pane.engine().and_then(|id| host.slot(id)) else {
+        return p.muted;
+    };
+    if !slot.pack_loaded {
+        p.warn
+    } else if slot.state == "error" || !slot.last_error.is_empty() {
+        p.err
+    } else if slot.connected {
+        p.live
+    } else {
+        p.muted
+    }
+}
+
+fn protocol_entry(pane: DockPane, count: usize, popped: bool, host: &HostSnapshot, p: &ThemePalette) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    let fmt = |color| TextFormat { font_id: font_ui(13.0), color, ..Default::default() };
+    job.append("\u{25CF}  ", 0.0, fmt(protocol_dot(pane, host, p)));
+    job.append(pane.title(), 0.0, fmt(p.text));
+    if count > 0 {
+        job.append(&format!("   {count}"), 0.0, fmt(p.muted));
+    }
+    if popped {
+        job.append("   (own panel)", 0.0, fmt(p.muted));
+    }
+    job
+}
+
+struct ProtocolsHeader {
+    /// Protocol whose panel to draw under the header, if any.
+    show: Option<DockPane>,
+    change: crate::hubs::HubChange,
+}
+
+/// Dropdown + pop-out row at the top of the Protocols pane.
+fn protocols_header(
+    ui: &mut egui::Ui,
+    host: &HostSnapshot,
+    p: &ThemePalette,
+    states: &ProtoStates,
+    view: &mut ProtocolsView,
+) -> ProtocolsHeader {
+    let mut change = crate::hubs::HubChange::quiet();
+    let available = DockPane::available_protocols(host);
+    let in_use: Vec<DockPane> = available.iter().copied().filter(|pane| states.count(*pane) > 0).collect();
+    let Some(current) = resolve_protocol(view.selected, &available, &in_use, &view.popped) else {
+        ui.add_space(24.0);
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new("No protocol packs loaded").font(font_semi(14.0)).color(p.text));
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Add libpb_* packs to the service modules/ folder and restart the service.")
+                    .font(font_ui(12.0))
+                    .color(p.muted),
+            );
+        });
+        return ProtocolsHeader { show: None, change };
+    };
+    if view.selected != Some(current) {
+        view.selected = Some(current);
+        change.ui_dirty = true;
+    }
+    let (used, rest) = protocol_groups(&available, &in_use);
+    let mut pick = current;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::ITEM_X;
+        let (icon, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+        art::paint_pane_icon(ui.painter(), icon, current, current.ink(p.is_light));
+        let popped_now = view.popped.contains(&current);
+        egui::ComboBox::from_id_salt("pb_protocols_pick")
+            .width(220.0)
+            .selected_text(protocol_entry(current, states.count(current), popped_now, host, p))
+            .show_ui(ui, |ui| {
+                for (caption, list) in [("IN THIS PROJECT", &used), ("AVAILABLE", &rest)] {
+                    if list.is_empty() {
+                        continue;
+                    }
+                    ui.label(egui::RichText::new(caption).font(font_ui(10.5)).color(p.muted));
+                    for pane in list.iter().copied() {
+                        let job = protocol_entry(pane, states.count(pane), view.popped.contains(&pane), host, p);
+                        if ui.selectable_label(pane == current, job).clicked() {
+                            pick = pane;
+                        }
+                    }
+                }
+            });
+        if !host.alive {
+            ui.label(egui::RichText::new("service offline: showing every protocol").font(font_ui(11.0)).color(p.muted));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (label, tip) = if popped_now {
+                ("Go to panel", "This protocol already has its own panel")
+            } else {
+                ("Pop out", "Open this protocol in its own panel, beside this one")
+            };
+            if crate::hubs::text_button(ui, label, false, p).on_hover_text(tip).clicked() {
+                if popped_now {
+                    change.open = Some(current);
+                } else {
+                    change.pop_out = Some(current);
+                }
+            }
+        });
+    });
+    if pick != current {
+        if view.popped.contains(&pick) {
+            change.open = Some(pick);
+        } else {
+            view.selected = Some(pick);
+            change.ui_dirty = true;
+        }
+    }
+    ui.add_space(6.0);
+    let shown = view.selected.unwrap_or(current);
+    if view.popped.contains(&shown) {
+        ui.add_space(24.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new(format!("{} is open in its own panel", shown.title()))
+                    .font(font_ui(12.5))
+                    .color(p.muted),
+            );
+        });
+        return ProtocolsHeader { show: None, change };
+    }
+    ProtocolsHeader { show: Some(shown), change }
+}
+
 /// Fill the pane body for one dock leaf.
 pub fn paint(
     ui: &mut egui::Ui,
@@ -49,12 +240,28 @@ pub fn paint(
     snmp: &mut SnmpPanelState,
     modbus: &mut ModbusPanelState,
     files: &mut FilesPanelState,
+    ext: &mut crate::ext_proto::ExtPanels,
     points: &mut PointsPanelState,
     traffic: &mut TrafficPanelState,
     settings: &mut ProjectSettings,
     project_path: &std::path::Path,
+    protocols: &mut ProtocolsView,
 ) -> crate::hubs::HubChange {
     match pane {
+        DockPane::Protocols => {
+            let states = ProtoStates {
+                mqtt, opcua, http, streams, las, snmp, modbus, files, ext,
+            };
+            let header = protocols_header(ui, host, p, &states, protocols);
+            let Some(chosen) = header.show else {
+                return header.change;
+            };
+            let body = paint(
+                ui, chosen, host, p, hubs, engine, mqtt, opcua, http, streams, las, snmp,
+                modbus, files, ext, points, traffic, settings, project_path, protocols,
+            );
+            header.change.join(body)
+        }
         DockPane::Project => {
             project_panel(ui, hubs, engine, mqtt, opcua, host, settings, project_path, p)
         }
@@ -66,6 +273,7 @@ pub fn paint(
             hubs.choices.modbus_clients = modbus.choices(ModbusRole::Client);
             hubs.choices.modbus_servers = modbus.choices(ModbusRole::Server);
             hubs.choices.file_sources = files.choices();
+            hubs.choices.ext_conns = ext.states.iter().map(|st| st.choices()).collect();
             crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, http, streams, las, snmp, host, engine)
         }
         DockPane::Mqtt => {
@@ -124,6 +332,17 @@ pub fn paint(
         }
         DockPane::Mappings => {
             mappings_panel::paint(ui, host, hubs, p);
+            crate::hubs::HubChange::quiet()
+        }
+        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can => {
+            let mut change = crate::hubs::HubChange::quiet();
+            if let Some(e) = pane.ext() {
+                change.dirty = crate::ext_proto::paint_panel(ui, p, ext.get_mut(e), host);
+            }
+            change
+        }
+        DockPane::Help => {
+            crate::help_panel::paint(ui, p);
             crate::hubs::HubChange::quiet()
         }
         DockPane::Calculations => {
@@ -190,7 +409,7 @@ fn points_panel_body(
         ui.add(
             egui::TextEdit::singleline(&mut state.filter)
                 .desired_width(w)
-                .hint_text("name or source…"),
+                .hint_text(crate::theme::hint(ui, "name or source…")),
         );
     });
     ui.add_space(8.0);
@@ -225,7 +444,7 @@ fn points_panel_body(
         return;
     }
 
-    egui::ScrollArea::vertical()
+    egui::ScrollArea::both()
         .id_salt("pb_points_live")
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -419,7 +638,8 @@ fn columns(pane: DockPane) -> &'static [(&'static str, f32)] {
         DockPane::Http => &[("NAME", 0.28), ("URL", 0.52), ("AUTH", 0.20)],
         DockPane::Las => &[("NAME", 0.28), ("PATH", 0.48), ("ROLE", 0.24)],
         DockPane::Snmp => &[("NAME", 0.28), ("HOST", 0.44), ("VER", 0.28)],
-        DockPane::Project | DockPane::Hubs | DockPane::Calculations => &[("NAME", 1.0)],
+        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can => &[("NAME", 0.30), ("ENDPOINT", 0.50), ("STATE", 0.20)],
+        DockPane::Project | DockPane::Hubs | DockPane::Help | DockPane::Calculations | DockPane::Protocols => &[("NAME", 1.0)],
     }
 }
 
@@ -436,7 +656,8 @@ fn empty_message(pane: DockPane) -> &'static str {
         DockPane::Http => "No clients yet",
         DockPane::Las => "No endpoints yet",
         DockPane::Snmp => "No targets yet",
-        DockPane::Project | DockPane::Hubs | DockPane::Calculations => "",
+        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can => "No connections yet",
+        DockPane::Project | DockPane::Hubs | DockPane::Help | DockPane::Calculations | DockPane::Protocols => "",
     }
 }
 
@@ -487,7 +708,7 @@ fn project_panel(
                                 .add(
                                     egui::TextEdit::singleline(&mut settings.name)
                                         .desired_width(ui.available_width().max(120.0))
-                                        .hint_text(fallback)
+                                        .hint_text(crate::theme::hint(ui, fallback))
                                         .margin(egui::Margin::symmetric(6.0, 3.0)),
                                 )
                                 .changed()
@@ -513,7 +734,7 @@ fn project_panel(
                             egui::TextEdit::multiline(&mut settings.description)
                                 .desired_width(ui.available_width().max(120.0))
                                 .desired_rows(3)
-                                .hint_text("Optional notes for this project")
+                                .hint_text(crate::theme::hint(ui, "Optional notes for this project"))
                                 .margin(egui::Margin::symmetric(6.0, 4.0)),
                         )
                         .changed()
@@ -558,7 +779,7 @@ fn project_panel(
                         change.dirty = true;
                     }
                     ui.add_space(space::AFTER_FIELD);
-                    running_hubs_line(ui, mqtt, opcua, p);
+                    running_hubs_line(ui, mqtt, opcua, hubs, p);
                     ui.add_space(space::AFTER_BLURB);
                     if ui
                         .add(
@@ -650,36 +871,21 @@ fn running_hubs_line(
     ui: &mut egui::Ui,
     mqtt: &MqttPanelState,
     opcua: &OpcUaPanelState,
+    hubs: &HubModel,
     p: &ThemePalette,
 ) {
-    let mut parts = Vec::new();
-    if mqtt.embedded.enabled {
-        parts.push(if mqtt.broker_running {
-            format!("MQTT hub · running (:{})", mqtt.embedded.port)
-        } else {
-            "MQTT hub · stopped".into()
-        });
-    }
-    if opcua.embedded.enabled {
-        parts.push(if opcua.server_running {
-            format!("OPC UA hub · running (:{})", opcua.embedded.port)
-        } else {
-            "OPC UA hub · stopped".into()
-        });
-    }
-    let text = if parts.is_empty() {
-        "No embedded hubs configured.".into()
-    } else {
-        parts.join("  ·  ")
-    };
+    // Same wording as the top-banner status strip.
+    let kinds = crate::hub_status::kinds(mqtt, opcua, hubs);
+    let up = kinds.iter().any(|k| k.running);
     ui.label(
-        egui::RichText::new(text)
+        egui::RichText::new(crate::hub_status::headline(&kinds))
             .font(font_ui(12.0))
-            .color(if mqtt.broker_running || opcua.server_running {
-                p.live
-            } else {
-                p.muted
-            }),
+            .color(if up { p.live } else { p.muted }),
+    );
+    ui.label(
+        egui::RichText::new(crate::hub_status::subheading(&kinds))
+            .font(font_ui(10.5))
+            .color(p.muted),
     );
 }
 
@@ -886,13 +1092,18 @@ fn stat_tile_action(
     let Some((ctl, tip)) = action else {
         return false;
     };
-    let size = 22.0;
-    let btn = Rect::from_min_size(
-        Pos2::new(rect.max.x - size - 8.0, rect.min.y + 9.0),
-        Vec2::splat(size),
+    // Right-aligned pill in the tile's top row, opposite the value.
+    let height = 22.0;
+    let area = Rect::from_min_size(
+        Pos2::new(rect.min.x + 8.0, rect.min.y + 9.0),
+        Vec2::new(rect.width() - 16.0, height),
     );
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(btn));
-    art::run_button(&mut child, ctl.running, ctl.enabled, tip, p, size).clicked()
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(area)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    art::run_pill(&mut child, ctl.running, ctl.enabled, tip, p, height).clicked()
 }
 
 fn list_section(ui: &mut egui::Ui, title: &str, names: &[String], ink: Color32, p: &ThemePalette) {
@@ -966,20 +1177,23 @@ fn list_section_with(
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::hover());
         ui.painter()
             .circle_filled(Pos2::new(rect.min.x + 10.0, rect.center().y), 2.75, ink);
-        let reserve = if toggle.is_some() { 28.0 } else { 6.0 };
+        let reserve = if toggle.is_some() { 64.0 } else { 6.0 };
         let clip = Rect::from_min_max(
             Pos2::new(rect.min.x + 20.0, rect.min.y),
             Pos2::new(rect.max.x - reserve, rect.max.y),
         );
         if let Some(running) = toggle {
-            let size = 18.0;
-            let btn = Rect::from_center_size(
-                Pos2::new(rect.max.x - size * 0.5 - 4.0, rect.center().y),
-                Vec2::splat(size),
+            let btn = Rect::from_min_max(
+                Pos2::new(rect.min.x, rect.min.y + 1.0),
+                Pos2::new(rect.max.x - 4.0, rect.max.y - 1.0),
             );
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(btn));
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(btn)
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            );
             let tip = if running { "Stop this hub" } else { "Start this hub" };
-            if art::run_button(&mut child, running, true, tip, p, size).clicked() {
+            if art::run_pill(&mut child, running, true, tip, p, btn.height()).clicked() {
                 clicked_row = Some(i);
             }
         }
@@ -998,4 +1212,54 @@ fn list_section_with(
 pub fn format_uptime(ms: u64) -> String {
     let total = ms / 1000;
     format!("{}:{:02}", total / 60, total % 60)
+}
+
+#[cfg(test)]
+mod protocols_tests {
+    use super::*;
+
+    fn host(alive: bool, packs: &[&str]) -> HostSnapshot {
+        HostSnapshot {
+            thread_name: String::new(),
+            alive,
+            ticks: 0,
+            uptime_ms: 0,
+            slots: vec![],
+            modules_dir: String::new(),
+            packs_loaded: packs.iter().map(|s| s.to_string()).collect(),
+            point_count: 0,
+            points: vec![],
+        }
+    }
+
+    #[test]
+    fn dropdown_offers_only_loaded_packs() {
+        let got = DockPane::available_protocols(&host(true, &["modbus", "files", "can"]));
+        assert_eq!(got, vec![DockPane::Modbus, DockPane::Files, DockPane::Can]);
+        assert!(DockPane::available_protocols(&host(true, &[])).is_empty());
+        // Service offline: pack list unknown, offer everything.
+        assert_eq!(DockPane::available_protocols(&host(false, &[])).len(), DockPane::PROTOCOLS.len());
+    }
+
+    #[test]
+    fn selection_falls_back_sensibly() {
+        let avail = [DockPane::Streams, DockPane::Modbus, DockPane::Mqtt];
+        let used = [DockPane::Mqtt];
+        assert_eq!(resolve_protocol(Some(DockPane::Modbus), &avail, &used, &[]), Some(DockPane::Modbus));
+        // Saved pick no longer loaded → first used protocol.
+        assert_eq!(resolve_protocol(Some(DockPane::Can), &avail, &used, &[]), Some(DockPane::Mqtt));
+        assert_eq!(resolve_protocol(None, &avail, &[], &[]), Some(DockPane::Streams));
+        // Popped-out protocols are skipped while another is free.
+        assert_eq!(resolve_protocol(Some(DockPane::Mqtt), &avail, &used, &[DockPane::Mqtt]), Some(DockPane::Streams));
+        assert_eq!(resolve_protocol(None, &[DockPane::Mqtt], &[], &[DockPane::Mqtt]), Some(DockPane::Mqtt));
+        assert_eq!(resolve_protocol(None, &[], &[], &[]), None);
+    }
+
+    #[test]
+    fn used_protocols_group_first() {
+        let avail = [DockPane::Streams, DockPane::Modbus, DockPane::Mqtt];
+        let (used, rest) = protocol_groups(&avail, &[DockPane::Mqtt, DockPane::Streams]);
+        assert_eq!(used, vec![DockPane::Streams, DockPane::Mqtt]);
+        assert_eq!(rest, vec![DockPane::Modbus]);
+    }
 }

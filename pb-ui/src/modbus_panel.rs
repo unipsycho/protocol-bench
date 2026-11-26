@@ -10,7 +10,6 @@ use pb_modbus::codec::{Area, ByteOrder, DataType};
 use serde::{Deserialize, Serialize};
 
 use crate::connection_list::{self, RowAction};
-use crate::form::{self, Cell};
 use crate::theme::{apply_form_spacing, font_ui, form_inset, space, ThemePalette};
 
 // ---------------------------------------------------------------------------
@@ -181,8 +180,11 @@ impl ModbusParity {
 
 /// One register bind. Client Input: register → host point (`modbus_N`). Client Output: host
 /// point → register. Server map entry: host point served at this address.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModbusBind {
+    /// Tag label shown in the register map (`Discharge pressure`). Optional.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     /// `coil` | `discrete` | `input` | `holding`.
     #[serde(default = "default_modbus_area")]
     pub area: String,
@@ -200,6 +202,24 @@ pub struct ModbusBind {
     /// Input: empty on new binds — host assigns `modbus_N`. Output / server map: the host point.
     #[serde(default)]
     pub point: String,
+    /// Engineering scaling: `value = raw × scale + offset` (writes invert it).
+    #[serde(default = "default_scale", skip_serializing_if = "is_one")]
+    pub scale: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset: f64,
+    /// Engineering units label (`psi`, `°C`, `bbl/min`). Display only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub units: String,
+}
+
+pub fn default_scale() -> f64 {
+    1.0
+}
+fn is_one(v: &f64) -> bool {
+    *v == 1.0
+}
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 pub fn default_modbus_area() -> String {
@@ -221,6 +241,10 @@ impl Default for ModbusBind {
             order: default_modbus_order(),
             unit: 0,
             point: String::new(),
+            name: String::new(),
+            scale: 1.0,
+            offset: 0.0,
+            units: String::new(),
         }
     }
 }
@@ -304,158 +328,6 @@ pub fn map_problems(map: &[ModbusBind]) -> Vec<String> {
         }
     }
     out
-}
-
-const TYPE_KINDS: [&str; 10] = ["u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64", "bit", "string"];
-
-fn kind_of(dt: &str) -> &'static str {
-    match DataType::parse(dt) {
-        Some(DataType::Bit(_)) => "bit",
-        Some(DataType::Str(_)) => "string",
-        Some(t) => TYPE_KINDS.iter().copied().find(|k| *k == t.as_string()).unwrap_or("u16"),
-        None => "u16",
-    }
-}
-
-/// Add-a-register form shared by hub Input / Output inspectors and the server register map.
-/// `writable_only` hides read-only areas; `need_point` shows the host point field.
-/// Returns true when the user pressed **Add bind** and the draft is valid.
-pub fn bind_editor(
-    ui: &mut egui::Ui,
-    salt: (&str, u64),
-    draft: &mut ModbusBind,
-    writable_only: bool,
-    need_point: bool,
-    p: &ThemePalette,
-) -> bool {
-    let areas: Vec<(&str, &str)> = ModbusBind::AREAS
-        .iter()
-        .copied()
-        .filter(|(k, _)| !writable_only || matches!(*k, "coil" | "holding"))
-        .collect();
-    if !areas.iter().any(|(k, _)| *k == draft.area) {
-        draft.area = areas[0].0.to_string();
-    }
-    let bit_area = Area::parse(&draft.area).is_some_and(|a| a.is_bit());
-    let bit_area_now = bit_area;
-    // Address / Unit / Type (+ Bit or Regs) / Order / Point share wrapping rows.
-    let mut cells: Vec<Cell<ModbusBind>> = vec![
-        Cell::fixed("Area", 150.0, |ui, w, d: &mut ModbusBind| {
-            let shown = areas.iter().find(|(k, _)| *k == d.area).map(|(_, l)| *l).unwrap_or("");
-            let mut area = d.area.clone();
-            egui::ComboBox::from_id_salt(("pb_mb_area", salt))
-                .selected_text(shown)
-                .width(w)
-                .show_ui(ui, |ui| {
-                    for (k, l) in &areas {
-                        ui.selectable_value(&mut area, k.to_string(), *l);
-                    }
-                });
-            let changed = area != d.area;
-            d.area = area;
-            changed
-        }),
-        Cell::fixed("Address", 70.0, |ui, w, d: &mut ModbusBind| {
-            ui.add_sized([w, form::ROW_H - 2.0], egui::DragValue::new(&mut d.address).range(0..=65535))
-                .changed()
-        }),
-        Cell::fixed("Unit", 52.0, |ui, w, d: &mut ModbusBind| {
-            ui.add_enabled_ui(!matches!(salt.0, "map"), |ui| {
-                ui.add_sized([w, form::ROW_H - 2.0], egui::DragValue::new(&mut d.unit).range(0..=247))
-                    .on_hover_text("0 = connection default")
-                    .changed()
-            })
-            .inner
-        }),
-    ];
-    if !bit_area_now {
-        cells.push(Cell::fixed("Type", 84.0, |ui, w, d: &mut ModbusBind| {
-            let mut kind = kind_of(&d.dtype);
-            egui::ComboBox::from_id_salt(("pb_mb_type", salt))
-                .selected_text(kind)
-                .width(w)
-                .show_ui(ui, |ui| {
-                    for k in TYPE_KINDS {
-                        ui.selectable_value(&mut kind, k, k);
-                    }
-                });
-            if kind != kind_of(&d.dtype) {
-                d.dtype = match kind {
-                    "bit" => "bit0".into(),
-                    "string" => "str4".into(),
-                    k => k.into(),
-                };
-                return true;
-            }
-            false
-        }));
-        match DataType::parse(&draft.dtype) {
-            Some(DataType::Bit(_)) => cells.push(Cell::fixed("Bit", 50.0, |ui, w, d: &mut ModbusBind| {
-                let Some(DataType::Bit(mut b)) = DataType::parse(&d.dtype) else { return false };
-                let changed = ui
-                    .add_sized([w, form::ROW_H - 2.0], egui::DragValue::new(&mut b).range(0..=15))
-                    .changed();
-                if changed {
-                    d.dtype = format!("bit{b}");
-                }
-                changed
-            })),
-            Some(DataType::Str(_)) => cells.push(Cell::fixed("Regs", 54.0, |ui, w, d: &mut ModbusBind| {
-                let Some(DataType::Str(mut n)) = DataType::parse(&d.dtype) else { return false };
-                let changed = ui
-                    .add_sized([w, form::ROW_H - 2.0], egui::DragValue::new(&mut n).range(1..=125))
-                    .changed();
-                if changed {
-                    d.dtype = format!("str{n}");
-                }
-                changed
-            })),
-            _ => {}
-        }
-        if draft.data_type().is_some_and(|t| t.uses_order() && (t.width() > 1 || matches!(t, DataType::U16 | DataType::I16))) {
-            cells.push(Cell::grow_to("Order", 120.0, 190.0, |ui, w, d: &mut ModbusBind| {
-                let mut cur = d.byte_order();
-                egui::ComboBox::from_id_salt(("pb_mb_order", salt))
-                    .selected_text(cur.label())
-                    .width(w)
-                    .show_ui(ui, |ui| {
-                        for o in ByteOrder::ALL {
-                            ui.selectable_value(&mut cur, o, o.label());
-                        }
-                    });
-                d.order = cur.as_str().into();
-                false
-            }));
-        }
-    }
-    if need_point {
-        cells.push(Cell::grow("Point", 110.0, |ui, w, d: &mut ModbusBind| form::text(ui, w, &mut d.point)));
-    }
-    if form::flow(ui, draft, p, cells) {
-        // Area decides whether Type / Order apply: normalize now, redraw with the right cells.
-        let bit_now = Area::parse(&draft.area).is_some_and(|a| a.is_bit());
-        if bit_now {
-            draft.dtype = "bool".into();
-        } else if draft.dtype == "bool" || bit_area != bit_now {
-            draft.dtype = default_modbus_type();
-        }
-        ui.ctx().request_repaint();
-    }
-    let problem = draft.problem(need_point);
-    if let Some(msg) = &problem {
-        if need_point && draft.point.trim().is_empty() && draft.problem(false).is_none() {
-            // Just waiting for a point name — no warning noise.
-        } else {
-            ui.label(RichText::new(msg).font(font_ui(11.0)).color(p.muted));
-        }
-    }
-    let mut add = false;
-    ui.add_enabled_ui(problem.is_none(), |ui| {
-        if ui.button("Add bind").clicked() {
-            add = true;
-        }
-    });
-    add
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -607,8 +479,6 @@ pub struct ModbusPanelState {
     pub conns: Vec<ModbusConn>,
     pub selected: Option<usize>,
     pub pending_delete: Option<(usize, String)>,
-    /// Draft row for the server register-map editor (session only).
-    pub draft_map: ModbusBind,
 }
 
 impl Default for ModbusPanelState {
@@ -617,7 +487,6 @@ impl Default for ModbusPanelState {
             conns: vec![ModbusConn::default_client(), ModbusConn::default_server()],
             selected: None,
             pending_delete: None,
-            draft_map: ModbusBind::default(),
         }
     }
 }
@@ -769,9 +638,7 @@ fn edit_selected(
         .filter(|(i, _)| Some(*i) != state.selected)
         .map(|(_, c)| c.id.clone())
         .collect();
-    let mut draft = std::mem::take(&mut state.draft_map);
     let Some(c) = state.selected_mut() else {
-        state.draft_map = draft;
         return false;
     };
     section(ui, "STATUS", p);
@@ -919,49 +786,23 @@ fn edit_selected(
     if c.role == ModbusRole::Server {
         ui.add_space(space::SECTION);
         section(ui, "REGISTER MAP  ·  host point served at each address", p);
-        let mut remove = None;
-        for (i, b) in c.map.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = space::ITEM_X;
-                let point = if b.point.trim().is_empty() { "(no point)" } else { b.point.as_str() };
-                ui.label(
-                    RichText::new(format!("{}  ·  {point}", b.describe()))
-                        .font(font_ui(12.0))
-                        .color(p.text),
-                );
-                live_value_label(ui, host, &b.point, p);
-                if ui.small_button("×").clicked() {
-                    remove = Some(i);
-                }
-            });
-        }
-        if let Some(i) = remove {
-            c.map.remove(i);
+        let points: Vec<String> = host.points.iter().map(|pt| pt.name.clone()).collect();
+        let ctx = crate::register_map::MapCtx {
+            role: crate::register_map::MapRole::Server,
+            conn: "",
+            host,
+            points: &points,
+            p,
+        };
+        let id = c.id.clone();
+        if crate::register_map::register_map(ui, ("server_map", id), &mut c.map, &ctx) {
+            for e in c.map.iter_mut() {
+                e.unit = 0;
+                e.point = e.point.trim().to_string();
+            }
             dirty = true;
-        }
-        if c.map.is_empty() {
-            ui.label(
-                RichText::new("Empty — remote masters get an exception for every address.")
-                    .font(font_ui(11.0))
-                    .color(p.muted),
-            );
-        }
-        ui.add_space(space::AFTER_FIELD);
-        if bind_editor(ui, ("map", 0), &mut draft, false, true, p) {
-            let next = draft.address.saturating_add(draft.width());
-            let mut entry = draft.clone();
-            entry.unit = 0;
-            entry.point = entry.point.trim().to_string();
-            c.map.push(entry);
-            draft.address = next;
-            draft.point.clear();
-            dirty = true;
-        }
-        for msg in map_problems(&c.map) {
-            ui.label(RichText::new(format!("⚠ {msg}")).font(font_ui(11.0)).color(p.muted));
         }
     }
-    state.draft_map = draft;
     let Some(c) = state.selected_mut() else {
         return dirty;
     };

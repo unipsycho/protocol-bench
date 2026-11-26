@@ -10,8 +10,9 @@ use pb_abi::worker::{sanitize_id, sleep_stop, update_status};
 use pb_abi::{HostRef, Pack, PB_LOG_DEBUG, PB_LOG_ERROR, PB_LOG_INFO, PB_QUALITY_BAD, PB_QUALITY_GOOD};
 use serde::{Deserialize, Serialize};
 
+use crate::header::{auto_settled, head_lines, layout, lines_before, HeaderLayout, HeaderMode, SCAN_LINES};
 use crate::parse::{column_index, csv_columns, json_cell, json_leaves, json_path, split_csv_line, type_text, Cell};
-use crate::tail::{first_line, last_line, load_state, save_state, Tail, TailError};
+use crate::tail::{last_line, load_state, save_state, Tail, TailError};
 
 const PACK_ID: &[u8] = b"files\0";
 const PACK_TITLE: &[u8] = b"File follow\0";
@@ -39,8 +40,9 @@ struct SourceJson {
     /// `csv` | `jsonl`.
     #[serde(default = "default_parser")]
     parser: String,
-    #[serde(default = "yes")]
-    header_row: bool,
+    /// CSV header: `"auto"` (smart detection), `false` (none) or a 1-based names line.
+    #[serde(default)]
+    header_row: HeaderMode,
     #[serde(default = "default_delim")]
     delimiter: String,
     #[serde(default = "default_poll")]
@@ -120,6 +122,64 @@ struct Status {
     offset: u64,
     /// `(name, sample)` for the UI column picker: header names / JSON paths + the latest row.
     columns: Vec<(String, String)>,
+    /// CSV header layout summary for the UI (`3 preamble lines · names on line 4 · …`).
+    header: String,
+    /// Preamble lines above the header (first few, for the UI).
+    preamble: Vec<String>,
+}
+
+const PREAMBLE_SHOWN: usize = 24;
+
+fn header_status(s: &mut Status, l: &HeaderLayout, mode: HeaderMode, settled: bool) {
+    let tag = match mode {
+        HeaderMode::Auto if settled => "auto",
+        HeaderMode::Auto => "auto, waiting for data",
+        HeaderMode::None => "none",
+        HeaderMode::Line(_) => "fixed",
+    };
+    s.header = format!("{} ({tag})", l.describe());
+    s.preamble = l.preamble.iter().take(PREAMBLE_SHOWN).map(|p| p.chars().take(200).collect()).collect();
+}
+
+/// Header resolution for a CSV source while it is followed.
+struct HeaderTrack {
+    mode: HeaderMode,
+    delim: char,
+    /// Settled layout; `None` while Auto is still collecting evidence.
+    layout: Option<HeaderLayout>,
+    /// Index (non-blank lines from the top) of the next streamed line, when known.
+    line_no: Option<usize>,
+    /// Lines held back while the header is unsettled: `(line_no, text)`.
+    pending: Vec<(Option<usize>, String)>,
+}
+
+impl HeaderTrack {
+    fn names(&self) -> Option<&[String]> {
+        self.layout.as_ref().and_then(|l| l.names.as_deref())
+    }
+
+    /// Re-read the top of the file and try to settle. Returns the layout that was looked at.
+    fn resolve(&mut self, path: &std::path::Path, idle: bool) -> HeaderLayout {
+        let head = head_lines(path, SCAN_LINES);
+        let l = layout(&head, self.delim, self.mode);
+        let settled = match self.mode {
+            HeaderMode::Auto => auto_settled(&l, head.len(), idle),
+            HeaderMode::None => true,
+            HeaderMode::Line(n) => head.len() >= n as usize,
+        };
+        if settled {
+            self.layout = Some(l.clone());
+        }
+        l
+    }
+
+    /// Is this streamed line part of the preamble / header (never published)?
+    fn is_header_line(&self, line_no: Option<usize>) -> bool {
+        match (line_no, &self.layout) {
+            (Some(i), Some(l)) => i < l.data_start,
+            _ => false,
+        }
+    }
 }
 
 struct BindRt {
@@ -163,13 +223,18 @@ fn run_source(mut c: RunCtx) {
     let delim = c.src.delimiter.chars().next().unwrap_or(',');
     let saved = c.state_path.as_deref().and_then(load_state);
     let mut tail = Tail::start(&path, saved, c.src.start_at.eq_ignore_ascii_case("end"), c.src.follow_rotation);
-    let want_header = csv && c.src.header_row;
-    let mut header: Option<Vec<String>> = None;
-    let mut need_header = want_header;
-    if want_header && tail.state.offset > 0 {
-        // Resumed past the header: read it from the top of the file again.
-        header = first_line(&path).map(|l| split_csv_line(&l, delim));
-        need_header = header.is_none();
+    let mut hdr = HeaderTrack {
+        mode: if csv { c.src.header_row } else { HeaderMode::None },
+        delim,
+        layout: None,
+        line_no: if tail.state.offset == 0 { Some(0) } else { lines_before(&path, tail.state.offset) },
+        pending: Vec::new(),
+    };
+    if csv {
+        // Resumed / started mid-file: the header is read from the top of the file.
+        let l = hdr.resolve(&path, false);
+        let settled = hdr.layout.is_some();
+        update_status(&c.status, |s| header_status(s, &l, hdr.mode, settled));
     }
     let mut missing = false;
     let mut saved_offset = tail.state.offset;
@@ -184,23 +249,48 @@ fn run_source(mut c: RunCtx) {
                     c.host.log(PB_LOG_INFO, &format!("files {}: {} is back", c.src.id, path.display()));
                 }
                 if batch.reset {
-                    header = None;
-                    need_header = want_header;
+                    hdr.layout = None;
+                    hdr.line_no = Some(0);
+                    hdr.pending.clear();
                 }
                 let mut rows = 0u64;
                 let mut last_cols: Option<Vec<(String, String)>> = None;
-                for line in &batch.lines {
+                let mut lines: Vec<(Option<usize>, String)> = Vec::with_capacity(batch.lines.len());
+                for line in batch.lines {
+                    lines.push((hdr.line_no, line));
+                    hdr.line_no = hdr.line_no.map(|n| n + 1);
+                }
+                if csv && hdr.layout.is_none() {
+                    let idle = lines.is_empty();
+                    hdr.pending.append(&mut lines);
+                    let l = hdr.resolve(&path, idle);
+                    let settled = hdr.layout.is_some();
+                    update_status(&c.status, |s| {
+                        header_status(s, &l, hdr.mode, settled);
+                        if !settled && s.columns.is_empty() {
+                            if let Some(n) = l.names.as_deref() {
+                                s.columns = csv_columns(Some(n), &[]);
+                            }
+                        }
+                    });
+                    if settled {
+                        lines = std::mem::take(&mut hdr.pending);
+                        if let Some(n) = hdr.names() {
+                            last_cols = Some(csv_columns(Some(n), &[]));
+                        }
+                    }
+                }
+                for (line_no, line) in &lines {
                     if csv {
-                        let cols = split_csv_line(line, delim);
-                        if need_header {
-                            header = Some(cols);
-                            need_header = false;
+                        if hdr.is_header_line(*line_no) {
                             continue;
                         }
+                        let cols = split_csv_line(line, delim);
+                        let header = hdr.names();
                         rows += 1;
-                        last_cols = Some(csv_columns(header.as_deref(), &cols));
+                        last_cols = Some(csv_columns(header, &cols));
                         for b in &mut c.binds {
-                            match column_index(header.as_deref(), &b.column).and_then(|i| cols.get(i)) {
+                            match column_index(header, &b.column).and_then(|i| cols.get(i)) {
                                 Some(cell) => publish(&c.host, b, type_text(cell)),
                                 None if !b.warned_missing => {
                                     b.warned_missing = true;
@@ -253,8 +343,8 @@ fn run_source(mut c: RunCtx) {
                     saved_offset = tail.state.offset;
                 }
                 // A CSV header seen with no data row yet still gives the picker its names.
-                if last_cols.is_none() && !need_header && csv {
-                    if let Some(h) = header.as_deref() {
+                if last_cols.is_none() && csv {
+                    if let Some(h) = hdr.names() {
                         if c.status.lock().map(|s| s.columns.is_empty()).unwrap_or(false) {
                             last_cols = Some(csv_columns(Some(h), &[]));
                         }
@@ -314,20 +404,27 @@ fn run_preview(c: RunCtx) {
     let csv = !c.src.parser.eq_ignore_ascii_case("jsonl");
     let delim = c.src.delimiter.chars().next().unwrap_or(',');
     while !c.stop.load(Ordering::SeqCst) {
-        let header = (csv && c.src.header_row).then(|| first_line(&path).map(|l| split_csv_line(&l, delim))).flatten();
+        let head = if csv { head_lines(&path, SCAN_LINES) } else { Vec::new() };
+        let lay = layout(&head, delim, c.src.header_row);
+        let header = lay.names.as_deref();
         let last = last_line(&path);
         let columns = match (&last, csv) {
-            (Some(l), true) => {
-                // The "last line" can be the header itself in a one-line file.
-                let row = split_csv_line(l, delim);
-                if header.as_ref() == Some(&row) { csv_columns(header.as_deref(), &[]) } else { csv_columns(header.as_deref(), &row) }
-            }
+            // No data rows yet: the "last line" is part of the header / preamble.
+            (Some(_), true) if lay.data_rows == 0 => header.map(|h| csv_columns(Some(h), &[])).unwrap_or_default(),
+            (Some(l), true) => csv_columns(header, &split_csv_line(l, delim)),
             (Some(l), false) => serde_json::from_str::<serde_json::Value>(l).map(|v| json_leaves(&v, 60)).unwrap_or_default(),
-            (None, true) => header.as_deref().map(|h| csv_columns(Some(h), &[])).unwrap_or_default(),
+            (None, true) => header.map(|h| csv_columns(Some(h), &[])).unwrap_or_default(),
             (None, false) => Vec::new(),
         };
         let exists = path.exists();
+        let settled = match c.src.header_row {
+            HeaderMode::Auto => auto_settled(&lay, head.len(), true),
+            _ => true,
+        };
         update_status(&c.status, |s| {
+            if csv {
+                header_status(s, &lay, c.src.header_row, settled);
+            }
             s.columns = columns;
             s.connected = exists;
             s.state = if exists { "preview (no binds)".into() } else { "waiting for file".into() };
@@ -530,6 +627,7 @@ impl Pack for PackState {
                     "id": id, "path": path, "state": s.state, "connected": s.connected,
                     "error": s.error, "rows": s.rows, "bad_rows": s.bad_rows, "offset": s.offset,
                     "columns": s.columns.iter().map(|(n, v)| serde_json::json!({"name": n, "sample": v})).collect::<Vec<_>>(),
+                    "header": s.header, "preamble": s.preamble,
                 })
             })
             .collect();
@@ -782,6 +880,38 @@ mod tests {
         pk.configure_json(&baddelim).unwrap();
         assert!(pk.last_error().contains("delimiter"));
         pk.stop_all();
+    }
+
+    #[test]
+    fn auto_header_skips_preamble_and_units_and_names_columns() {
+        let d = dir("auto-hdr");
+        let (p, st) = (d.join("m.csv"), d.join("state"));
+        append(&p, "Pump test,rig 4\nOperator: Sam\nSerial,SN-77\n\nTime,Pressure,Temp\ns,kPa,degC\n0,101.3,20.1\n1,101.4,20.3\n");
+        let log = leak();
+        let mut pk = PackState::new(host(log));
+        pk.configure_json(&cfg(&p, &st, "csv", "beginning", serde_json::json!([
+            {"column":"Pressure","point":"file_1"},{"column":"temp","point":"file_2"}]))).unwrap();
+        wait(log, "both data rows", |l| l.iter().any(|r| r.cell == Cell::Float(101.4)));
+        let vals: Vec<Cell> = log.lock().unwrap().iter().filter(|r| r.name == "file_1").map(|r| r.cell.clone()).collect();
+        assert_eq!(vals, vec![Cell::Float(101.3), Cell::Float(101.4)], "preamble / header / units never published");
+        append(&p, "2,101.9,20.5\n");
+        wait(log, "appended", |l| l.iter().any(|r| r.cell == Cell::Float(20.5)));
+        let dj = pk.detail_json();
+        assert!(dj.contains("3 preamble lines · names on line 4 · +1 header line · 3 columns · data from line 6 (auto)"), "{dj}");
+        assert!(dj.contains("Operator: Sam"), "{dj}");
+        pk.stop_all();
+        // Fixed line mode: names on line 2, everything above is preamble.
+        let p2 = d.join("f.csv");
+        append(&p2, "junk line\nA,B\n1,2\n3,4\n");
+        let log2 = leak();
+        let mut c: serde_json::Value = serde_json::from_str(&cfg(&p2, &st, "csv", "beginning", serde_json::json!([{"column":"B","point":"file_1"}]))).unwrap();
+        c["sources"][0]["header_row"] = 2.into();
+        let mut pk2 = PackState::new(host(log2));
+        pk2.configure_json(&c.to_string()).unwrap();
+        wait(log2, "fixed", |l| l.iter().any(|r| r.cell == Cell::Int(4)));
+        let vals: Vec<Cell> = log2.lock().unwrap().iter().map(|r| r.cell.clone()).collect();
+        assert_eq!(vals, vec![Cell::Int(2), Cell::Int(4)]);
+        pk2.stop_all();
     }
 
     #[test]

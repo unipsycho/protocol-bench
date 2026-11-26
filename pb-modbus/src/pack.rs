@@ -87,6 +87,15 @@ struct BindJson {
     point: String,
     #[serde(default)]
     source: String,
+    /// Engineering scaling: `value = raw × scale + offset` (identity when absent).
+    #[serde(default = "default_scale")]
+    scale: f64,
+    #[serde(default)]
+    offset: f64,
+}
+
+fn default_scale() -> f64 {
+    1.0
 }
 
 fn default_order() -> String {
@@ -145,6 +154,7 @@ struct Bind {
     order: ByteOrder,
     name: String,
     source: String,
+    scaling: codec::Scaling,
     last: Option<Value>,
 }
 
@@ -182,6 +192,7 @@ fn build_bind(b: &BindJson, default_unit: u8, conn: &str) -> Result<Bind, String
         order,
         name,
         source,
+        scaling: codec::Scaling::new(b.scale, b.offset),
         last: None,
     })
 }
@@ -392,6 +403,7 @@ fn poll_group(
                     };
                     match decoded {
                         Some(Ok(v)) => {
+                            let v = b.scaling.apply(v);
                             host.put(&b.name, &b.source, &v, PB_QUALITY_GOOD);
                             b.last = Some(v);
                         }
@@ -432,7 +444,8 @@ fn poll_group(
 
 fn exec_write(session: &mut Session, conn: &ConnJson, cmd: &WriteCmd) -> Result<(), ModbusError> {
     let b = &cmd.bind;
-    let value = codec::parse_point_value(b.dt, &cmd.raw).map_err(|e| ModbusError::Protocol(e.to_string()))?;
+    let raw = b.scaling.unapply_text(b.dt, &cmd.raw).map_err(|e| ModbusError::Protocol(e.to_string()))?;
+    let value = codec::parse_point_value(b.dt, &raw).map_err(|e| ModbusError::Protocol(e.to_string()))?;
     let unit = b.unit;
     match (b.area, b.dt) {
         (Area::Coil, _) => {
@@ -486,7 +499,8 @@ fn map_overlap(entries: &[Bind]) -> Option<String> {
 
 /// Host point value → register image.
 fn push_to_bank(bank: &mut RegisterBank, b: &Bind, raw: &str) -> Result<(), String> {
-    let value = codec::parse_point_value(b.dt, raw).map_err(|e| e.to_string())?;
+    let raw = b.scaling.unapply_text(b.dt, raw).map_err(|e| e.to_string())?;
+    let value = codec::parse_point_value(b.dt, &raw).map_err(|e| e.to_string())?;
     match (b.area, b.dt) {
         (Area::Coil, _) | (Area::Discrete, _) => {
             let on = codec::encode_bit(&value).map_err(|e| e.to_string())?;
@@ -515,7 +529,8 @@ fn publish_entry(host: &HostRef, bank: &RegisterBank, b: &Bind) {
         bank.bits(b.area, b.address, 1).map(|v| Value::Bool(v[0]))
     } else {
         bank.regs(b.area, b.address, b.width()).and_then(|w| codec::decode(b.dt, b.order, &w).ok())
-    };
+    }
+    .map(|v| b.scaling.apply(v));
     if let Some(v) = value {
         // Empty source: keep whatever address the point store already has for this point.
         host.put(&b.name, "", &v, PB_QUALITY_GOOD);
@@ -985,7 +1000,7 @@ mod tests {
                 .all(|n| l.iter().any(|r| r.name == *n && r.quality == PB_QUALITY_GOOD))
         });
         let last = |n: &str| log.lock().unwrap().iter().rev().find(|r| r.name == n).unwrap().value.clone();
-        assert_eq!(last("modbus_1"), Value::Float(123.456f32 as f64));
+        assert_eq!(last("modbus_1"), Value::Float(123.456));
         assert_eq!(last("modbus_2"), Value::Int(100_000));
         assert_eq!(last("modbus_3"), Value::Bool(true));
         assert_eq!(last("modbus_4"), Value::Text("Hi!".into()));
@@ -1002,7 +1017,7 @@ mod tests {
             let b = bank.lock().unwrap();
             if b.coils[&3] && b.holding[&12] == 0b10 {
                 let w = b.regs(Area::Holding, 10, 2).unwrap();
-                assert_eq!(codec::decode(DataType::F32, ByteOrder::Cdab, &w).unwrap(), Value::Float(98.6f32 as f64));
+                assert_eq!(codec::decode(DataType::F32, ByteOrder::Cdab, &w).unwrap(), Value::Float(98.6));
                 break;
             }
             drop(b);
@@ -1012,6 +1027,32 @@ mod tests {
         // Device-side change flows through on the next poll.
         bank.lock().unwrap().set_regs(Area::Holding, 2, &[0, 7]);
         wait_for(log, "u32 update", |l| l.iter().any(|r| r.name == "modbus_2" && r.value == Value::Int(7)));
+    }
+
+    #[test]
+    fn scaled_binds_read_engineering_and_write_raw_counts() {
+        let bank = device();
+        bank.lock().unwrap().set_regs(Area::Holding, 7, &[1234]);
+        let addr = server::spawn_tcp_for_tests(bank.clone(), 1);
+        let log = leak_log();
+        let mut st = PackState::new(host(log));
+        let cfg = serde_json::json!({
+            "connections": [{"id":"plc","role":"client","transport":"tcp","host":"127.0.0.1","port":addr.port(),
+                             "timeout_ms":200,"unit_id":1,"retries":1}],
+            "inputs": [{"connection":"plc","interval_secs":0.05,"binds":[
+                {"area":"holding","address":7,"dtype":"u16","point":"psi","scale":0.1,"offset":0.0}]}],
+            "outputs": [{"connection":"plc","binds":[
+                {"area":"holding","address":8,"dtype":"i16","point":"temp_sp","scale":0.1,"offset":-40.0}]}]
+        });
+        st.configure_json(&cfg.to_string()).unwrap();
+        wait_for(log, "scaled read", |l| l.iter().any(|r| r.name == "psi" && r.value == Value::Float(123.4)));
+        // 21.5 °C with offset -40, scale 0.1 → raw 615.
+        st.write_point("temp_sp", "21.5");
+        let end = Instant::now() + Duration::from_secs(5);
+        while bank.lock().unwrap().holding.get(&8).copied() != Some(615) {
+            assert!(Instant::now() < end, "scaled write never landed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -1117,7 +1158,7 @@ mod tests {
         st.write_point("level", "-70000");
         st.write_point("door", "1");
         let w = m.read_regs(1, Area::Holding, 0, 2).unwrap();
-        assert_eq!(codec::decode(DataType::F32, ByteOrder::Cdab, &w).unwrap(), Value::Float(123.456f32 as f64));
+        assert_eq!(codec::decode(DataType::F32, ByteOrder::Cdab, &w).unwrap(), Value::Float(123.456));
         assert_eq!(m.read_regs(1, Area::Holding, 2, 1).unwrap(), vec![42]);
         assert_eq!(m.read_regs(1, Area::Holding, 3, 1).unwrap(), vec![0b100]);
         let t = m.read_regs(1, Area::Holding, 4, 3).unwrap();

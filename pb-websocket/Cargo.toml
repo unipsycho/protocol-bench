@@ -1,0 +1,19 @@
+[package]
+name = "pb-websocket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "pb_websocket"
+
+[dependencies]
+pb-abi = { workspace = true }
+pb-extkit = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+pb-json = { workspace = true }
+tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }

@@ -69,6 +69,7 @@ pub struct ProtocolBenchApp {
     snmp: SnmpPanelState,
     modbus: ModbusPanelState,
     files: FilesPanelState,
+    ext: crate::ext_proto::ExtPanels,
     points: PointsPanelState,
     traffic: TrafficPanelState,
     /// Project-level options (Project panel / project.json).
@@ -88,6 +89,7 @@ pub struct ProtocolBenchApp {
     snmp_saved: SnmpProject,
     modbus_saved: ModbusProject,
     files_saved: FilesProject,
+    ext_saved: crate::ext_proto::ExtSections,
     /// Last hubs snapshot written to the project file.
     hubs_saved: crate::hubs::HubModel,
     /// Last dock layout written to project.json (PB-95).
@@ -109,6 +111,9 @@ pub struct ProtocolBenchApp {
     last_live_poll: Instant,
     /// Last IPC status probe (chip + bottom report).
     last_service_poll: Instant,
+    /// Per-hub start/stop timers for the banner status strip.
+    clock_mqtt: crate::hub_status::HubClock,
+    clock_opcua: crate::hub_status::HubClock,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -148,7 +153,10 @@ enum MenuAction {
     Quit,
     About,
     Settings,
+    HelpTopics,
     Toggle(DockPane),
+    /// Close a popped-out protocol tile back into the Protocols pane.
+    DockBack(DockPane),
     ShowAll,
     Theme(AppTheme),
     Close,
@@ -159,6 +167,27 @@ struct Anchor {
     clicked: bool,
 }
 
+/// Project to show at launch. A service running live hubs keeps its project (re-opening would
+/// stop them). Otherwise the last project used in the UI wins, so a restarted service (which
+/// loads the default project) does not replace it. With no history, follow the service.
+fn startup_project(
+    last_used: Option<&std::path::Path>,
+    service_path: &str,
+    live_hubs: bool,
+    default: &std::path::Path,
+) -> PathBuf {
+    let service = (!service_path.is_empty()).then(|| PathBuf::from(service_path));
+    if live_hubs {
+        if let Some(path) = service {
+            return path;
+        }
+    }
+    last_used
+        .map(|p| p.to_path_buf())
+        .or(service)
+        .unwrap_or_else(|| default.to_path_buf())
+}
+
 impl ProtocolBenchApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
@@ -166,9 +195,12 @@ impl ProtocolBenchApp {
         let ui_state = persist::load();
         let theme = persist::theme_from_state(&ui_state);
         theme::apply_theme(&cc.egui_ctx, theme);
-        let mut project_path = project::default_project_path().unwrap_or_else(|| {
+        let default_path = project::default_project_path().unwrap_or_else(|| {
             PathBuf::from("protocol-bench-project.json")
         });
+        // Reopen the project used last (newest recent entry that still exists).
+        let last_used = persist::existing_recent_projects(&ui_state).into_iter().next();
+        let mut project_path = last_used.clone().unwrap_or_else(|| default_path.clone());
         let mut mqtt = MqttPanelState::default();
         let mut opcua = OpcUaPanelState::default();
         let mut http = HttpPanelState::default();
@@ -177,6 +209,7 @@ impl ProtocolBenchApp {
         let mut snmp = SnmpPanelState::default();
         let mut modbus = ModbusPanelState::default();
         let mut files = FilesPanelState::default();
+        let mut ext = crate::ext_proto::ExtPanels::default();
         let mut mqtt_saved = MqttProject::default();
         let mut http_saved = HttpProject::default();
         let mut streams_saved = StreamsProject::default();
@@ -184,6 +217,7 @@ impl ProtocolBenchApp {
         let mut snmp_saved = SnmpProject::default();
         let mut modbus_saved = ModbusProject::default();
         let mut files_saved = FilesProject::default();
+        let mut ext_saved = crate::ext_proto::ExtSections::default();
         let mut project_settings = ProjectSettings::default();
         // Quiet offline: chip shows disconnected; left status stays calm (PB-101).
         let mut status = "Ready".into();
@@ -210,10 +244,9 @@ impl ProtocolBenchApp {
             let probe = engine.status().ok();
             let mut attached = false;
             if let Some(st) = probe.as_ref() {
-                if !st.project_path.is_empty() {
-                    project_path = PathBuf::from(&st.project_path);
-                }
                 attached = !st.running_hubs().is_empty();
+                project_path =
+                    startup_project(last_used.as_deref(), &st.project_path, attached, &default_path);
             }
             if !attached {
                 let open_path = project_path.display().to_string();
@@ -230,6 +263,7 @@ impl ProtocolBenchApp {
                         file.snmp.apply_to_panel(&mut snmp);
                         file.modbus.apply_to_panel(&mut modbus);
                         file.files.apply_to_panel(&mut files);
+                        file.ext.apply_to_panels(&mut ext);
                         project_settings = file.settings.clone();
                         // PB-58: legacy project auto-run → app setting (ui.toml).
                         if file.settings.auto_run_embedded_broker && !ui_state.auto_run_embedded_hubs
@@ -261,6 +295,7 @@ impl ProtocolBenchApp {
                         snmp_saved = SnmpProject::from_panel(&snmp);
                         modbus_saved = ModbusProject::from_panel(&modbus);
                         files_saved = FilesProject::from_panel(&files);
+                        ext_saved = crate::ext_proto::ExtSections::from_panels(&ext);
                         // Repair orphan hub mqtt_connection ids before materializing points.
                         if mqtt_panel::apply_mqtt_session(&engine, &mut mqtt, &mut ui_state.hubs) {
                             seed_layout = true;
@@ -286,6 +321,17 @@ impl ProtocolBenchApp {
             if let Ok(st) = engine.status() {
                 service_report = Self::format_service_report(&st);
                 status = format!("Service · {service_report}");
+            }
+        }
+        // `PB_UI_SELECT=<hub>[:<node>]` opens that hub / node in the inspector at start
+        // (screenshots, demo kiosks). Like `PB_OPEN_SETTINGS`, a start-up convenience only.
+        if let Ok(sel) = std::env::var("PB_UI_SELECT") {
+            let mut it = sel.split(':').map(|x| x.trim().parse::<u64>().ok());
+            if let Some(Some(hub)) = it.next() {
+                let node = it.next().flatten();
+                ui_state.hubs.selected = Some(hub);
+                ui_state.hubs.selected_port = node;
+                ui_state.hubs.selection = vec![(hub, node)];
             }
         }
         let hubs_saved = ui_state.hubs.clone();
@@ -317,6 +363,7 @@ impl ProtocolBenchApp {
             snmp,
             modbus,
             files,
+            ext,
             points: PointsPanelState::default(),
             traffic: TrafficPanelState::default(),
             project_settings,
@@ -329,6 +376,7 @@ impl ProtocolBenchApp {
             snmp_saved,
             modbus_saved,
             files_saved,
+            ext_saved,
             hubs_saved,
             layout_saved,
             last_project_save: Instant::now(),
@@ -340,6 +388,8 @@ impl ProtocolBenchApp {
             live_host,
             live_points_fp,
             last_live_poll: Instant::now(),
+            clock_mqtt: Default::default(),
+            clock_opcua: Default::default(),
             last_service_poll: Instant::now()
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
@@ -445,6 +495,7 @@ impl ProtocolBenchApp {
         let snmp_dirty = SnmpProject::from_panel(&self.snmp) != self.snmp_saved;
         let modbus_dirty = ModbusProject::from_panel(&self.modbus) != self.modbus_saved;
         let files_dirty = FilesProject::from_panel(&self.files) != self.files_saved;
+        let ext_dirty = crate::ext_proto::ExtSections::from_panels(&self.ext) != self.ext_saved;
         let hubs_dirty = self.ui_state.hubs != self.hubs_saved;
         let settings_dirty = self.project_settings != self.settings_saved;
         let layout_dirty = DockLayout::from_ui(&self.ui_state) != self.layout_saved;
@@ -456,6 +507,7 @@ impl ProtocolBenchApp {
             || snmp_dirty
             || modbus_dirty
             || files_dirty
+            || ext_dirty
             || hubs_dirty
             || settings_dirty
             || layout_dirty)
@@ -519,6 +571,7 @@ impl ProtocolBenchApp {
         let snmp = SnmpProject::from_panel(&self.snmp);
         let modbus = ModbusProject::from_panel(&self.modbus);
         let files = FilesProject::from_panel(&self.files);
+        let ext = crate::ext_proto::ExtSections::from_panels(&self.ext);
         let file = ProjectFile {
             version: project::PROJECT_VERSION,
             points,
@@ -531,6 +584,7 @@ impl ProtocolBenchApp {
             snmp: snmp.clone(),
             modbus: modbus.clone(),
             files: files.clone(),
+            ext: ext.clone(),
             hubs: Some(self.ui_state.hubs.clone()),
             settings: self.project_settings.clone(),
             layout: Some(layout.clone()),
@@ -550,6 +604,7 @@ impl ProtocolBenchApp {
         self.snmp_saved = snmp;
         self.modbus_saved = modbus;
         self.files_saved = files;
+        self.ext_saved = ext;
         self.hubs_saved = self.ui_state.hubs.clone();
         self.settings_saved = self.project_settings.clone();
         self.layout_saved = layout;
@@ -676,6 +731,7 @@ impl ProtocolBenchApp {
         file.snmp.apply_to_panel(&mut self.snmp);
         file.modbus.apply_to_panel(&mut self.modbus);
         file.files.apply_to_panel(&mut self.files);
+        file.ext.apply_to_panels(&mut self.ext);
         self.project_settings = file.settings.clone();
         if file.settings.auto_run_embedded_broker && !self.ui_state.auto_run_embedded_hubs {
             self.ui_state.auto_run_embedded_hubs = true;
@@ -699,6 +755,7 @@ impl ProtocolBenchApp {
         self.snmp_saved = SnmpProject::from_panel(&self.snmp);
         self.modbus_saved = ModbusProject::from_panel(&self.modbus);
         self.files_saved = FilesProject::from_panel(&self.files);
+        self.ext_saved = crate::ext_proto::ExtSections::from_panels(&self.ext);
         self.hubs_saved = self.ui_state.hubs.clone();
         self.settings_saved = self.project_settings.clone();
         self.layout_saved = DockLayout::from_ui(&self.ui_state);
@@ -870,6 +927,18 @@ impl ProtocolBenchApp {
             MenuAction::Quit => self.request_quit(ctx),
             MenuAction::About => self.about_open = true,
             MenuAction::Settings => self.settings_open = true,
+            MenuAction::HelpTopics => {
+                if !self.ui_state.pane_visible(DockPane::Help) {
+                    self.ui_state.toggle_pane_visible(DockPane::Help);
+                    self.mark_dirty();
+                }
+                self.status = "Showing Help".into();
+            }
+            MenuAction::DockBack(pane) => {
+                self.ui_state.dock_back_protocol(pane);
+                self.status = format!("{} docked back into Protocols", pane.title());
+                self.mark_dirty();
+            }
             MenuAction::Toggle(pane) => {
                 if !self.ui_state.toggle_pane_visible(pane) {
                     self.status = "At least one panel stays open".into();
@@ -1048,6 +1117,23 @@ impl ProtocolBenchApp {
         let mut view = None;
         let mut help = None;
         let mut theme_anchor = None;
+        let mut strip_action = None;
+        // Hubs the service runs on its own (auto-run, headless start) must show as running even
+        // when their panels are not open.
+        let host = self.engine.snapshot();
+        crate::mqtt_panel::sync_broker_running_from_host(&host, &mut self.mqtt);
+        self.opcua.sync_from_host(&host);
+        self.clock_mqtt.observe(self.mqtt.broker_running);
+        self.clock_opcua.observe(self.opcua.server_running);
+        let hub_kinds = crate::hub_status::kinds(&self.mqtt, &self.opcua, &self.ui_state.hubs);
+        let project_name = if self.project_settings.name.trim().is_empty() {
+            self.project_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            self.project_settings.name.trim().to_owned()
+        };
         egui::TopBottomPanel::top("app_bar")
             .exact_height(BAR_H)
             .frame(
@@ -1112,6 +1198,17 @@ impl ProtocolBenchApp {
                             rect: theme_resp.rect,
                             clicked: theme_resp.clicked(),
                         });
+                        ui.add_space(6.0);
+                        strip_action = crate::hub_status::banner_strip(
+                            ui,
+                            &crate::hub_status::StripInput {
+                                kinds: &hub_kinds,
+                                clocks: [&self.clock_mqtt, &self.clock_opcua],
+                                points: self.live_host.point_count,
+                                project: &project_name,
+                            },
+                            p,
+                        );
                     });
                 });
                 let clip = ui.clip_rect();
@@ -1124,6 +1221,9 @@ impl ProtocolBenchApp {
                 );
             });
 
+        if strip_action == Some(crate::hub_status::StripAction::ToggleAll) {
+            self.toggle_all_hubs();
+        }
         let mut action = None;
         if let Some(anchor) = file {
             self.file_menu(ctx, &anchor, p, &mut action);
@@ -1140,6 +1240,25 @@ impl ProtocolBenchApp {
         if let Some(action) = action {
             self.apply_menu(ctx, action);
         }
+    }
+
+    /// Banner Start/Stop-all: stop whatever is live, or start every hub the project has.
+    fn toggle_all_hubs(&mut self) {
+        let kinds = crate::hub_status::kinds(&self.mqtt, &self.opcua, &self.ui_state.hubs);
+        let any_up = kinds.iter().any(|k| k.running);
+        for k in &kinds {
+            if any_up && !k.running {
+                continue;
+            }
+            let run = !any_up;
+            match k.label {
+                "MQTT" => {
+                    mqtt_panel::set_hub_running(&self.engine, &mut self.mqtt, &mut self.ui_state.hubs, run);
+                }
+                _ => opcua_panel::set_hub_running(&self.engine, &mut self.opcua, run),
+            }
+        }
+        self.dirty = true;
     }
 
     fn menu_button(
@@ -1224,10 +1343,20 @@ impl ProtocolBenchApp {
             .copied()
             .map(|pane| (pane, self.ui_state.pane_visible(pane)))
             .collect();
+        let popped = self.ui_state.popped_protocols();
         self.popup(ctx, anchor, BarMenu::View, p, action, |ui, action| {
             for (pane, on) in visible {
                 if menu_row(ui, pane.title(), Some(on), p).clicked() {
                     *action = Some(MenuAction::Toggle(pane));
+                }
+            }
+            if !popped.is_empty() {
+                menu_sep(ui, p);
+                for pane in popped {
+                    let label = format!("{}  (dock back)", pane.title());
+                    if menu_row(ui, &label, Some(true), p).clicked() {
+                        *action = Some(MenuAction::DockBack(pane));
+                    }
                 }
             }
             menu_sep(ui, p);
@@ -1248,6 +1377,9 @@ impl ProtocolBenchApp {
         action: &mut Option<MenuAction>,
     ) {
         self.popup(ctx, anchor, BarMenu::Help, p, action, |ui, action| {
+            if menu_row(ui, "Help topics", None, p).clicked() {
+                *action = Some(MenuAction::HelpTopics);
+            }
             if menu_row(ui, "About Protocol Bench", None, p).clicked() {
                 *action = Some(MenuAction::About);
             }
@@ -1391,18 +1523,8 @@ impl ProtocolBenchApp {
                 ui.with_layout(Layout::top_down(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.y = 6.0;
                     rail_caption(ui, "BENCH", p);
-                    for pane in DockPane::ALL
-                        .into_iter()
-                        .filter(|pane| pane.engine().is_none())
-                    {
-                        self.rail_toggle(ui, pane, p);
-                    }
-                    ui.add_space(6.0);
-                    rail_caption(ui, "LINKS", p);
-                    for pane in DockPane::ALL
-                        .into_iter()
-                        .filter(|pane| pane.engine().is_some())
-                    {
+                    // Protocol panes live inside Protocols; only bench views get a rail button.
+                    for pane in DockPane::ALL {
                         self.rail_toggle(ui, pane, p);
                     }
                 });
@@ -1632,6 +1754,11 @@ impl ProtocolBenchApp {
                         ("LAS", DockPane::Las),
                         ("SNMP", DockPane::Snmp),
                         ("File follow", DockPane::Files),
+                        ("WITS", DockPane::Wits),
+                        ("WebSocket", DockPane::WebSocket),
+                        ("Sparkplug B", DockPane::Sparkplug),
+                        ("DNP3", DockPane::Dnp3),
+                        ("CAN", DockPane::Can),
                         ("Points", DockPane::Points),
                     ] {
                         about_chip(ui, label, pane.ink_core(), p);
@@ -1640,7 +1767,7 @@ impl ProtocolBenchApp {
                 ui.add_space(14.0);
                 ui.label(
                     egui::RichText::new(
-                        "Protocol I/O will run in the always-on service. This build does not open a link.",
+                        "Protocol I/O runs in the always-on service; each protocol is a pack it loads.",
                     )
                     .font(font_ui(12.0))
                     .color(p.muted),
@@ -1817,7 +1944,7 @@ impl ProtocolBenchApp {
                 Vec2::new(3.0, 16.0),
             );
             painter.rect_filled(cap, Rounding::same(1.5), ink);
-            let max_w = 44.0;
+            let max_w = if active.is_protocol() { 76.0 } else { 44.0 };
             let drag_w = (header.width() - max_w).max(48.0);
             let drag_rect = Rect::from_min_size(header.min, Vec2::new(drag_w, header.height()));
             {
@@ -1835,7 +1962,7 @@ impl ProtocolBenchApp {
                 title_painter.text(
                     Pos2::new(header.min.x + 60.0, header.center().y),
                     Align2::LEFT_CENTER,
-                    active.title(),
+                    self.ui_state.pane_label(active),
                     font_semi(15.0),
                     p.text,
                 );
@@ -1870,9 +1997,11 @@ impl ProtocolBenchApp {
         }
 
         let mut toggle_max = false;
+        let mut dock_back = false;
         // Header-right only. A layout on the pane ui would drop the button into the body.
+        let zone_w = if active.is_protocol() { 70.0 } else { 38.0 };
         let btn_zone = Rect::from_min_max(
-            Pos2::new(header.max.x - 38.0, header.min.y),
+            Pos2::new(header.max.x - zone_w, header.min.y),
             Pos2::new(header.max.x - 6.0, header.max.y),
         );
         let mut btn_ui = child.new_child(
@@ -1890,9 +2019,23 @@ impl ProtocolBenchApp {
         if art::chrome_button(&mut btn_ui, icon, tip, maximized, p, 26.0).clicked() {
             toggle_max = true;
         }
+        // A popped-out protocol closes back into the Protocols pane.
+        if active.is_protocol()
+            && art::chrome_button(&mut btn_ui, ChromeIcon::Close, "Dock back into Protocols", false, p, 26.0)
+                .clicked()
+        {
+            dock_back = true;
+        }
         if toggle_max {
             self.ui_state.maximized = if maximized { None } else { Some(active) };
             self.mark_dirty();
+        }
+        if dock_back {
+            self.ui_state.dock_back_protocol(active);
+            self.status = format!("{} docked back into Protocols", active.title());
+            self.mark_dirty();
+            self.pane_hits.push(PaneHit::area(active, group.tabs.clone(), rect));
+            return;
         }
 
         let body = Rect::from_min_max(
@@ -1906,6 +2049,10 @@ impl ProtocolBenchApp {
                     .layout(Layout::top_down(egui::Align::Min)),
             );
             body_ui.set_clip_rect(body.expand(2.0).intersect(clip));
+            let mut protocols = panels::ProtocolsView {
+                selected: self.ui_state.protocols_selected,
+                popped: self.ui_state.popped_protocols(),
+            };
             let hub_change = panels::paint(
                 &mut body_ui,
                 active,
@@ -1921,11 +2068,24 @@ impl ProtocolBenchApp {
                 &mut self.snmp,
                 &mut self.modbus,
                 &mut self.files,
+                &mut self.ext,
                 &mut self.points,
                 &mut self.traffic,
                 &mut self.project_settings,
                 &self.project_path,
+                &mut protocols,
             );
+            if protocols.selected != self.ui_state.protocols_selected {
+                self.ui_state.protocols_selected = protocols.selected;
+            }
+            if hub_change.ui_dirty {
+                self.mark_dirty();
+            }
+            if let Some(pane) = hub_change.pop_out {
+                self.ui_state.pop_out_protocol(pane);
+                self.status = format!("{} opened in its own panel", pane.title());
+                self.mark_dirty();
+            }
             if hub_change.dirty {
                 self.mark_dirty();
                 // Allocate / refresh point ids for new Input binds, then push to service.
@@ -1944,11 +2104,7 @@ impl ProtocolBenchApp {
             }
             // Auto-run toggle lives in Settings (ui.toml), not Project panel.
             if let Some(pane) = hub_change.open {
-                self.ui_state.reveal_pane(pane);
-                self.ui_state.tree.set_active(pane);
-                if self.ui_state.maximized.is_some() {
-                    self.ui_state.maximized = Some(pane);
-                }
+                self.ui_state.open_pane(pane);
                 self.status = format!("Opened {}", pane.title());
                 self.mark_dirty();
             }
@@ -1958,7 +2114,10 @@ impl ProtocolBenchApp {
     }
 
     fn handle_drop(&mut self, ctx: &egui::Context, p: &ThemePalette) {
-        let dragging = egui::DragAndDrop::payload::<DockPane>(ctx).map(|pane| *pane);
+        let group_drag = egui::DragAndDrop::payload::<dnd::GroupDrag>(ctx).map(|g| g.0);
+        let dragging = egui::DragAndDrop::payload::<DockPane>(ctx)
+            .map(|pane| *pane)
+            .or(group_drag);
         let released = ctx.input(|i| i.pointer.any_released());
         if dragging.is_none() {
             if released {
@@ -1984,7 +2143,16 @@ impl ProtocolBenchApp {
             data.get_temp::<Vec2>(Id::new("pb_drag_src_size"))
                 .unwrap_or(Vec2::new(280.0, 180.0))
         });
-        dnd::paint_ghost(ctx, pane, pos, src, p);
+        let group_tabs: Option<Vec<DockPane>> = group_drag.map(|member| {
+            self.ui_state
+                .tree
+                .group_of(member)
+                .map_or_else(|| vec![member], |g| g.tabs.clone())
+        });
+        let what = match &group_tabs {
+            Some(tabs) if tabs.len() > 1 => format!("{} tabs", tabs.len()),
+            _ => pane.title().to_string(),
+        };
 
         let Some(hit) = self
             .pane_hits
@@ -1998,19 +2166,32 @@ impl ProtocolBenchApp {
             })
             .cloned()
         else {
+            match &group_tabs {
+                Some(tabs) => dnd::paint_group_ghost(ctx, tabs, pane, pos, src, p),
+                None => dnd::paint_ghost(ctx, pane, pos, src, p),
+            }
             self.pending = None;
-            self.status = format!("Dragging {} — release to cancel", pane.title());
+            self.status = format!("Dragging {what} — release to cancel");
             return;
         };
 
-        let landing = dnd::landing_at(pane, &hit, pos);
+        let landing = if group_tabs.is_some() {
+            dnd::landing_for_group(pane, &hit, pos)
+        } else {
+            dnd::landing_at(pane, &hit, pos)
+        };
         dnd::paint_landing(ctx, hit.rect, &landing, p);
+        match (&group_tabs, landing.kind) {
+            (Some(tabs), _) => dnd::paint_group_ghost(ctx, tabs, pane, pos, src, p),
+            (None, dnd::LandingKind::Insert) => dnd::paint_tab_ghost(ctx, pane, pos, p),
+            (None, _) => dnd::paint_ghost(ctx, pane, pos, src, p),
+        }
         if let Some(commit) = landing.commit {
-            self.status = format!("Dragging {} — {}", pane.title(), landing.label);
+            self.status = format!("Dragging {what} — {}", landing.label);
             self.pending = Some(commit);
         } else {
             self.pending = None;
-            self.status = format!("Dragging {}", pane.title());
+            self.status = format!("Dragging {what}");
         }
         if released {
             if let Some(commit) = self.pending.take() {
@@ -2021,6 +2202,43 @@ impl ProtocolBenchApp {
 
     fn apply_commit(&mut self, ctx: &egui::Context, commit: DropCommit) {
         let _ = egui::DragAndDrop::take_payload::<DockPane>(ctx);
+        let _ = egui::DragAndDrop::take_payload::<dnd::GroupDrag>(ctx);
+        let tree = &mut self.ui_state.tree;
+        let done = match commit {
+            DropCommit::Reorder { pane, index } => {
+                tree.reorder_tab(pane, index).then(|| format!("Moved {} tab", pane.title()))
+            }
+            DropCommit::TabAt { moving, target, index } => tree
+                .tab_onto_at(moving, target, index)
+                .then(|| format!("Tabbed {} beside {}", moving.title(), target.title())),
+            DropCommit::GroupDock { member, target, edge } => tree
+                .dock_group(member, target, edge)
+                .then(|| format!("Docked group {} {}", edge.phrase(), target.title())),
+            DropCommit::GroupMerge { member, target, index } => tree
+                .merge_group(member, target, index)
+                .then(|| format!("Merged tabs into {}", target.title())),
+            DropCommit::GroupSwap { member, target } => tree
+                .swap_groups(member, target)
+                .then(|| format!("Swapped groups with {}", target.title())),
+            _ => None,
+        };
+        if matches!(
+            commit,
+            DropCommit::Reorder { .. }
+                | DropCommit::TabAt { .. }
+                | DropCommit::GroupDock { .. }
+                | DropCommit::GroupMerge { .. }
+                | DropCommit::GroupSwap { .. }
+        ) {
+            match done {
+                Some(msg) => {
+                    self.status = msg;
+                    self.mark_dirty();
+                }
+                None => self.status = "Move blocked".into(),
+            }
+            return;
+        }
         match commit {
             DropCommit::Swap { a, b } => {
                 self.ui_state.tree.swap_panes(a, b);
@@ -2052,6 +2270,8 @@ impl ProtocolBenchApp {
                     self.status = "Dock blocked".into();
                 }
             }
+            // Handled above.
+            _ => {}
         }
     }
 }
@@ -2066,28 +2286,64 @@ fn paint_tab_strip(
     p: &ThemePalette,
 ) -> bool {
     let count = group.tabs.len();
-    let right = header.max.x - 44.0;
-    let left = header.min.x + 8.0;
-    let gap = 4.0;
-    let avail = (right - left - gap * (count.saturating_sub(1) as f32)).max(1.0);
-    let width = (avail / count as f32).clamp(1.0, 156.0);
     let active = group.active.min(count - 1);
+    let chips = dnd::tab_chip_rects(header, count);
+    let width = chips.first().map_or(0.0, |c| c.width());
     let mut changed = false;
-    let mut x = left;
+
+    // Whole-group handle: the grip at the left plus any free strip space right of the last tab.
+    let grip = Rect::from_min_max(
+        header.min + Vec2::new(4.0, 7.0),
+        Pos2::new(header.min.x + dnd::GROUP_GRIP_W - 2.0, header.max.y - 5.0),
+    );
+    let last_x = chips.last().map_or(header.min.x, |c| c.max.x);
+    let free = Rect::from_min_max(
+        Pos2::new(last_x + 4.0, header.min.y + 4.0),
+        Pos2::new(header.max.x - 44.0, header.max.y - 2.0),
+    );
+    let group_key = ("pb_group_drag", group.tabs[0]);
+    let group_dragging = egui::DragAndDrop::payload::<dnd::GroupDrag>(ui.ctx())
+        .is_some_and(|g| group.contains(g.0));
+    for (zone_i, zone) in [grip, free].into_iter().enumerate() {
+        if zone.width() < 6.0 {
+            continue;
+        }
+        let resp = ui
+            .interact(zone, Id::new((group_key, zone_i)), Sense::drag())
+            .on_hover_text("Drag to move this whole group — all its tabs go together")
+            .on_hover_cursor(CursorIcon::Grab);
+        if zone_i == 0 {
+            let hot = resp.hovered() || resp.dragged() || group_dragging;
+            if hot {
+                ui.painter().rect_filled(zone, Rounding::same(4.0), tint(p.accent, 40));
+            }
+            dnd::paint_group_grip(ui.painter(), zone.center(), if hot { p.accent } else { p.muted });
+        }
+        if resp.dragged() {
+            if dnd::arm_drag(ui.ctx(), (group_key, zone_i), resp.drag_delta(), source) {
+                egui::DragAndDrop::set_payload(ui.ctx(), dnd::GroupDrag(group.active_pane()));
+            }
+        } else if !egui::DragAndDrop::has_payload_of_type::<dnd::GroupDrag>(ui.ctx()) {
+            dnd::clear_drag_arm(ui.ctx(), (group_key, zone_i));
+        }
+    }
+
+    let moving_tab = egui::DragAndDrop::payload::<DockPane>(ui.ctx()).map(|p| *p);
     for (index, pane) in group.tabs.iter().copied().enumerate() {
         let on = index == active;
-        let bottom = if on {
-            header.max.y + 1.0
-        } else {
-            header.max.y - 5.0
-        };
-        let tab = Rect::from_min_max(
-            Pos2::new(x, header.min.y + 7.0),
-            Pos2::new(x + width, bottom),
-        );
-        x += width + gap;
+        let mut tab = chips[index];
+        if on {
+            tab.max.y = header.max.y + 1.0;
+        }
+        let lifted = moving_tab == Some(pane);
         let ink = pane.ink(p.is_light);
-        let fill = if on { p.pane } else { p.control };
+        let fill = if lifted {
+            tint(p.control, 90)
+        } else if on {
+            p.pane
+        } else {
+            p.control
+        };
         let rounding = Rounding {
             nw: 6.0,
             ne: 6.0,
@@ -2118,7 +2374,7 @@ fn paint_tab_strip(
             painter.with_clip_rect(text_clip).text(
                 Pos2::new(text_clip.min.x, tab.center().y + 1.0),
                 Align2::LEFT_CENTER,
-                pane.title(),
+                state.pane_label(pane),
                 font_semi(13.0),
                 if on { p.text } else { p.muted },
             );
@@ -2129,10 +2385,13 @@ fn paint_tab_strip(
                 Id::new(("pb_tab_drag", pane.id())),
                 Sense::click_and_drag(),
             )
-            .on_hover_text("Drag this tab onto a strip to stack it, or onto an edge to dock it")
+            .on_hover_text("Drag along the strip to reorder, onto another strip to stack, or onto an edge to dock")
             .on_hover_cursor(CursorIcon::Grab);
         if resp.clicked() && !on && state.tree.set_active(pane) {
             changed = true;
+        }
+        if lifted {
+            ui.painter().rect_stroke(tab, rounding, Stroke::new(1.0, tint(p.accent, 160)));
         }
         if resp.dragged() {
             if dnd::arm_drag(ui.ctx(), pane, resp.drag_delta(), source) {
@@ -2842,4 +3101,22 @@ fn elide_middle(text: &str, max: usize) -> String {
     let start: String = chars[..head].iter().collect();
     let end: String = chars[chars.len() - tail..].iter().collect();
     format!("{start}…{end}")
+}
+
+#[cfg(test)]
+mod startup_project_tests {
+    use super::startup_project;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn last_used_beats_a_restarted_service() {
+        let last = Path::new("/w/plant.pbproj.json");
+        let def = Path::new("/cfg/project.json");
+        assert_eq!(startup_project(Some(last), "/cfg/project.json", false, def), PathBuf::from(last));
+        // Live hubs: attach to the service, never swap their project out.
+        assert_eq!(startup_project(Some(last), "/cfg/project.json", true, def), PathBuf::from(def));
+        // No history: follow the service, else the default.
+        assert_eq!(startup_project(None, "/x/other.json", false, def), PathBuf::from("/x/other.json"));
+        assert_eq!(startup_project(None, "", false, def), PathBuf::from(def));
+    }
 }

@@ -17,6 +17,52 @@ pub struct PaneHit {
     pub rect: Rect,
     /// Header strip. A drop here adds a tab.
     pub strip: Rect,
+    /// Tab chip rects when the area shows a strip of two or more tabs (else empty).
+    pub chips: Vec<Rect>,
+}
+
+/// Drag payload for a whole area: every tab in the area holding this pane moves together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupDrag(pub DockPane);
+
+/// Width reserved at the left of a tab strip for the group grip.
+pub const GROUP_GRIP_W: f32 = 22.0;
+
+/// Tab chip rects inside an area header (shared by painting and drop targeting).
+pub fn tab_chip_rects(header: Rect, count: usize) -> Vec<Rect> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let right = header.max.x - 44.0;
+    let left = header.min.x + GROUP_GRIP_W;
+    let gap = 4.0;
+    let avail = (right - left - gap * (count.saturating_sub(1) as f32)).max(1.0);
+    let width = (avail / count as f32).clamp(1.0, 156.0);
+    (0..count)
+        .map(|i| {
+            let x = left + i as f32 * (width + gap);
+            Rect::from_min_max(
+                Pos2::new(x, header.min.y + 7.0),
+                Pos2::new(x + width, header.max.y - 5.0),
+            )
+        })
+        .collect()
+}
+
+/// Insertion slot (0..=len) nearest the pointer along a chip strip.
+fn insert_index(chips: &[Rect], x: f32) -> usize {
+    chips.iter().position(|c| x < c.center().x).unwrap_or(chips.len())
+}
+
+/// Thin vertical caret marking where an insertion lands.
+fn caret_at(chips: &[Rect], index: usize) -> Rect {
+    let (x, r) = if index < chips.len() {
+        (chips[index].min.x - 2.0, chips[index])
+    } else {
+        let last = chips[chips.len() - 1];
+        (last.max.x + 2.0, last)
+    };
+    Rect::from_center_size(Pos2::new(x, r.center().y), Vec2::new(3.0, r.height() + 6.0))
 }
 
 impl PaneHit {
@@ -25,11 +71,13 @@ impl PaneHit {
             rect.min,
             Vec2::new(rect.width(), HEADER_H.min(rect.height())),
         );
+        let chips = if tabs.len() >= 2 { tab_chip_rects(strip, tabs.len()) } else { Vec::new() };
         Self {
             pane,
             tabs,
             rect,
             strip,
+            chips,
         }
     }
 }
@@ -50,6 +98,32 @@ pub enum DropCommit {
         target: DockPane,
         edge: TileEdge,
     },
+    /// Insert `moving` before slot `index` of the strip holding `target` (another area).
+    TabAt {
+        moving: DockPane,
+        target: DockPane,
+        index: usize,
+    },
+    /// Move `pane` to slot `index` of its own strip.
+    Reorder {
+        pane: DockPane,
+        index: usize,
+    },
+    /// Whole-area moves: `member` names the dragged area.
+    GroupDock {
+        member: DockPane,
+        target: DockPane,
+        edge: TileEdge,
+    },
+    GroupMerge {
+        member: DockPane,
+        target: DockPane,
+        index: usize,
+    },
+    GroupSwap {
+        member: DockPane,
+        target: DockPane,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +142,8 @@ pub enum LandingKind {
     SplitLeft,
     SplitRight,
     SplitBottom,
+    /// Insertion caret inside a tab strip (`preview` is the caret).
+    Insert,
     Blocked,
 }
 
@@ -165,6 +241,23 @@ pub fn landing_at(moving: DockPane, hit: &PaneHit, pos: Pos2) -> Landing {
     }
     let strip = tab_strip(hit);
     let zone = favnyr_zone(hit.rect, pos);
+    // Over a strip of chips: insert at the slot under the pointer (reorder in the same area).
+    if strip.contains(pos) && !hit.chips.is_empty() {
+        let index = insert_index(&hit.chips, pos.x);
+        let caret = caret_at(&hit.chips, index);
+        let commit = if in_area {
+            let from = tabs.iter().position(|t| *t == moving).unwrap_or(0);
+            (index != from && index != from + 1).then_some(DropCommit::Reorder { pane: moving, index })
+        } else {
+            Some(DropCommit::TabAt { moving, target: hit.pane, index })
+        };
+        return Landing {
+            preview: caret,
+            label: if in_area { "Move tab" } else { "Insert tab" },
+            kind: LandingKind::Insert,
+            commit,
+        };
+    }
     // The header and the top band both add a tab. They do not split the area.
     if strip.contains(pos) || zone == EdgeZone::North {
         if in_area {
@@ -256,6 +349,60 @@ pub fn landing_at(moving: DockPane, hit: &PaneHit, pos: Pos2) -> Landing {
     }
 }
 
+/// What releasing a dragged area (all its tabs) over `hit` would do.
+pub fn landing_for_group(member: DockPane, hit: &PaneHit, pos: Pos2) -> Landing {
+    if hit.pane == member || hit.tabs.contains(&member) {
+        return blocked(hit.rect.shrink(4.0));
+    }
+    let strip = tab_strip(hit);
+    let zone = favnyr_zone(hit.rect, pos);
+    if strip.contains(pos) && !hit.chips.is_empty() {
+        let index = insert_index(&hit.chips, pos.x);
+        return Landing {
+            preview: caret_at(&hit.chips, index),
+            label: "Merge tabs here",
+            kind: LandingKind::Insert,
+            commit: Some(DropCommit::GroupMerge { member, target: hit.pane, index }),
+        };
+    }
+    if strip.contains(pos) || zone == EdgeZone::North {
+        let index = hit.tabs.len().max(1);
+        return Landing {
+            preview: strip,
+            label: "Merge tabs",
+            kind: LandingKind::Tab,
+            commit: Some(DropCommit::GroupMerge { member, target: hit.pane, index }),
+        };
+    }
+    let (preview, label, kind, edge) = match zone {
+        EdgeZone::Center => {
+            return Landing {
+                preview: hit.rect.shrink(4.0),
+                label: "Swap",
+                kind: LandingKind::Swap,
+                commit: Some(DropCommit::GroupSwap { member, target: hit.pane }),
+            }
+        }
+        EdgeZone::South => (bottom_half(hit.rect), "dock group bottom", LandingKind::SplitBottom, TileEdge::South),
+        EdgeZone::West => (left_half(hit.rect), "dock group left", LandingKind::SplitLeft, TileEdge::West),
+        EdgeZone::East => (right_half(hit.rect), "dock group right", LandingKind::SplitRight, TileEdge::East),
+        EdgeZone::North => return blocked(strip),
+    };
+    let too_small = match edge {
+        TileEdge::West | TileEdge::East => hit.rect.width() < MIN_PANE * 2.0 + SEP,
+        _ => hit.rect.height() < MIN_PANE * 2.0 + SEP,
+    };
+    if too_small {
+        return Landing { preview, label: "blocked", kind: LandingKind::Blocked, commit: None };
+    }
+    Landing {
+        preview,
+        label,
+        kind,
+        commit: Some(DropCommit::GroupDock { member, target: hit.pane, edge }),
+    }
+}
+
 fn blocked(preview: Rect) -> Landing {
     Landing {
         preview,
@@ -317,6 +464,10 @@ pub fn paint_ghost(ctx: &Context, pane: DockPane, pos: Pos2, src: Vec2, p: &Them
 
 pub fn paint_landing(ctx: &Context, hit: Rect, landing: &Landing, p: &ThemePalette) {
     let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("pb_favnyr")));
+    if landing.kind == LandingKind::Insert {
+        paint_insert_caret(&painter, landing, p);
+        return;
+    }
     let blocked = landing.kind == LandingKind::Blocked;
     let accent = if blocked { p.err } else { p.accent };
     let splitting = matches!(
@@ -418,6 +569,97 @@ pub fn paint_landing(ctx: &Context, hit: Rect, landing: &Landing, p: &ThemePalet
     }
 }
 
+/// Insertion marker: a glowing caret with end caps between two tab chips.
+fn paint_insert_caret(painter: &Painter, landing: &Landing, p: &ThemePalette) {
+    let live = landing.commit.is_some();
+    let color = if live { p.accent } else { tint(p.muted, 180) };
+    let c = landing.preview;
+    painter.rect_filled(c.expand2(Vec2::new(4.0, 2.0)), Rounding::same(4.0), tint(color, 50));
+    painter.rect_filled(c, Rounding::same(1.5), color);
+    let top = Pos2::new(c.center().x, c.min.y);
+    let bot = Pos2::new(c.center().x, c.max.y);
+    let tri = |tip: Pos2, dir: f32| {
+        egui::Shape::convex_polygon(
+            vec![tip, Pos2::new(tip.x - 5.0, tip.y - 6.0 * dir), Pos2::new(tip.x + 5.0, tip.y - 6.0 * dir)],
+            color,
+            Stroke::NONE,
+        )
+    };
+    painter.add(tri(top + Vec2::new(0.0, 5.0), 1.0));
+    painter.add(tri(bot - Vec2::new(0.0, 5.0), -1.0));
+}
+
+/// Small tab-shaped ghost that follows the pointer while a tab is moved within a strip.
+pub fn paint_tab_ghost(ctx: &Context, pane: DockPane, pos: Pos2, p: &ThemePalette) {
+    let painter = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("pb_drag_ghost")));
+    let ink = pane.ink(p.is_light);
+    let galley = ctx.fonts(|f| f.layout_no_wrap(pane.title().to_owned(), theme::font_semi(13.0), p.text));
+    let w = (galley.size().x + 40.0).clamp(90.0, 200.0);
+    let tab = Rect::from_min_size(Pos2::new(pos.x - 18.0, pos.y - 14.0), Vec2::new(w, 28.0));
+    let rounding = Rounding { nw: 6.0, ne: 6.0, sw: 2.0, se: 2.0 };
+    painter.rect_filled(tab.translate(Vec2::new(2.0, 3.0)), rounding, Color32::from_black_alpha(70));
+    painter.rect_filled(tab, rounding, tint(p.pane, 240));
+    painter.rect_filled(Rect::from_min_max(tab.min, Pos2::new(tab.max.x, tab.min.y + 2.0)), rounding, ink);
+    painter.rect_stroke(tab, rounding, Stroke::new(1.5, ink));
+    let icon = Rect::from_center_size(Pos2::new(tab.min.x + 14.0, tab.center().y + 1.0), Vec2::splat(13.0));
+    crate::art::paint_pane_icon(&painter, icon, pane, ink);
+    painter.galley(Pos2::new(tab.min.x + 26.0, tab.center().y - galley.size().y / 2.0 + 1.0), galley, p.text);
+}
+
+/// Panel ghost for a whole area: header shows every tab it carries.
+pub fn paint_group_ghost(ctx: &Context, tabs: &[DockPane], active: DockPane, pos: Pos2, src: Vec2, p: &ThemePalette) {
+    let painter = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("pb_drag_ghost")));
+    let ghost = Rect::from_min_size(
+        Pos2::new(pos.x + 16.0, pos.y + 12.0),
+        Vec2::new(src.x.clamp(260.0, 460.0), src.y.clamp(140.0, 280.0)),
+    );
+    let ink = active.ink(p.is_light);
+    painter.rect_filled(ghost.translate(Vec2::new(3.0, 4.0)), Rounding::same(RADIUS), Color32::from_black_alpha(60));
+    painter.rect_filled(ghost, Rounding::same(RADIUS), tint(p.pane, 230));
+    painter.rect_stroke(ghost, Rounding::same(RADIUS), Stroke::new(1.5, ink));
+    let header = Rect::from_min_size(ghost.min, Vec2::new(ghost.width(), HEADER_H));
+    painter.rect_filled(header, Rounding { nw: RADIUS, ne: RADIUS, sw: 0.0, se: 0.0 }, p.header_top);
+    let chips = tab_chip_rects(header, tabs.len());
+    for (pane, chip) in tabs.iter().zip(chips) {
+        let on = *pane == active;
+        let pink = pane.ink(p.is_light);
+        let rounding = Rounding { nw: 6.0, ne: 6.0, sw: 0.0, se: 0.0 };
+        painter.rect_filled(chip, rounding, if on { p.pane } else { p.control });
+        painter.rect_filled(Rect::from_min_max(chip.min, Pos2::new(chip.max.x, chip.min.y + 2.0)), rounding, if on { pink } else { tint(pink, 80) });
+        if chip.width() >= 26.0 {
+            let icon = Rect::from_center_size(Pos2::new(chip.min.x + 13.0, chip.center().y + 1.0), Vec2::splat(13.0));
+            crate::art::paint_pane_icon(&painter, icon, *pane, if on { pink } else { p.muted });
+        }
+        if chip.width() >= 68.0 {
+            let clip = Rect::from_min_max(Pos2::new(chip.min.x + 24.0, chip.min.y), Pos2::new(chip.max.x - 6.0, chip.max.y));
+            painter.with_clip_rect(clip).text(
+                Pos2::new(clip.min.x, chip.center().y + 1.0),
+                egui::Align2::LEFT_CENTER,
+                pane.title(),
+                theme::font_semi(13.0),
+                if on { p.text } else { p.muted },
+            );
+        }
+    }
+    let n = tabs.len();
+    let label = if n == 1 { "Moving 1 panel".to_string() } else { format!("Moving {n} tabs together") };
+    painter.text(
+        Pos2::new(ghost.center().x, header.max.y + (ghost.max.y - header.max.y) / 2.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        theme::font_ui(12.5),
+        p.muted,
+    );
+}
+
+/// Group grip: three short bars, drawn at the left of a tab strip.
+pub fn paint_group_grip(painter: &Painter, center: Pos2, color: Color32) {
+    for i in -1..=1 {
+        let y = center.y + i as f32 * 4.0;
+        painter.line_segment([Pos2::new(center.x - 4.5, y), Pos2::new(center.x + 4.5, y)], Stroke::new(1.6, color));
+    }
+}
+
 /// Two sheets, the front one raised. This pad adds a tab instead of splitting.
 fn paint_tab_glyph(painter: &Painter, center: Pos2, color: Color32) {
     let stroke = Stroke::new(1.4, color);
@@ -459,8 +701,8 @@ fn right_half(rect: Rect) -> Rect {
 }
 
 /// Drag distance accumulated for one pane. Returns true once the gesture is armed.
-pub fn arm_drag(ctx: &Context, pane: DockPane, delta: Vec2, source: Vec2) -> bool {
-    let key = Id::new(("pb_drag_acc", pane.id()));
+pub fn arm_drag(ctx: &Context, key: impl std::hash::Hash, delta: Vec2, source: Vec2) -> bool {
+    let key = Id::new(("pb_drag_acc", key));
     let mut acc = ctx.data(|data| data.get_temp::<f32>(key).unwrap_or(0.0));
     acc += delta.length();
     ctx.data_mut(|data| data.insert_temp(key, acc));
@@ -472,8 +714,8 @@ pub fn arm_drag(ctx: &Context, pane: DockPane, delta: Vec2, source: Vec2) -> boo
     }
 }
 
-pub fn clear_drag_arm(ctx: &Context, pane: DockPane) {
-    ctx.data_mut(|data| data.remove_temp::<f32>(Id::new(("pb_drag_acc", pane.id()))));
+pub fn clear_drag_arm(ctx: &Context, key: impl std::hash::Hash) {
+    ctx.data_mut(|data| data.remove_temp::<f32>(Id::new(("pb_drag_acc", key))));
 }
 
 #[cfg(test)]
@@ -534,6 +776,45 @@ mod tests {
         ));
     }
 
+    fn strip_hit() -> PaneHit {
+        PaneHit::area(
+            DockPane::Points,
+            vec![DockPane::Project, DockPane::Points, DockPane::Mappings],
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(600.0, 420.0)),
+        )
+    }
+
+    #[test]
+    fn dragging_a_tab_along_its_strip_reorders() {
+        let hit = strip_hit();
+        let y = hit.chips[0].center().y;
+        // Before the first chip → slot 0.
+        let first = landing_at(DockPane::Mappings, &hit, pos2(hit.chips[0].min.x + 2.0, y));
+        assert_eq!(first.kind, LandingKind::Insert);
+        assert!(matches!(first.commit, Some(DropCommit::Reorder { pane: DockPane::Mappings, index: 0 })));
+        // Past the last chip → end slot.
+        let end = landing_at(DockPane::Project, &hit, pos2(hit.chips[2].max.x - 2.0, y));
+        assert!(matches!(end.commit, Some(DropCommit::Reorder { pane: DockPane::Project, index: 3 })));
+        // Its own slot: caret shows, nothing to commit.
+        let stay = landing_at(DockPane::Points, &hit, pos2(hit.chips[1].min.x + 2.0, y));
+        assert_eq!(stay.kind, LandingKind::Insert);
+        assert!(stay.commit.is_none());
+    }
+
+    #[test]
+    fn dragging_a_group_docks_merges_or_swaps() {
+        let hit = strip_hit();
+        let y = hit.chips[0].center().y;
+        let merge = landing_for_group(DockPane::Hubs, &hit, pos2(hit.chips[1].min.x + 2.0, y));
+        assert!(matches!(merge.commit, Some(DropCommit::GroupMerge { index: 1, .. })));
+        let swap = landing_for_group(DockPane::Hubs, &hit, hit.rect.center());
+        assert!(matches!(swap.commit, Some(DropCommit::GroupSwap { .. })));
+        let dock = landing_for_group(DockPane::Hubs, &hit, pos2(300.0, 400.0));
+        assert!(matches!(dock.commit, Some(DropCommit::GroupDock { edge: TileEdge::South, .. })));
+        let own = landing_for_group(DockPane::Project, &hit, hit.rect.center());
+        assert!(own.commit.is_none(), "a group cannot land on itself");
+    }
+
     #[test]
     fn a_tab_strip_accepts_another_areas_pane() {
         let hit = PaneHit::area(
@@ -542,7 +823,7 @@ mod tests {
             Rect::from_min_max(pos2(0.0, 0.0), pos2(500.0, 420.0)),
         );
         let onto = landing_at(DockPane::Modbus, &hit, hit.strip.center());
-        assert!(matches!(onto.commit, Some(DropCommit::Tab { .. })));
+        assert!(matches!(onto.commit, Some(DropCommit::TabAt { index: 1, .. })));
         let already = landing_at(DockPane::Mappings, &hit, hit.strip.center());
         assert!(already.commit.is_none());
         let out = landing_at(DockPane::Mappings, &hit, pos2(250.0, 390.0));

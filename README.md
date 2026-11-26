@@ -1,6 +1,6 @@
 # Protocol Bench
 
-Native Rust product for moving values between industrial and oilfield links (serial / TCP streams, Modbus, MQTT, OPC UA, HTTP / REST, SNMP, LAS, CSV / JSON-lines file follow). An always-on **service** (`pb-service`) holds the points and runs the protocol packs; a separate **UI** (`protocol-bench`, egui / eframe) configures and monitors it.
+Native Rust product for moving values between industrial and oilfield links (serial / TCP streams, Modbus, MQTT, OPC UA, HTTP / REST, SNMP, LAS, CSV / JSON-lines file follow, WITS, WebSocket, Sparkplug B, DNP3, CAN). An always-on **service** (`pb-service`) holds the points and runs the protocol packs; a separate **UI** (`protocol-bench`, egui / eframe) configures and monitors it.
 
 > Your protocol hub for every stream. — Agile Automation
 
@@ -18,7 +18,8 @@ Start the service (with the protocol packs it loads), then the UI:
 
 ```bash
 # 1. Build the packs and the service, and put the packs in modules/
-cargo build -p pb-mqtt -p pb-opcua -p pb-streams -p pb-http -p pb-modbus -p pb-files -p pb-snmp -p pb-las -p pb-service
+cargo build -p pb-mqtt -p pb-opcua -p pb-streams -p pb-http -p pb-modbus -p pb-files -p pb-snmp -p pb-las \
+            -p pb-wits -p pb-websocket -p pb-sparkplug -p pb-dnp3 -p pb-can -p pb-service
 mkdir -p modules && cp target/debug/libpb_*.so modules/     # pb_*.dll on Windows
 
 # 2. Service (always-on; owns project.json, serves localhost JSON IPC)
@@ -39,6 +40,7 @@ Keep the service running in its own terminal (it stays in the foreground and pri
 | `PB_MODULES` | Directory the service loads protocol packs from (unset = no packs loaded) |
 | `PB_PROJECT` | Project file the service opens (otherwise the default project path) |
 | `PB_IPC_PORT` | Fixed localhost IPC port (otherwise chosen and written to `~/.config/protocolbench/ipc.json` with `ipc.token`) |
+| `PB_AUTO_RUN_HUBS` | `1` = start the project's embedded MQTT broker / OPC UA server at service start, with no UI attached (headless demos) |
 
 ### Tests
 
@@ -50,6 +52,7 @@ cargo test --workspace
 ./scripts/modbus-rtu-smoke.sh   # Modbus RTU master + slave over a virtual serial pair (pty), no hardware
 ./scripts/files-smoke.sh        # File follow: appends, restart catch-up, rotation, column picker
 ./scripts/snmp-las-smoke.sh     # fake SNMP agent + LAS file follow / write
+./scripts/demo-smoke.sh         # pb-sim devices → every pack → the three industrial demos (all Rust)
 ./scripts/pb-service-smoke.sh   # IPC smoke (also mqtt-smoke.sh, opcua-smoke.sh)
 ```
 
@@ -65,11 +68,15 @@ The smokes need python3 and use a private config dir, so a running UI never atta
 | `pb-points` | Host point store (short ids ↔ wire addresses, quality) and `addr`, the single definition of every wire-address format |
 | `pb-ipc` | UI ↔ service framing and client |
 | `pb-abi` | Stable C ABI shared by the host and packs, plus the `Pack` trait / `export_pack!` macro that packs implement |
-| `pb-mqtt`, `pb-opcua`, `pb-streams`, `pb-http`, `pb-modbus`, `pb-files`, `pb-snmp`, `pb-las` | Protocol packs (`cdylib`) — MQTT client + embedded broker, OPC UA client + server, serial / TCP streams, HTTP / REST, Modbus TCP / RTU client + server, File follow (CSV / JSON lines), SNMP v1 / v2c GET, LAS 2.0 follow + write |
+| `pb-mqtt`, `pb-opcua`, `pb-streams`, `pb-http`, `pb-modbus`, `pb-files`, `pb-snmp`, `pb-las` | Protocol packs (`cdylib`) — MQTT client + embedded broker, OPC UA client + server, serial / TCP streams, HTTP / REST, Modbus TCP / RTU client + server (register maps with scaling), File follow (CSV / JSON lines), SNMP v1 / v2c GET, LAS 2.0 follow + write |
+| `pb-wits`, `pb-websocket`, `pb-sparkplug`, `pb-dnp3`, `pb-can` | Ext protocol packs (`cdylib`) — WITS level 0 in / out (TCP / serial), WebSocket JSON client + server, Sparkplug B host + edge node, DNP3 TCP master (polls + controls), CAN / SocketCAN signals (J1939 PGNs) |
+| `pb-extkit` | Shared runtime for the ext packs: workers per connection, config diffing, output routing, status / "seen on the wire" |
+| `pb-proto` | Pure codecs shared by packs and the simulator: WITS, Sparkplug B protobuf, DNP3 (link / transport / application + demo outstation), CAN signals + SocketCAN |
+| `pb-sim` | Demo field devices (frac spread, bottling line, lift station) and `watch` / `check` point tools |
 | `pb-tail` | Shared byte-offset file tailing (rotation detection, saved state) used by the File follow and LAS packs |
 | `pb-json` | One JSON path syntax (`a.b`, `a[0]`, `$.a`) shared by the MQTT, HTTP and File follow packs |
 
-All protocol packs in the table are live. See the gap review for what is not built (Sparkplug B, DNP3, WebSocket, CAN, WITS, MCP server).
+All protocol packs in the table are live. The service also hosts an MCP server for agents (see `pb-service/README.md`). See the gap review for what is not built.
 
 ## Key dependencies
 
@@ -89,9 +96,24 @@ More samples (`modbus-hub.json`, `edge-logger.json`, with `scripts/field-sim.py`
 
 > The UI and service find each other through `~/.config/protocolbench/ipc.json`. Only one service should write it at a time — an open UI attaches to whichever service wrote it last.
 
+## Industrial demos (all Rust)
+
+```bash
+cargo run -p pb-sim -- all                      # every simulated device (frac, bottling, water)
+scripts/dev.sh --project ../protocol-bench-projects/frac-spread.json
+```
+
+| Project | What it shows |
+| --- | --- |
+| `frac-spread.json` | Frac pumps + blender (Modbus TCP), wellhead RTU (DNP3), pressure-pumping WITS feed, pump engine (CAN J1939) → WITS to the data van, WebSocket dashboard `:8765`, MQTT `frac/#`, stage LAS log, ESD and rate commands back to the devices |
+| `bottling-line.json` | Line PLC, VFDs, energy meter (Modbus TCP), robot cell (Sparkplug B edge) → ISA-95 UNS, Sparkplug gateway edge node, WebSocket dashboard `:8766`, run / speed commands |
+| `water-lift-station.json` | Lift station RTU (DNP3), chlorine analyzer (Modbus) → OPC UA server hub `:4855`, two-way web HMI on WebSocket `:8767` |
+
+Headless (web demos): `PB_AUTO_RUN_HUBS=1 PB_MODULES=$PWD/modules PB_PROJECT=… pb-service` runs a project with its embedded broker / OPC UA server and no UI. `pb-sim watch` prints the live point table.
+
 ## Projects
 
-A project is one JSON file (current version 10). Sample projects live in `../protocol-bench-projects/`. UI layout and theme are stored separately in `~/.config/protocolbench/ui.toml`.
+A project is one JSON file (current version 11). Sample projects live in `../protocol-bench-projects/`. UI layout and theme are stored separately in `~/.config/protocolbench/ui.toml`.
 
 ## More docs
 

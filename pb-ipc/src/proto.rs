@@ -76,6 +76,11 @@ impl ServiceStatus {
                 "http" => "HTTP / REST",
                 "snmp" => "SNMP",
                 "las" => "LAS",
+                "wits" => "WITS",
+                "websocket" => "WebSocket",
+                "sparkplug" => "Sparkplug B",
+                "dnp3" => "DNP3",
+                "can" => "CAN",
                 other => other,
             };
             out.push(format!("{name}: {}", s.state));

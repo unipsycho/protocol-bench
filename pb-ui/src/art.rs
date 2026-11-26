@@ -107,6 +107,13 @@ pub fn paint_pane_icon(painter: &Painter, rect: Rect, pane: DockPane, ink: Color
         DockPane::Http => icon_http(painter, rect, stroke, ink),
         DockPane::Las => icon_las(painter, rect, stroke, ink),
         DockPane::Snmp => icon_snmp(painter, rect, stroke, ink),
+        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can => {
+            if let Some(e) = pane.ext() {
+                crate::ext_proto::paint_icon(painter, e, rect, stroke, ink);
+            }
+        }
+        DockPane::Protocols => icon_protocols(painter, rect, stroke, ink),
+        DockPane::Help => icon_help(painter, rect, stroke, ink),
     }
 }
 
@@ -130,6 +137,13 @@ pub fn paint_hero(painter: &Painter, pane: DockPane, rect: Rect) {
         DockPane::Http => hero_http(painter, rect),
         DockPane::Las => hero_las(painter, rect),
         DockPane::Snmp => hero_snmp(painter, rect),
+        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can => {
+            if let Some(e) = pane.ext() {
+                crate::ext_proto::paint_hero(painter, e, rect);
+            }
+        }
+        DockPane::Protocols => hero_hubs(painter, rect),
+        DockPane::Help => hero_points(painter, rect),
     }
 }
 
@@ -270,6 +284,19 @@ fn icon_hub(painter: &Painter, r: Rect, stroke: Stroke, ink: Color32) {
     }
 }
 
+fn icon_help(painter: &Painter, r: Rect, stroke: Stroke, ink: Color32) {
+    // Circle with a question mark.
+    let c = n(r, 0.50, 0.50);
+    let rad = r.width().min(r.height()) * 0.42;
+    painter.circle_stroke(c, rad, stroke);
+    painter.line_segment([n(r, 0.38, 0.34), n(r, 0.44, 0.26)], stroke);
+    painter.line_segment([n(r, 0.44, 0.26), n(r, 0.56, 0.26)], stroke);
+    painter.line_segment([n(r, 0.56, 0.26), n(r, 0.62, 0.36)], stroke);
+    painter.line_segment([n(r, 0.62, 0.36), n(r, 0.50, 0.50)], stroke);
+    painter.line_segment([n(r, 0.50, 0.50), n(r, 0.50, 0.58)], stroke);
+    painter.circle_filled(n(r, 0.50, 0.72), rad * 0.10, ink);
+}
+
 fn icon_map(painter: &Painter, r: Rect, stroke: Stroke, ink: Color32) {
     let left = nrect(r, 0.04, 0.26, 0.30, 0.48);
     let right = nrect(r, 0.66, 0.26, 0.30, 0.48);
@@ -280,6 +307,27 @@ fn icon_map(painter: &Painter, r: Rect, stroke: Stroke, ink: Color32) {
     let tip = Pos2::new(right.min.x - 1.0, y);
     painter.line_segment([tail, tip], stroke);
     arrow_head(painter, tip, Vec2::new(1.0, 0.0), r.width() * 0.16, ink);
+}
+
+/// Protocols: a three-unit rack, one status lamp per unit.
+fn icon_protocols(painter: &Painter, r: Rect, stroke: Stroke, ink: Color32) {
+    for i in 0..3 {
+        let y = 0.12 + i as f32 * 0.27;
+        let unit = nrect(r, 0.10, y, 0.80, 0.22);
+        painter.rect_stroke(unit, Rounding::same(2.0), stroke);
+        painter.circle_filled(
+            Pos2::new(unit.min.x + unit.width() * 0.18, unit.center().y),
+            r.width() * 0.05,
+            ink,
+        );
+        painter.line_segment(
+            [
+                Pos2::new(unit.min.x + unit.width() * 0.38, unit.center().y),
+                Pos2::new(unit.max.x - unit.width() * 0.14, unit.center().y),
+            ],
+            stroke,
+        );
+    }
 }
 
 fn icon_traffic(painter: &Painter, r: Rect, stroke: Stroke) {
@@ -786,16 +834,26 @@ fn paint_close(painter: &Painter, r: Rect, ink: Color32) {
     painter.line_segment([inner.right_top(), inner.left_bottom()], stroke);
 }
 
+/// Maximize = four corner L brackets; restore = the same, smaller and inset
+/// (glyph pair ported from Modbus Bench).
 fn paint_max(painter: &Painter, r: Rect, ink: Color32, restore: bool) {
-    let stroke = Stroke::new((r.width() * 0.09).clamp(1.15, 1.7), ink);
-    if !restore {
-        painter.rect_stroke(r.shrink(r.width() * 0.16), Rounding::same(1.5), stroke);
-        return;
+    let (width, inset, arm_k, lo, hi) = if restore {
+        (1.5, 3.2, 0.34, 2.5, 4.0)
+    } else {
+        (1.6, 1.8, 0.32, 3.0, 5.0)
+    };
+    let stroke = Stroke::new(width, ink);
+    let b = r.shrink(inset);
+    let arm = (b.width().min(b.height()) * arm_k).clamp(lo, hi);
+    for (corner, dx, dy) in [
+        (b.left_top(), arm, arm),
+        (b.right_top(), -arm, arm),
+        (b.left_bottom(), arm, -arm),
+        (b.right_bottom(), -arm, -arm),
+    ] {
+        painter.line_segment([corner + Vec2::new(0.0, dy), corner], stroke);
+        painter.line_segment([corner, corner + Vec2::new(dx, 0.0)], stroke);
     }
-    let back = Rect::from_min_max(n(r, 0.30, 0.16), n(r, 0.88, 0.70));
-    let front = Rect::from_min_max(n(r, 0.12, 0.34), n(r, 0.70, 0.88));
-    painter.rect_stroke(back, Rounding::same(1.0), stroke);
-    painter.rect_stroke(front, Rounding::same(1.0), stroke);
 }
 
 fn wave(painter: &Painter, x0: f32, x1: f32, y: f32, amp: f32, cycles: f32, stroke: Stroke) {
@@ -891,22 +949,18 @@ pub fn paint_warning_badge(painter: &Painter, rect: Rect, color: Color32) {
     painter.circle_filled(Pos2::new(c.x, c.y + side * 0.23), w * 0.62, color);
 }
 
-/// Small round Start / Stop control (▶ / ■). `running` shows Stop. Returns the response so the
-/// caller can read `clicked()`; disabled controls draw muted and never click.
-pub fn run_button(
+/// Pill-shaped Start / Stop control: the play / stop glyph followed by a text label,
+/// so the action reads without needing the hover tooltip. `height` is the pill height.
+pub fn run_pill(
     ui: &mut egui::Ui,
     running: bool,
     enabled: bool,
     tip: &str,
     p: &ThemePalette,
-    size: f32,
+    height: f32,
 ) -> egui::Response {
-    let sense = if enabled {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), sense);
+    let label = if running { "Stop" } else { "Start" };
+    let font = crate::theme::font_semi(height * 0.5);
     let ink = if !enabled {
         tint(p.muted, 120)
     } else if running {
@@ -914,37 +968,65 @@ pub fn run_button(
     } else {
         p.live
     };
+    // Enabled: solid fill with a black/white label chosen by luminance for strong contrast.
+    let lum = 0.299 * ink.r() as f32 + 0.587 * ink.g() as f32 + 0.114 * ink.b() as f32;
+    let fg = if !enabled {
+        ink
+    } else if lum > 140.0 {
+        Color32::from_rgb(10, 14, 20)
+    } else {
+        Color32::WHITE
+    };
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, fg);
+    let pad = height * 0.4;
+    let glyph = height * 0.42;
+    let width = pad + glyph + height * 0.22 + galley.size().x + pad;
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), sense);
     let hot = enabled && resp.hovered();
     let painter = ui.painter();
-    painter.circle_filled(rect.center(), size * 0.5, tint(ink, if hot { 60 } else { 28 }));
-    painter.circle_stroke(
-        rect.center(),
-        size * 0.5 - 0.5,
-        Stroke::new(1.0, tint(ink, if hot { 220 } else { 150 })),
-    );
-    let c = rect.center();
-    let g = size * 0.21;
+    let round = Rounding::same(height * 0.5);
+    if enabled {
+        painter.rect_filled(rect, round, if hot { ink } else { tint(ink, 225) });
+        painter.rect_stroke(rect.shrink(0.5), round, Stroke::new(1.0, ink));
+    } else {
+        painter.rect_filled(rect, round, tint(ink, 28));
+        painter.rect_stroke(rect.shrink(0.5), round, Stroke::new(1.0, tint(ink, 150)));
+    }
+    let c = Pos2::new(rect.min.x + pad + glyph * 0.5, rect.center().y);
+    let g = glyph * 0.5;
     if running {
         painter.rect_filled(
-            Rect::from_center_size(c, Vec2::splat(g * 1.7)),
+            Rect::from_center_size(c, Vec2::splat(g * 1.6)),
             Rounding::same(1.5),
-            ink,
+            fg,
         );
     } else {
-        // Optical centre: nudge the triangle right by a sliver.
-        let cx = c.x + g * 0.15;
         painter.add(Shape::convex_polygon(
             vec![
-                Pos2::new(cx - g * 0.8, c.y - g * 1.05),
-                Pos2::new(cx - g * 0.8, c.y + g * 1.05),
-                Pos2::new(cx + g * 1.1, c.y),
+                Pos2::new(c.x - g * 0.7, c.y - g),
+                Pos2::new(c.x - g * 0.7, c.y + g),
+                Pos2::new(c.x + g * 1.0, c.y),
             ],
-            ink,
+            fg,
             Stroke::NONE,
         ));
     }
+    painter.galley(
+        Pos2::new(
+            rect.min.x + pad + glyph + height * 0.22,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        fg,
+    );
     if enabled {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp.on_hover_text(tip)
 }
+

@@ -186,7 +186,9 @@ pub fn paint_node_props(
             };
             egui::ComboBox::from_id_salt(("pb_agg_member", step_id, i))
                 .selected_text(label)
-                .width((ui.available_width() - 36.0).max(100.0))
+                // Reserve the × (28 + gap) plus the combo button's own padding, or
+                // the row overflows and every following row widens with it.
+                .width((ui.available_width() - 36.0 - 2.0 * ui.spacing().button_padding.x - 4.0).max(100.0))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut pick, String::new(), "(none)");
                     for name in &point_names {

@@ -14,6 +14,11 @@
 //! | File follow | `file/<source>[::<column>]` |
 //! | SNMP | `snmp/<target>[::<oid>]` |
 //! | LAS | `las/<endpoint>[::<curve>]` |
+//! | WITS | `wits/<conn>::<item>` (4-digit record + item, `0108`) |
+//! | WebSocket | `websocket/<conn>::<json path>` |
+//! | Sparkplug B | `sparkplug/<conn>::<device>:<metric>` (device empty for node metrics) |
+//! | DNP3 | `dnp3/<conn>::<kind>:<index>` (`analog:3`, `binary:0`, `counter:1`, …) |
+//! | CAN | `can/<conn>::<id>:<start>:<len>` (frame id as written, start bit, bit length) |
 //!
 //! An empty connection drops that segment (`mqtt/<topic>`); an empty leaf drops the `::` part.
 //! Every input is trimmed.
@@ -91,9 +96,82 @@ pub fn modbus_bind_source(conn: &str, unit: u64, area: &str, address: u64, dtype
     join("modbus", instance.trim_start_matches('/'), &leaf)
 }
 
+/// A protocol whose binds the UI and service handle generically ("ext" protocols). The UI
+/// adds field schemas on top; the service only needs the section key, the point-id prefix and
+/// which bind fields make up the wire address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtSpec {
+    /// Project section key, pack id, address prefix, and (case-insensitively) hub port protocol.
+    pub id: &'static str,
+    /// Short point id prefix: `wits` → `wits_1`.
+    pub prefix: &'static str,
+    /// Bind fields joined with `:` to form the address leaf. Empty values are skipped.
+    pub leaf_keys: &'static [&'static str],
+    /// Fields that must be non-empty for a bind to count. Empty list = a bind with every leaf
+    /// field empty is valid (WebSocket: the whole message).
+    pub required: &'static [&'static str],
+}
+
+pub const EXT_PROTOCOLS: &[ExtSpec] = &[
+    ExtSpec { id: "wits", prefix: "wits", leaf_keys: &["item"], required: &["item"] },
+    ExtSpec { id: "websocket", prefix: "ws", leaf_keys: &["path"], required: &[] },
+    ExtSpec { id: "sparkplug", prefix: "spb", leaf_keys: &["device", "metric"], required: &["metric"] },
+    ExtSpec { id: "dnp3", prefix: "dnp3", leaf_keys: &["kind", "index"], required: &["kind", "index"] },
+    ExtSpec { id: "can", prefix: "can", leaf_keys: &["id", "start", "len"], required: &["id", "start", "len"] },
+];
+
+/// Spec for a section key / port protocol name (case-insensitive).
+pub fn ext_spec(id: &str) -> Option<&'static ExtSpec> {
+    EXT_PROTOCOLS.iter().find(|s| s.id.eq_ignore_ascii_case(id.trim()))
+}
+
+/// Address leaf for an ext bind: the `leaf_keys` values (via `get`), trimmed, empties skipped,
+/// joined with `:`. `None` when a required field is empty (the bind is blank).
+pub fn ext_leaf(spec: &ExtSpec, get: impl Fn(&str) -> String) -> Option<String> {
+    let parts: Vec<String> = spec
+        .leaf_keys
+        .iter()
+        .map(|k| get(k).trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let ok = spec.required.iter().all(|k| !get(k).trim().is_empty());
+    ok.then(|| parts.join(":"))
+}
+
+/// `<id>/<conn>::<leaf>`.
+pub fn ext_bind_source(spec: &ExtSpec, conn: &str, leaf: &str) -> String {
+    join(spec.id, conn, leaf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ext_protocol_addresses() {
+        let wits = ext_spec("WITS").unwrap();
+        let leaf = ext_leaf(wits, |k| if k == "item" { " 0108 ".into() } else { String::new() }).unwrap();
+        assert_eq!(ext_bind_source(wits, "van", &leaf), "wits/van::0108");
+        let spb = ext_spec("Sparkplug").unwrap();
+        let get = |d: &'static str, m: &'static str| move |k: &str| if k == "device" { d.to_string() } else if k == "metric" { m.to_string() } else { String::new() };
+        assert_eq!(ext_leaf(spb, get("Pump1", "Pressure")).unwrap(), "Pump1:Pressure");
+        assert_eq!(ext_leaf(spb, get("", "Node/Uptime")).unwrap(), "Node/Uptime");
+        assert_eq!(ext_leaf(spb, get("Pump1", "")), None);
+        let dnp = ext_spec("dnp3").unwrap();
+        let leaf = ext_leaf(dnp, |k| if k == "kind" { "analog".into() } else { "3".into() }).unwrap();
+        assert_eq!(ext_bind_source(dnp, "rtu", &leaf), "dnp3/rtu::analog:3");
+        assert!(ext_spec("nope").is_none());
+        let ws = ext_spec("websocket").unwrap();
+        assert_eq!(ext_leaf(ws, |_| String::new()).as_deref(), Some(""));
+        assert_eq!(ext_bind_source(ws, "feed", ""), "websocket/feed");
+        let can = ext_spec("can").unwrap();
+        assert_eq!(ext_leaf(can, |k| if k == "id" { String::new() } else { "8".into() }), None);
+        // Prefixes are unique so point ids never collide across protocols.
+        let mut seen = std::collections::HashSet::new();
+        for s in EXT_PROTOCOLS {
+            assert!(seen.insert(s.prefix));
+        }
+    }
 
     #[test]
     fn mqtt_and_http_paths() {

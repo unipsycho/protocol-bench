@@ -27,6 +27,10 @@ pub struct LiveSrc {
     pub offset: u64,
     /// `(name, sample)` from the pack, for the column picker.
     pub columns: Vec<(String, String)>,
+    /// CSV header layout the pack found (`3 preamble lines · names on line 4 · …`).
+    pub header: String,
+    /// Preamble lines above the header.
+    pub preamble: Vec<String>,
 }
 
 pub fn parse_live(detail_json: &str) -> Vec<LiveSrc> {
@@ -51,6 +55,12 @@ pub fn parse_live(detail_json: &str) -> Vec<LiveSrc> {
                 .get("columns")
                 .and_then(|x| x.as_array())
                 .map(|a| a.iter().map(|x| (st(x, "name"), st(x, "sample"))).collect())
+                .unwrap_or_default(),
+            header: st(c, "header"),
+            preamble: c
+                .get("preamble")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
                 .unwrap_or_default(),
         })
         .collect()
@@ -123,6 +133,64 @@ impl FileStart {
     }
 }
 
+/// CSV header handling. Same JSON as the pack's `header_row`: `"auto"`, `false`, or a 1-based
+/// line number for the column names. Legacy `true` (old checkbox) reads as Auto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HeaderMode {
+    /// Smart detection: skip file / test info lines, find the names row and where data starts.
+    #[default]
+    Auto,
+    None,
+    /// Column names on this 1-based line; data from the next.
+    Line(u32),
+}
+
+impl HeaderMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto-detect",
+            Self::None => "None (numbered columns)",
+            Self::Line(_) => "Names on line…",
+        }
+    }
+}
+
+impl Serialize for HeaderMode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => s.serialize_str("auto"),
+            Self::None => s.serialize_bool(false),
+            Self::Line(n) => s.serialize_u32(*n),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HeaderMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            B(bool),
+            N(u64),
+            S(String),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::B(true) => Self::Auto,
+            Raw::B(false) | Raw::N(0) => Self::None,
+            Raw::N(n) => Self::Line(n.min(u32::MAX as u64) as u32),
+            Raw::S(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "none" | "false" | "" => Self::None,
+                "first" => Self::Line(1),
+                other => match other.parse::<u32>() {
+                    Ok(0) => Self::None,
+                    Ok(n) => Self::Line(n),
+                    Err(_) => Self::Auto,
+                },
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileSource {
     pub id: String,
@@ -131,9 +199,9 @@ pub struct FileSource {
     #[serde(default)]
     pub path: String,
     pub parser: FileParser,
-    /// CSV: first row names the columns.
-    #[serde(default = "yes")]
-    pub header_row: bool,
+    /// CSV: header handling (smart detection by default).
+    #[serde(default)]
+    pub header_row: HeaderMode,
     /// CSV field delimiter (single character).
     #[serde(default = "default_delim")]
     pub delimiter: String,
@@ -166,7 +234,7 @@ impl FileSource {
             label: "Meter log".into(),
             path: String::new(),
             parser: FileParser::Csv,
-            header_row: true,
+            header_row: HeaderMode::Auto,
             delimiter: default_delim(),
             poll_ms: default_poll_ms(),
             start_at: default_start(),
@@ -369,9 +437,51 @@ fn paint_body(ui: &mut egui::Ui, p: &ThemePalette, state: &mut FilesPanelState, 
                 if s.delimiter.chars().count() > 1 {
                     s.delimiter = s.delimiter.chars().take(1).collect();
                 }
-                combo_row(ui, "Header row", p, |ui| {
-                    dirty |= ui.checkbox(&mut s.header_row, "First row names the columns").changed();
+                combo_row(ui, "Header", p, |ui| {
+                    let mut v = s.header_row;
+                    egui::ComboBox::from_id_salt("pb_files_header")
+                        .selected_text(v.label())
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            let line = match s.header_row {
+                                HeaderMode::Line(n) => n,
+                                _ => 1,
+                            };
+                            for x in [HeaderMode::Auto, HeaderMode::Line(line), HeaderMode::None] {
+                                ui.selectable_value(&mut v, x, x.label());
+                            }
+                        });
+                    if let HeaderMode::Line(mut n) = v {
+                        if ui.add(egui::DragValue::new(&mut n).range(1..=10_000).speed(0.2)).changed() {
+                            v = HeaderMode::Line(n);
+                        }
+                    }
+                    if v != s.header_row {
+                        s.header_row = v;
+                        dirty = true;
+                    }
                 });
+                let hint = match s.header_row {
+                    HeaderMode::Auto => "Scans the top of the file until the column count settles: that block is the data, \
+                                         its first row the column names, and lines above it (test / file info) are skipped.",
+                    HeaderMode::Line(_) => "Lines above the names are skipped; data starts on the next line. Blank lines are not counted.",
+                    HeaderMode::None => "Every line is data; bind columns by number (0, 1, 2…).",
+                };
+                ui.label(RichText::new(hint).font(font_ui(11.0)).color(p.muted));
+                if let Some(l) = mine.filter(|l| !l.header.is_empty()) {
+                    ui.label(RichText::new(format!("Detected: {}", l.header)).font(font_ui(11.5)).color(p.text));
+                    if !l.preamble.is_empty() {
+                        egui::CollapsingHeader::new(
+                            RichText::new(format!("Preamble ({} lines)", l.preamble.len())).font(font_ui(11.5)).color(p.muted),
+                        )
+                        .id_salt(("pb_files_preamble", &s.id))
+                        .show(ui, |ui| {
+                            for line in &l.preamble {
+                                ui.label(RichText::new(line).font(egui::FontId::monospace(11.0)).color(p.muted));
+                            }
+                        });
+                    }
+                }
             }
 
             ui.add_space(space::SECTION);
@@ -429,5 +539,22 @@ mod tests {
         assert!(l[0].columns.is_empty());
         assert!(l[0].connected);
         assert!(parse_live("").is_empty());
+    }
+
+    #[test]
+    fn header_mode_json_and_live_detection() {
+        let p = |j: &str| serde_json::from_str::<HeaderMode>(j).unwrap();
+        assert_eq!(p("true"), HeaderMode::Auto, "legacy checkbox on");
+        assert_eq!(p("false"), HeaderMode::None);
+        assert_eq!(p("\"auto\""), HeaderMode::Auto);
+        assert_eq!(p("5"), HeaderMode::Line(5));
+        for m in [HeaderMode::Auto, HeaderMode::None, HeaderMode::Line(3)] {
+            assert_eq!(p(&serde_json::to_string(&m).unwrap()), m);
+        }
+        let old: FileSource = serde_json::from_str(r#"{"id":"m","parser":"csv","header_row":true}"#).unwrap();
+        assert_eq!(old.header_row, HeaderMode::Auto);
+        let l = parse_live(r#"{"sources":[{"id":"m","header":"2 preamble lines · names on line 3","preamble":["Rig 4","Op: Sam"]}]}"#);
+        assert_eq!(l[0].preamble, vec!["Rig 4", "Op: Sam"]);
+        assert!(l[0].header.contains("names on line 3"));
     }
 }

@@ -39,10 +39,15 @@ pub enum EngineId {
     Http,
     Snmp,
     Las,
+    Wits,
+    WebSocket,
+    Sparkplug,
+    Dnp3,
+    Can,
 }
 
 impl EngineId {
-    pub const ALL: [EngineId; 8] = [
+    pub const ALL: [EngineId; 13] = [
         EngineId::Streams,
         EngineId::Modbus,
         EngineId::Mqtt,
@@ -51,7 +56,28 @@ impl EngineId {
         EngineId::Http,
         EngineId::Snmp,
         EngineId::Las,
+        EngineId::Wits,
+        EngineId::WebSocket,
+        EngineId::Sparkplug,
+        EngineId::Dnp3,
+        EngineId::Can,
     ];
+
+    /// Slot for an ext protocol section key (`wits`, `websocket`, …).
+    pub fn from_ext(id: &str) -> Option<EngineId> {
+        Self::ALL.into_iter().find(|e| e.pack_id() == Some(id) && e.is_ext())
+    }
+
+    /// True for the protocols configured through the generic ext path.
+    pub fn is_ext(self) -> bool {
+        matches!(self, Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can)
+    }
+
+    /// Slots whose packs take host point writes (Output binds). The engine sends egress to
+    /// every connected one.
+    pub fn takes_egress(self) -> bool {
+        !matches!(self, Self::OpcUa | Self::FileFollow | Self::Snmp)
+    }
 
     /// Human title for the engine (matches the pack `TITLE`).
     pub fn title(self) -> &'static str {
@@ -64,6 +90,11 @@ impl EngineId {
             Self::Http => "HTTP / REST",
             Self::Snmp => "SNMP",
             Self::Las => "LAS",
+            Self::Wits => "WITS",
+            Self::WebSocket => "WebSocket",
+            Self::Sparkplug => "Sparkplug B",
+            Self::Dnp3 => "DNP3",
+            Self::Can => "CAN",
         }
     }
 
@@ -78,6 +109,11 @@ impl EngineId {
             Self::FileFollow => Some("files"),
             Self::Snmp => Some("snmp"),
             Self::Las => Some("las"),
+            Self::Wits => Some("wits"),
+            Self::WebSocket => Some("websocket"),
+            Self::Sparkplug => Some("sparkplug"),
+            Self::Dnp3 => Some("dnp3"),
+            Self::Can => Some("can"),
         }
     }
 
@@ -100,6 +136,11 @@ impl EngineId {
             Self::Http => "HTTP / REST pack — outbound client poll (Input) and JSON body push (Output).",
             Self::Snmp => "SNMP pack — v2c GET poll of agent OIDs (Input).",
             Self::Las => "LAS pack — follow LAS 2.0 well-log files (Input) and write curve rows (Output).",
+            Self::Wits => "WITS pack — WITS level 0 record streams over TCP / serial (Input + Output).",
+            Self::WebSocket => "WebSocket pack — JSON messages from a ws:// client or to a listening server.",
+            Self::Sparkplug => "Sparkplug B pack — host (decode NBIRTH / NDATA) and edge node (publish).",
+            Self::Dnp3 => "DNP3 pack — TCP master: class polls, binary / analog / counter points, controls.",
+            Self::Can => "CAN pack — SocketCAN signals in (frame decode) and out (frame encode).",
         }
     }
 
@@ -479,7 +520,9 @@ fn host_main(
     // Last payload string published per point (deadband must not republish holds).
     let mut egress_payload: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    let mut mqtt_was_connected = false;
+    // Egress slots connected on the previous tick: a slot that just connected gets every
+    // current value once (otherwise it would only see points that change later).
+    let mut prev_egress: Vec<EngineId> = Vec::new();
 
     loop {
         let queued = match rx.recv_timeout(Duration::from_millis(200)) {
@@ -573,62 +616,33 @@ fn host_main(
             }
         }
 
-        // Live Output publish: push transformed values to connected egress packs.
-        let mqtt_connected = engines
+        // Live Output publish: push transformed values to every connected egress pack.
+        let egress: Vec<EngineId> = engines
             .iter()
-            .find(|e| e.id() == EngineId::Mqtt)
-            .map(|e| e.snapshot().connected)
-            .unwrap_or(false);
-        let streams_connected = engines
-            .iter()
-            .find(|e| e.id() == EngineId::Streams)
-            .map(|e| e.snapshot().connected)
-            .unwrap_or(false);
-        let http_connected = engines
-            .iter()
-            .find(|e| e.id() == EngineId::Http)
-            .map(|e| e.snapshot().connected)
-            .unwrap_or(false);
-        let modbus_connected = engines
-            .iter()
-            .find(|e| e.id() == EngineId::Modbus)
-            .map(|e| e.snapshot().connected)
-            .unwrap_or(false);
-        let las_connected = engines
-            .iter()
-            .find(|e| e.id() == EngineId::Las)
-            .map(|e| e.snapshot().connected)
-            .unwrap_or(false);
-        let any_egress = mqtt_connected || streams_connected || http_connected || modbus_connected || las_connected;
-        if any_egress {
-            let force_all = !mqtt_was_connected;
-            mqtt_was_connected = true;
-            let to_pub: Vec<(String, String)> = if force_all {
-                last_out
-                    .iter()
-                    .map(|(n, v)| (n.clone(), v.clone()))
-                    .collect()
-            } else {
-                dirty_out
-            };
-            for (name, value) in to_pub {
+            .filter(|e| e.id().takes_egress() && e.snapshot().connected)
+            .map(|e| e.id())
+            .collect();
+        let fresh: Vec<EngineId> = egress.iter().copied().filter(|id| !prev_egress.contains(id)).collect();
+        if !fresh.is_empty() {
+            // Newly connected packs: send every current value (no deadband check).
+            for (name, value) in &last_out {
+                for &id in &fresh {
+                    if let Some(engine) = engines.iter_mut().find(|e| e.id() == id) {
+                        engine.handle(EngineCommand::WritePoint { name: name.clone(), value: value.clone() });
+                    }
+                }
+                egress_payload.insert(name.clone(), value.clone());
+            }
+        }
+        let steady: Vec<EngineId> = egress.iter().copied().filter(|id| prev_egress.contains(id)).collect();
+        if !steady.is_empty() {
+            for (name, value) in dirty_out {
                 // Deadband hold: same payload as last publish → skip (no Explorer jitter).
-                if !force_all && egress_payload.get(&name) == Some(&value) {
+                if egress_payload.get(&name) == Some(&value) {
                     continue;
                 }
                 let mut ok = false;
-                for id in [EngineId::Mqtt, EngineId::Streams, EngineId::Http, EngineId::Modbus, EngineId::Las] {
-                    let connected = match id {
-                        EngineId::Mqtt => mqtt_connected,
-                        EngineId::Streams => streams_connected,
-                        EngineId::Http => http_connected,
-                        EngineId::Modbus => modbus_connected,
-                        EngineId::Las => las_connected,
-                        _ => false,
-                    };
-                    if !connected {
-                        continue;
-                    }
+                for &id in &steady {
                     if let Some(engine) = engines.iter_mut().find(|e| e.id() == id) {
                         ok |= engine.handle(EngineCommand::WritePoint {
                             name: name.clone(),
@@ -640,11 +654,12 @@ fn host_main(
                     egress_payload.insert(name, value);
                 }
             }
-        } else {
-            mqtt_was_connected = false;
+        }
+        if egress.is_empty() {
             // Keep calc_rt / last_out so preview stays coherent across disconnects.
             egress_payload.clear();
         }
+        prev_egress = egress;
         publish(
             &snap,
             snapshot_of(

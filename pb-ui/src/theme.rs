@@ -361,6 +361,13 @@ pub fn form_inset(full: egui::Rect) -> egui::Rect {
     )
 }
 
+/// Placeholder (hint) text: dimmed, italic muted. The theme sets
+/// `override_text_color`, which would otherwise paint hints at full strength.
+pub fn hint(ui: &egui::Ui, text: impl Into<String>) -> egui::RichText {
+    let c = ui.visuals().widgets.noninteractive.fg_stroke.color;
+    egui::RichText::new(text.into()).italics().color(c.gamma_multiply(0.55))
+}
+
 /// Restore form rhythm on a Ui whose ancestors zeroed spacing (dock splitters).
 pub fn apply_form_spacing(ui: &mut egui::Ui) {
     let s = ui.spacing_mut();
@@ -614,5 +621,60 @@ mod tests {
             assert!(radius < screen.y * 0.5);
             assert!(radius > screen.x.min(screen.y) * 0.4);
         }
+    }
+}
+
+#[cfg(test)]
+mod glyph_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Non-ASCII characters on code lines (comments skipped) of every UI source file, with
+    /// where each first appears. Help article bodies are rendered too, so they are included.
+    fn ui_chars() -> BTreeMap<char, String> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = BTreeMap::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().map_or(true, |e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                // Trailing `// …` comments: only cut when no string is open before them.
+                let code = match code.find(" // ") {
+                    Some(i) if code[..i].matches('"').count() % 2 == 0 => &code[..i],
+                    _ => code,
+                };
+                for c in code.chars().filter(|c| !c.is_ascii()) {
+                    out.entry(c).or_insert_with(|| {
+                        format!("{}:{}", path.file_name().unwrap().to_string_lossy(), n + 1)
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_ui_character_has_a_glyph() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let mut missing = Vec::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            let chars = ui_chars();
+            ctx.fonts(|fonts| {
+                for (c, at) in &chars {
+                    if !fonts.has_glyph(&font_ui(13.0), *c) {
+                        missing.push(format!("U+{:04X} {c:?} at {at}", *c as u32));
+                    }
+                }
+            });
+        });
+        assert!(missing.is_empty(), "characters the UI font cannot draw (shows as a box):\n{}", missing.join("\n"));
     }
 }

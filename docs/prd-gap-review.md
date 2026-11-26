@@ -1,8 +1,31 @@
 # PRD gap review
 
-Reviewed 2026-11-19 against the code on `main`. `[x]` done, `[ ]` open.
+Reviewed 2026-11-19, updated 2026-11-25 against the working tree. `[x]` done, `[ ]` open.
 
-## Done in this pass (UI)
+## 2026-11-25 pass — register maps, five new protocols, MCP, demo plants
+
+- [x] **Modbus register map editor** (`pb-ui/src/register_map.rs`) for hub Inputs, Outputs and Server maps: + Register / + Block, device templates (power meter, VFD status / command, tank, frac pump, flow computer, pump commands), CSV import / export (foreign headers, Modicon refs), Modicon / 0-based address toggle, memory strip per area (overlaps red on servers), table with tag name / area badge / type / scaling / point / live value, inline edit card, point picker, request-count summary. 8 tests.
+- [x] **Engineering scaling + tag names + units** on Modbus binds (`scale`, `offset`, `name`, `units`); pack applies scaling on reads and inverts it on client writes and server-map pushes (`codec::Scaling`, tests incl. an end-to-end pack test). f32 values widen to their shortest decimal (`21.7`, not `21.700000762939453`).
+- [x] **Ext protocol framework**: `pb_points::addr::EXT_PROTOCOLS` (shared address rules), `EngineId` slots, generic `build_ext_configure` + point materialisation in the service, `pb-extkit` pack runtime, schema-driven UI (`pb-ui/src/ext_proto.rs`: panel, hub inspector with "seen on the wire" chips, persistence).
+- [x] **WITS** (`pb-wits`): level 0 blocks over TCP client / listen / serial, both directions, null values and stale detection → bad quality. 7 tests.
+- [x] **WebSocket** (`pb-websocket`, tungstenite): client (ws / wss, subscribe message) and server (fans out to browsers, current picture on connect, reads their messages). 3 tests.
+- [x] **Sparkplug B** (`pb-sparkplug` + `pb-proto::sparkplug` hand-written protobuf): host (BIRTH aliases, DATA, DEATH → bad, NCMD / DCMD) and edge node (NBIRTH / DBIRTH / NDATA / DDATA, bdSeq, NDEATH will, rebirth). End-to-end test through an embedded broker.
+- [x] **DNP3** (`pb-dnp3` + `pb-proto::dnp3`): TCP master — link CRC, transport reassembly, class 0 / 1 / 2 / 3 polls, g1/g2/g10/g11/g20/g22/g30/g32/g40/g42, ONLINE flag → quality, restart clear, CROB + analog output controls; demo outstation. 6 tests.
+- [x] **CAN** (`pb-can` + `pb-proto::can`): SocketCAN raw sockets, DBC-style Intel / Motorola signals, signed / float, J1939 `pgn:` matching, frame transmit. Codec tests; live vcan test runs when `vcan0` exists.
+- [x] **Engine egress** goes to every connected pack that takes writes; a pack that connects late gets every current value once.
+- [x] **MCP server on the service** (`pb-service/src/mcp.rs`, PRD #14): Streamable HTTP on 127.0.0.1, bearer auth (IPC token), 11 tools. Tests + live HTTP check.
+- [x] **Demo plants** (`pb-sim`, all Rust): frac spread, bottling line, lift station projects in `../protocol-bench-projects/`; `scripts/demo-smoke.sh` runs each through the real service (all three pass). `PB_AUTO_RUN_HUBS=1` for headless runs; `PB_UI_SELECT=hub:node` opens a node at UI start.
+- [x] UI: header hub state follows the service even when the MQTT / OPC UA panels are closed; help articles for every new protocol, the register map editor, the demos and MCP.
+
+### Still open after this pass
+
+- [ ] Modbus Bench pass and real hardware for every protocol (all new packs are tested against in-repo fakes / simulators only; CAN only if `vcan0` exists).
+- [ ] DNP3 over serial, DNP3 outstation role, secure authentication. Sparkplug DataSets / Templates / primary-host STATE. SNMPv3 / SET / traps. WITSML.
+- [ ] MCP edits are not pushed to an open UI (it keeps its own copy until the project is reopened).
+- [ ] Windows: new packs untested there (CAN reports "needs Linux"); MSI not started.
+- [ ] Two-serial + two-TCP and restart-restores-bridges acceptance tests still have no automated coverage.
+
+## Done in the 2026-11-19 pass (UI)
 
 - [x] **Modbus panel** — connections: client / server, TCP / RTU, serial line settings, unit, timeout, retries (`pb-ui/src/modbus_panel.rs`).
 - [x] **Modbus hub node configs** — Input (client, poll, register binds → `modbus_N`), Output (point → coil / holding), hub Server picker.
@@ -16,8 +39,8 @@ Reviewed 2026-11-19 against the code on `main`. `[x]` done, `[ ]` open.
 
 - [ ] Modbus is done in the pack for TCP + RTU client and server, but only exercised against fakes: no real device, no real serial port, and no Modbus Bench pass yet (phase 7).
 - [ ] Live link state, quality and last error per endpoint in the UI — the Modbus pack reports state / error / client count per connection already (`topics_json`); the panel does not show it yet (phase 6). 
-- [ ] MCP server on the service (PRD #14 — no schema yet).
-- [ ] Sparkplug B, DNP3, WebSocket, CAN, WITS — in the PRD protocol list, nothing built.
+- [x] MCP server on the service (PRD #14) — built 2026-11-25.
+- [x] Sparkplug B, DNP3, WebSocket, CAN, WITS — built 2026-11-25 (see above).
 - [ ] Windows: service host is scaffolded only; MSI / `cargo-wix` not started (PRD says hold until license details land).
 - [ ] Output binds exist for Modbus (client writes) only; OPC UA, File and SNMP outputs are not available.
 - [ ] Two-serial + two-TCP and restart-restores-bridges acceptance tests (PRD "Done when") have no automated coverage.
