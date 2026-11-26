@@ -150,6 +150,11 @@ Moving a value between a serial instrument, a Modbus device, a log file, an MQTT
 | File follow | Growing CSV and JSON-lines files |
 | LAS | LAS 2.0 well logs — follow and write |
 | SNMP | v1 / v2c GET polling |
+| WITS | WITS level 0 in and out, over TCP or serial |
+| WebSocket | JSON client and server |
+| Sparkplug B | Host and edge node |
+| DNP3 | TCP master: polls and controls |
+| CAN | SocketCAN signals, including J1939 PGNs |
 
 > New here? Read **Quick start** next, then **Core concepts**.
 "#,

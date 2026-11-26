@@ -26,12 +26,34 @@ done
 PACKS=(pb-mqtt pb-opcua pb-streams pb-http pb-modbus pb-files pb-snmp pb-las pb-wits pb-websocket pb-sparkplug pb-dnp3 pb-can)
 
 echo "==> stopping old service / UI"
-pkill -x protocol-bench 2>/dev/null || true
-pkill -x pb-service 2>/dev/null || true
-for _ in $(seq 20); do
-  pgrep -x pb-service >/dev/null || pgrep -x protocol-bench >/dev/null || break
-  sleep 0.25
-done
+# pgrep hangs on a process stuck in the kernel, so scan /proc directly.
+pids_named() {  # print PIDs whose comm is $1
+  local p c
+  for p in /proc/[0-9]*; do
+    { read -r c < "$p/comm"; } 2>/dev/null || continue
+    [ "$c" = "$1" ] && echo "${p#/proc/}"
+  done
+}
+stale() { [ -n "$(pids_named pb-service)$(pids_named protocol-bench)" ]; }
+for pid in $(pids_named protocol-bench) $(pids_named pb-service); do kill "$pid" 2>/dev/null || true; done
+for _ in $(seq 20); do stale || break; sleep 0.25; done
+if stale; then
+  for pid in $(pids_named protocol-bench) $(pids_named pb-service); do kill -KILL "$pid" 2>/dev/null || true; done
+  for _ in $(seq 20); do stale || break; sleep 0.25; done
+fi
+if stale; then
+  # A process in uninterruptible sleep (state D, usually a driver call) ignores
+  # even SIGKILL until the kernel releases it. Starting a new service now would
+  # fight it for ports, so stop here and say so.
+  for name in pb-service protocol-bench; do
+    for pid in $(pids_named "$name"); do
+      st=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || echo "?")
+      echo "error: $name (pid $pid) is still running, state $st" >&2
+      [ "$st" = "D" ] && echo "       state D = stuck in the kernel; it cannot be killed until it returns. Try again later, or reboot." >&2
+    done
+  done
+  exit 1
+fi
 
 echo "==> building ($profile)"
 args=(); for p in "${PACKS[@]}"; do args+=(-p "$p"); done
