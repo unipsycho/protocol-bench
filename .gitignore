@@ -9,3 +9,6 @@ modules/*.dylib
 
 # local OPC UA PKI scratch (never commit)
 pki/
+
+# trunk build lock (dashboard web app)
+pb-dashboard/dist/.trunk-lock

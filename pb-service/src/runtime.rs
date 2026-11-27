@@ -269,7 +269,10 @@ impl Runtime {
         // Ext protocols (WITS, WebSocket, Sparkplug B, DNP3, CAN) share one config shape.
         for spec in pb_points::addr::EXT_PROTOCOLS {
             let Some(id) = EngineId::from_ext(spec.id) else { continue };
-            let section = value.get(spec.id).cloned().unwrap_or_else(|| serde_json::json!({}));
+            let mut section = value.get(spec.id).cloned().unwrap_or_else(|| serde_json::json!({}));
+            if spec.id == "dashboard" {
+                add_dashboard_dirs(&mut section, &self.project_path);
+            }
             let json = build_ext_configure(spec, &section, value.get("hubs"));
             self.engine.submit(id, pb_engine::EngineCommand::Configure { json });
         }
@@ -1098,6 +1101,22 @@ fn build_modbus_configure(modbus: &serde_json::Value, hubs: Option<&serde_json::
     serde_json::json!({ "connections": connections, "inputs": inputs, "outputs": outputs }).to_string()
 }
 
+/// Saved dashboards live next to the service's other state, in
+/// `<config dir>/dashboards/<project name>/<connection id>/`, so two projects (or two dashboard
+/// nodes) never share layouts. Each dashboard connection is handed its folder as `data_dir`.
+fn add_dashboard_dirs(section: &mut serde_json::Value, project: &std::path::Path) {
+    let Some(root) = pb_ipc::config_dir().map(|d| d.join("dashboards")) else { return };
+    let stem = project.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
+    let stem: String = stem.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ') { c } else { '_' }).collect();
+    for c in section.get_mut("connections").and_then(|v| v.as_array_mut()).into_iter().flatten() {
+        let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if id.is_empty() || id.contains(['/', '\\']) {
+            continue;
+        }
+        c["data_dir"] = serde_json::json!(root.join(&stem).join(&id).to_string_lossy());
+    }
+}
+
 /// Where File follow keeps its per-source byte offsets (`<config dir>/file-follow`).
 fn files_state_dir(sub: &str) -> Option<String> {
     pb_ipc::config_dir().map(|d| d.join(sub).to_string_lossy().into_owned())
@@ -1220,6 +1239,18 @@ fn build_ext_configure(spec: &pb_points::addr::ExtSpec, section: &serde_json::Va
 #[cfg(test)]
 mod ext_tests {
     use super::*;
+
+    #[test]
+    fn dashboard_connections_get_a_private_folder() {
+        let mut sec = serde_json::json!({"connections":[{"id":"dash_1_9"},{"id":"../x"},{"id":""}]});
+        add_dashboard_dirs(&mut sec, std::path::Path::new("/p/My Plant.json"));
+        let dir = sec["connections"][0]["data_dir"].as_str().unwrap_or_default().to_string();
+        if pb_ipc::config_dir().is_some() {
+            assert!(dir.ends_with("dashboards/My Plant/dash_1_9"), "{dir}");
+            assert!(sec["connections"][1].get("data_dir").is_none(), "path-like ids are skipped");
+            assert!(sec["connections"][2].get("data_dir").is_none());
+        }
+    }
 
     #[test]
     fn ext_config_splits_ports_and_adds_sources() {

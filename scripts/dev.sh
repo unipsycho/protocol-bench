@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-PACKS=(pb-mqtt pb-opcua pb-streams pb-http pb-modbus pb-files pb-snmp pb-las pb-wits pb-websocket pb-sparkplug pb-dnp3 pb-can pb-gen)
+PACKS=(pb-mqtt pb-opcua pb-streams pb-http pb-modbus pb-files pb-snmp pb-las pb-wits pb-websocket pb-sparkplug pb-dnp3 pb-can pb-gen pb-dashboard)
 
 echo "==> stopping old service / UI"
 # pgrep hangs on a process stuck in the kernel, so scan /proc directly.

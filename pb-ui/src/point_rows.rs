@@ -789,7 +789,7 @@ pub fn rows_for_points_panel(
                         });
                     }
                 }
-                HubProto::Wits | HubProto::WebSocket | HubProto::Sparkplug | HubProto::Dnp3 | HubProto::Can | HubProto::Gen => {
+                HubProto::Wits | HubProto::WebSocket | HubProto::Sparkplug | HubProto::Dnp3 | HubProto::Can | HubProto::Gen | HubProto::Dashboard => {
                     let Some(e) = port.protocol.ext() else { continue };
                     for bind in &port.ext_inputs {
                         let Some(source) = crate::ext_proto::bind_source(e, &port.ext_connection, bind) else { continue };

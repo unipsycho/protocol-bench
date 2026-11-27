@@ -50,7 +50,7 @@ fn output_routes(port: &HubPort) -> Vec<(String, String)> {
                 out.push((b.point.clone(), format!("las/{}::{}", port.las_endpoint, b.curve)));
             }
         }
-        HubProto::Wits | HubProto::WebSocket | HubProto::Sparkplug | HubProto::Dnp3 | HubProto::Can | HubProto::Gen => {
+        HubProto::Wits | HubProto::WebSocket | HubProto::Sparkplug | HubProto::Dnp3 | HubProto::Can | HubProto::Gen | HubProto::Dashboard => {
             if let Some(e) = port.protocol.ext() {
                 let conn = if port.ext_connection.is_empty() { e.id() } else { port.ext_connection.as_str() };
                 for b in &port.ext_outputs {

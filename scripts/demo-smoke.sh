@@ -9,7 +9,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 PROJECTS="$ROOT/../protocol-bench-projects"
-cargo build -q -p pb-mqtt -p pb-opcua -p pb-modbus -p pb-las -p pb-wits -p pb-websocket -p pb-sparkplug -p pb-dnp3 -p pb-can -p pb-gen -p pb-service -p pb-sim || exit 1
+cargo build -q -p pb-mqtt -p pb-opcua -p pb-modbus -p pb-las -p pb-wits -p pb-websocket -p pb-sparkplug -p pb-dnp3 -p pb-can -p pb-gen -p pb-dashboard -p pb-service -p pb-sim || exit 1
 WORK="$(mktemp -d)"
 cleanup() { [ -n "${SVC:-}" ] && kill "$SVC" 2>/dev/null; [ -n "${SIM:-}" ] && kill "$SIM" 2>/dev/null; wait 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT

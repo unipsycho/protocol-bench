@@ -1238,6 +1238,10 @@ impl eframe::App for ProtocolBenchApp {
             });
 
         self.handle_drop(ctx, &p);
+        // Dashboard nodes own their connections: keep them in step even when the Hubs pane is hidden.
+        if crate::ext_proto::sync_dashboard_conns(&mut self.ui_state.hubs, &mut self.ext.get_mut(crate::ext_proto::ExtProto::Dashboard).conns) {
+            self.mark_dirty();
+        }
         self.autosave();
         self.autosave_project(&host_for_panes);
         // Next data poll only — do not chase mouse FPS for live values (PB-64). When nothing
@@ -3026,7 +3030,7 @@ fn tile_splitter(
     None
 }
 
-fn open_in_browser(url: &str) {
+pub(crate) fn open_in_browser(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 

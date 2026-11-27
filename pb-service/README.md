@@ -6,7 +6,7 @@ Always-on Protocol Bench host: loads protocol packs, owns `project.json`, serves
 
 ```bash
 cargo build -p pb-mqtt -p pb-opcua -p pb-streams -p pb-http -p pb-modbus -p pb-files -p pb-snmp -p pb-las \
-            -p pb-wits -p pb-websocket -p pb-sparkplug -p pb-dnp3 -p pb-can -p pb-gen -p pb-service
+            -p pb-wits -p pb-websocket -p pb-sparkplug -p pb-dnp3 -p pb-can -p pb-gen -p pb-dashboard -p pb-service
 mkdir -p modules && cp target/debug/libpb_*.so modules/
 PB_MODULES=$PWD/modules cargo run -p pb-service
 # optional: PB_IPC_PORT=17500 PB_PROJECT=/path/to/project.json PB_NO_TRAY=1

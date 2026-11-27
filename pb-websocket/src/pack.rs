@@ -231,6 +231,22 @@ fn run_client(mut ctx: LinkCtx) {
     }
 }
 
+/// Built-in viewer page: any plain HTTP GET on the server port gets this, so a browser
+/// can confirm the feed by opening `http://host:port/`.
+const VIEWER_HTML: &str = include_str!("viewer.html");
+
+fn route(req: &pb_webserve::Request) -> pb_webserve::Response {
+    use pb_webserve::Response;
+    if req.method != "GET" && req.method != "HEAD" {
+        return Response::method_not_allowed();
+    }
+    if req.path == "/" || req.path.starts_with("/viewer") {
+        Response::html(VIEWER_HTML)
+    } else {
+        Response::text(404, "Not found — the viewer lives at /")
+    }
+}
+
 fn run_server(mut ctx: LinkCtx) {
     let host = ctx.conn.s("host", "0.0.0.0");
     let port = ctx.conn.n("port", 8765.0) as u16;
@@ -250,23 +266,39 @@ fn run_server(mut ctx: LinkCtx) {
         let _ = listener.set_nonblocking(true);
         ctx.up(format!("listening ws://{host}:{port}"));
         let mut peers: Vec<WebSocket<TcpStream>> = Vec::new();
+        let (joined_tx, joined_rx) = std::sync::mpsc::channel::<WebSocket<TcpStream>>();
         let mut pending: Vec<(String, String)> = Vec::new();
         let mut next = Instant::now();
         while !ctx.stopped() {
             while let Ok((s, _)) = listener.accept() {
-                let _ = s.set_nonblocking(false);
-                let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
-                if let Ok(mut ws) = tungstenite::accept(s) {
-                    let _ = ws.get_ref().set_read_timeout(Some(Duration::from_millis(5)));
-                    // A new viewer gets the current picture straight away.
-                    if !ctx.outputs.is_empty() {
-                        let all: Vec<(String, String)> = ctx.latest.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                        for m in output_messages(&ctx, &all, "object") {
-                            let _ = ws.send(Message::text(m));
+                // Classify + handshake off the worker thread so a slow or silent client can't
+                // stall the live feed to everyone else.
+                let tx = joined_tx.clone();
+                std::thread::spawn(move || {
+                    let _ = s.set_nonblocking(false);
+                    let s = match pb_webserve::classify(s, Duration::from_secs(3)) {
+                        pb_webserve::Incoming::WebSocket(s) => s,
+                        pb_webserve::Incoming::Http(req, mut s) => {
+                            let _ = pb_webserve::respond(&mut s, route(&req));
+                            return;
                         }
+                        pb_webserve::Incoming::Dropped => return,
+                    };
+                    if let Ok(ws) = tungstenite::accept(s) {
+                        let _ = tx.send(ws);
                     }
-                    peers.push(ws);
+                });
+            }
+            while let Ok(mut ws) = joined_rx.try_recv() {
+                let _ = ws.get_ref().set_read_timeout(Some(Duration::from_millis(5)));
+                // A new viewer gets the current picture straight away.
+                if !ctx.outputs.is_empty() {
+                    let all: Vec<(String, String)> = ctx.latest.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    for m in output_messages(&ctx, &all, "object") {
+                        let _ = ws.send(Message::text(m));
+                    }
                 }
+                peers.push(ws);
             }
             let mut texts = Vec::new();
             peers.retain_mut(|ws| loop {
@@ -352,6 +384,26 @@ mod tests {
         let d: Value = serde_json::from_str(&p.detail_json()).unwrap();
         assert_eq!(d["connections"][0]["peers"], 1);
         assert!(d["connections"][0]["seen"].as_array().unwrap().iter().any(|x| x["leaf"]["path"] == "cmd.speed"));
+    }
+
+    #[test]
+    fn plain_http_get_serves_the_viewer_page() {
+        use std::io::{Read, Write};
+        let (_log, host) = testhost::host();
+        let port = testhost::free_port();
+        let mut p = ExtPack::new(host, "websocket", run, endpoint, check);
+        p.configure(&serde_json::json!({"connections":[{"id":"dash","mode":"server","host":"127.0.0.1","port":port}]}).to_string()).unwrap();
+        let mut c = loop {
+            if let Ok(c) = TcpStream::connect(("127.0.0.1", port)) {
+                break c;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert!(out.contains("new WebSocket"));
     }
 
     #[test]

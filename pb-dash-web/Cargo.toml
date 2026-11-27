@@ -1,0 +1,27 @@
+[package]
+name = "pb-dash-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Dashboard browser app (egui compiled to wasm); built with scripts/build-dashboard.sh and served by pb-dashboard"
+
+[dependencies]
+pb-dash-model = { workspace = true }
+serde_json = { workspace = true }
+# Own egui (newer than the desktop app's workspace 0.29): 0.36 positions glyphs at sub-pixel
+# accuracy with proper shaping, so small text has even letter spacing in the browser.
+egui = "0.36"
+# The web build wants glow only, no native windowing.
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native build = a demo window with synthetic data, used for development and screenshots.
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "Location", "History", "WebSocket", "MessageEvent", "CloseEvent", "Event", "Request", "RequestInit", "Response", "Headers"] }

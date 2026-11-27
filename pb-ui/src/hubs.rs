@@ -89,10 +89,12 @@ pub enum HubProto {
     Can,
     /// Generator — a synthetic source (Input only; nothing wires into it).
     Gen,
+    /// Dashboard — a browser page fed by Outputs (nothing is read from it).
+    Dashboard,
 }
 
 impl HubProto {
-    pub const ALL: [HubProto; 14] = [
+    pub const ALL: [HubProto; 15] = [
         HubProto::Streams,
         HubProto::Modbus,
         HubProto::Mqtt,
@@ -107,12 +109,14 @@ impl HubProto {
         HubProto::Dnp3,
         HubProto::Can,
         HubProto::Gen,
+        HubProto::Dashboard,
     ];
 
     /// Protocols the Protocol dropdown offers on an Input (`incoming`) or an Output. A Generator
-    /// only produces data, so it is never offered on an Output.
+    /// only produces data, so it is never offered on an Output; a Dashboard only consumes, so it
+    /// is never offered on an Input.
     pub fn offered(incoming: bool) -> impl Iterator<Item = HubProto> {
-        Self::ALL.into_iter().filter(move |p| incoming || *p != HubProto::Gen)
+        Self::ALL.into_iter().filter(move |p| if incoming { *p != HubProto::Dashboard } else { *p != HubProto::Gen })
     }
 
     /// The ext protocol behind this node, if any.
@@ -125,6 +129,7 @@ impl HubProto {
             Self::Dnp3 => Some(ExtProto::Dnp3),
             Self::Can => Some(ExtProto::Can),
             Self::Gen => Some(ExtProto::Gen),
+            Self::Dashboard => Some(ExtProto::Dashboard),
             _ => None,
         }
     }
@@ -142,7 +147,7 @@ impl HubProto {
             Self::Http => "HTTP / REST",
             Self::Las => "LAS",
             Self::Snmp => "SNMP",
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => self.ext().map(|e| e.title()).unwrap_or(""),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen | Self::Dashboard => self.ext().map(|e| e.title()).unwrap_or(""),
         }
     }
 
@@ -156,7 +161,7 @@ impl HubProto {
             Self::Http => DockPane::Http,
             Self::Las => DockPane::Las,
             Self::Snmp => DockPane::Snmp,
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => {
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen | Self::Dashboard => {
                 self.ext().map(DockPane::from_ext).unwrap_or(DockPane::Hubs)
             }
         }
@@ -438,6 +443,13 @@ pub struct HubPort {
     /// Ext protocol Input poll / Output send interval (seconds).
     #[serde(default = "default_ext_interval")]
     pub ext_interval_secs: f32,
+    /// Dashboard node: page title and listen port. The node *is* the connection; the matching
+    /// `dashboard` connection is created and kept in step automatically
+    /// (`ext_proto::sync_dashboard_conns`). Port 0 = not chosen yet.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dash_title: String,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub dash_port: u16,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ext_inputs: Vec<serde_json::Map<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -511,6 +523,7 @@ fn default_stream_ts() -> String { "receive".into() }
 fn default_snmp_interval() -> f32 { 10.0 }
 fn default_modbus_interval() -> f32 { 1.0 }
 fn default_ext_interval() -> f32 { 1.0 }
+fn is_zero_u16(v: &u16) -> bool { *v == 0 }
 fn default_las_index() -> String { "depth".into() }
 
 impl HubPort {
@@ -555,6 +568,8 @@ impl HubPort {
             file_inputs: Vec::new(),
             ext_connection: String::new(),
             ext_interval_secs: default_ext_interval(),
+            dash_title: String::new(),
+            dash_port: 0,
             ext_inputs: Vec::new(),
             ext_outputs: Vec::new(),
             draft_modbus: None,
@@ -1982,6 +1997,17 @@ impl HubModel {
         }
         for hub in &mut self.hubs {
             for port in &mut hub.outputs {
+                if port.protocol == HubProto::Dashboard {
+                    // A Dashboard shows everything wired to it: one auto bind per wired point,
+                    // units kept across rebuilds, binds for points no longer wired dropped.
+                    let wired = by_out.get(&(hub.id, port.id)).cloned().unwrap_or_default();
+                    let next = crate::ext_proto::dashboard_auto_binds(&port.ext_outputs, &wired);
+                    if next != port.ext_outputs {
+                        port.ext_outputs = next;
+                        changed = true;
+                    }
+                    continue;
+                }
                 if port.protocol != HubProto::Mqtt {
                     continue;
                 }
@@ -4773,6 +4799,7 @@ fn edit_port(
             other_names,
             conn: &mut port.ext_connection,
             interval: &mut port.ext_interval_secs,
+            dash: Some((&mut port.dash_title, &mut port.dash_port)),
             inputs: &mut port.ext_inputs,
             outputs: &mut port.ext_outputs,
         };
@@ -8569,13 +8596,15 @@ mod tests {
     }
 
     #[test]
-    fn generator_is_offered_on_inputs_only() {
+    fn generator_is_offered_on_inputs_only_and_dashboard_on_outputs_only() {
         let inputs: Vec<HubProto> = HubProto::offered(true).collect();
         let outputs: Vec<HubProto> = HubProto::offered(false).collect();
         assert!(inputs.contains(&HubProto::Gen));
         assert!(!outputs.contains(&HubProto::Gen));
-        assert_eq!(inputs.len(), outputs.len() + 1);
+        assert!(outputs.contains(&HubProto::Dashboard) && !inputs.contains(&HubProto::Dashboard));
+        assert_eq!(inputs.len(), outputs.len());
         assert_eq!(HubProto::Gen.label(), "Generator");
+        assert_eq!(HubProto::Dashboard.label(), "Dashboard");
         assert!(!HubProto::Gen.hub_capable(), "a generator cannot own a hub");
     }
 
@@ -8754,6 +8783,26 @@ mod tests {
             binds.iter().any(|b| b.point == "mqtt_1" && b.auto),
             "calc point should auto-bind: {binds:?}"
         );
+    }
+
+    #[test]
+    fn arrows_into_a_dashboard_node_create_and_drop_its_points() {
+        let mut model = unwired_sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let out = model.hubs[1].outputs[0].id;
+        model.hub_mut(hub).unwrap().outputs[0].protocol = HubProto::Dashboard;
+        model.hub_mut(hub).unwrap().sources[0].mqtt_inputs.push(MqttInputBind { point: "mqtt_1".into(), ..Default::default() });
+        assert!(model.connect_feed(hub, src, hub, out));
+        assert!(model.sync_output_feed_binds(&[]));
+        let o = &model.hubs[1].outputs[0];
+        assert_eq!(o.ext_outputs.len(), 1);
+        assert_eq!(crate::ext_proto::text_of(&o.ext_outputs[0], "point"), "mqtt_1");
+        assert!(!model.sync_output_feed_binds(&[]), "stable");
+        // Cutting the arrow removes the point again.
+        model.feeds.retain(|f| f.to_node != out);
+        assert!(model.sync_output_feed_binds(&[]));
+        assert!(model.hubs[1].outputs[0].ext_outputs.is_empty());
     }
 
     #[test]

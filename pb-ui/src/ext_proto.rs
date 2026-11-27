@@ -37,6 +37,8 @@ pub enum ExtProto {
     Can,
     /// Generator: synthetic signals, no device.
     Gen,
+    /// Dashboard: a browser page fed by Output binds.
+    Dashboard,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,7 +125,7 @@ const WITS: UiSpec = UiSpec {
 };
 
 const WEBSOCKET: UiSpec = UiSpec {
-    blurb: "JSON over WebSocket. Dial a ws:// / wss:// feed as a client, or listen as a server so browsers and web dashboards get live points.",
+    blurb: "JSON over WebSocket. Dial a ws:// / wss:// feed as a client, or listen as a server so browsers and web dashboards get live points. A server also hosts a live viewer page at http://host:port/.",
     conn_fields: &[
         f("mode", "Mode", Kind::Choice(&[("client", "Client (dial a URL)"), ("server", "Server (listen)")]), Def::S("client"), 170.0, ""),
         fs("url", "URL", Kind::Text, Def::S("ws://127.0.0.1:8765/"), 240.0, "ws:// or wss://", ("mode", &["client"])),
@@ -331,8 +333,24 @@ const GEN: UiSpec = UiSpec {
     note: "Each signal below is one point. A signal's formula can read any other signal on the same board by name. Nothing can be wired into a generator.",
 };
 
+const DASHBOARD: UiSpec = UiSpec {
+    blurb: "A live web dashboard for everything Protocol Bench converts. The service hosts the page on its own port; anyone on the network can open it in a browser. Wire points to it with a hub Output node.",
+    conn_fields: &[
+        f("title", "Title", Kind::Text, Def::S("Dashboard"), 200.0, "shown at the top of the page"),
+        f("host", "Listen host", Kind::Text, Def::S("0.0.0.0"), 140.0, "0.0.0.0 = reachable from the network"),
+        f("port", "Port", INT(1.0, 65535.0), Def::N(8780.0), 70.0, ""),
+    ],
+    in_fields: &[],
+    out_fields: &[],
+    in_heading: "",
+    out_heading: "",
+    interval_in: None,
+    interval_out: Some(("Update every (s)", 0.25)),
+    note: "Anyone who can reach the port can view the dashboard. Everything wired into this node is available to the dashboard; choose what to show on the page itself.",
+};
+
 impl ExtProto {
-    pub const ALL: [ExtProto; 6] = [ExtProto::Wits, ExtProto::WebSocket, ExtProto::Sparkplug, ExtProto::Dnp3, ExtProto::Can, ExtProto::Gen];
+    pub const ALL: [ExtProto; 7] = [ExtProto::Wits, ExtProto::WebSocket, ExtProto::Sparkplug, ExtProto::Dnp3, ExtProto::Can, ExtProto::Gen, ExtProto::Dashboard];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -342,6 +360,7 @@ impl ExtProto {
             Self::Dnp3 => "dnp3",
             Self::Can => "can",
             Self::Gen => "gen",
+            Self::Dashboard => "dashboard",
         }
     }
 
@@ -353,6 +372,7 @@ impl ExtProto {
             Self::Dnp3 => "DNP3",
             Self::Can => "CAN bus",
             Self::Gen => "Generator",
+            Self::Dashboard => "Dashboard",
         }
     }
 
@@ -372,6 +392,7 @@ impl ExtProto {
             Self::Dnp3 => &DNP3,
             Self::Can => &CAN,
             Self::Gen => &GEN,
+            Self::Dashboard => &DASHBOARD,
         }
     }
 
@@ -388,6 +409,7 @@ impl ExtProto {
             Self::Dnp3 => Color32::from_rgb(0xb8, 0xe0, 0x5c),
             Self::Can => Color32::from_rgb(0xff, 0xd1, 0x66),
             Self::Gen => Color32::from_rgb(0x7d, 0xe0, 0x9a),
+            Self::Dashboard => Color32::from_rgb(0xb3, 0x9d, 0xff),
         }
     }
 
@@ -400,6 +422,7 @@ impl ExtProto {
             Self::Dnp3 => Color32::from_rgb(0x4a, 0x6e, 0x10),
             Self::Can => Color32::from_rgb(0x8a, 0x62, 0x00),
             Self::Gen => Color32::from_rgb(0x1d, 0x76, 0x3f),
+            Self::Dashboard => Color32::from_rgb(0x4a, 0x3a, 0xb0),
         }
     }
 
@@ -664,6 +687,8 @@ pub struct ExtSections {
     pub can: ExtSection,
     #[serde(default)]
     pub gen: ExtSection,
+    #[serde(default)]
+    pub dashboard: ExtSection,
 }
 
 impl ExtSections {
@@ -675,6 +700,7 @@ impl ExtSections {
             ExtProto::Dnp3 => &self.dnp3,
             ExtProto::Can => &self.can,
             ExtProto::Gen => &self.gen,
+            ExtProto::Dashboard => &self.dashboard,
         }
     }
     pub fn get_mut(&mut self, p: ExtProto) -> &mut ExtSection {
@@ -685,6 +711,7 @@ impl ExtSections {
             ExtProto::Dnp3 => &mut self.dnp3,
             ExtProto::Can => &mut self.can,
             ExtProto::Gen => &mut self.gen,
+            ExtProto::Dashboard => &mut self.dashboard,
         }
     }
     pub fn from_panels(panels: &ExtPanels) -> Self {
@@ -784,6 +811,7 @@ fn conn_summary(proto: ExtProto, c: &Obj) -> String {
         ExtProto::Sparkplug => format!("{} · {}:{} · {}{}", s("role"), s("host"), s("port"), s("group_id"), if s("edge_node_id").is_empty() { String::new() } else { format!("/{}", s("edge_node_id")) }),
         ExtProto::Dnp3 => format!("{}:{} · {} → {}", s("host"), s("port"), s("master_address"), s("outstation_address")),
         ExtProto::Can => format!("SocketCAN {}", s("interface")),
+        ExtProto::Dashboard => format!("http://{}:{}/", s("host"), s("port")),
         ExtProto::Gen => {
             let seed = s("seed");
             let speed = s("speed");
@@ -933,6 +961,23 @@ fn paint_panel_body(ui: &mut Ui, p: &ThemePalette, st: &mut ExtPanelState, host:
     }
     ui.add_space(4.0);
     dirty |= fields_form(ui, salt, spec.conn_fields, c, p);
+    if proto == ExtProto::Dashboard || (proto == ExtProto::WebSocket && text_of(c, "mode") == "server") {
+        ui.add_space(4.0);
+        let host = text_of(c, "host");
+        let host = if matches!(host.as_str(), "" | "0.0.0.0" | "::") { "localhost".to_string() } else { host };
+        let url = format!("http://{host}:{}/", text_of(c, "port"));
+        ui.horizontal(|ui| {
+            let (label, tip) = if proto == ExtProto::Dashboard {
+                ("Open dashboard in browser", "The live dashboard page served by this connection")
+            } else {
+                ("Open viewer in browser", "Live page served by this server — shows the points it sends")
+            };
+            if ui.button(label).on_hover_text(tip).clicked() {
+                crate::app::open_in_browser(&url);
+            }
+            ui.label(RichText::new(&url).font(font_mono(11.0)).color(p.muted));
+        });
+    }
     ui.add_space(space::AFTER_FIELD);
     ui.label(RichText::new(spec.note).font(font_ui(11.0)).color(p.muted));
 
@@ -982,6 +1027,9 @@ pub fn bind_label(proto: ExtProto, b: &Obj) -> String {
         let model = text_of(b, "model");
         let name = text_of(b, "name");
         return if model.is_empty() { name } else { format!("{name} · {model}") };
+    }
+    if proto == ExtProto::Dashboard {
+        return "dashboard".into();
     }
     if s.is_empty() {
         "(whole message)".into()
@@ -1039,6 +1087,8 @@ pub struct PortFields<'a> {
     pub other_names: Vec<String>,
     pub conn: &'a mut String,
     pub interval: &'a mut f32,
+    /// Dashboard node only: (page title, listen port).
+    pub dash: Option<(&'a mut String, &'a mut u16)>,
     pub inputs: &'a mut Vec<Obj>,
     pub outputs: &'a mut Vec<Obj>,
 }
@@ -1064,6 +1114,24 @@ pub fn edit_port(
     let spec = proto.spec();
     let ink = if p.is_light { proto.ink_deep() } else { proto.ink_core() };
     let mut dirty = false;
+    if let (ExtProto::Dashboard, Some((title, listen))) = (proto, port.dash) {
+        // The node is the connection: just a title and a port.
+        section(ui, "DASHBOARD", p);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Title").font(font_ui(12.0)).color(p.muted));
+            dirty |= ui.add(egui::TextEdit::singleline(title).desired_width(180.0).hint_text("Dashboard")).changed();
+            ui.label(RichText::new("Port").font(font_ui(12.0)).color(p.muted));
+            let mut v = (*listen).max(1) as u32;
+            if ui.add(egui::DragValue::new(&mut v).range(1..=65535).speed(1.0)).changed() {
+                *listen = v as u16;
+                dirty = true;
+            }
+            if let Some((label, _)) = spec.interval_out {
+                ui.label(RichText::new(label).font(font_ui(12.0)).color(p.muted));
+                dirty |= ui.add(egui::DragValue::new(port.interval).range(0.02..=3600.0).speed(0.05).max_decimals(2)).changed();
+            }
+        });
+    } else {
     section(ui, &format!("{} CONNECTION", proto.title().to_ascii_uppercase()), p);
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Connection").font(font_ui(12.0)).color(p.muted));
@@ -1085,6 +1153,7 @@ pub fn edit_port(
             dirty |= ui.add(egui::DragValue::new(port.interval).range(0.02..=3600.0).speed(0.05).max_decimals(2)).changed();
         }
     });
+    }
     let (live, pack_loaded) = live_for(host, proto);
     let link = live.iter().find(|l| l.id == *port.conn);
     if !port.conn.is_empty() {
@@ -1097,8 +1166,37 @@ pub fn edit_port(
             ui.label(RichText::new(&l.error).font(font_ui(11.0)).color(p.warn));
         }
     }
-    if conns.is_empty() {
+    if proto == ExtProto::Dashboard && !port.conn.is_empty() {
+        // The pack reports its real address once it is serving.
+        match link.filter(|l| l.endpoint.starts_with("http")).map(|l| viewer_url(&l.endpoint)) {
+            Some(url) => {
+                ui.horizontal(|ui| {
+                    if ui.button("Open dashboard in browser").on_hover_text("The live dashboard page served by this connection").clicked() {
+                        crate::app::open_in_browser(&url);
+                    }
+                    ui.label(RichText::new(&url).font(font_mono(11.0)).color(p.muted));
+                });
+            }
+            None => {
+                ui.label(RichText::new("Start the service and this connection to open the dashboard.").font(font_ui(11.0)).color(p.muted));
+            }
+        }
+    }
+    if conns.is_empty() && proto != ExtProto::Dashboard {
         ui.label(RichText::new(format!("Add a connection in the {} panel.", proto.title())).font(font_ui(11.0)).color(p.muted));
+    }
+    if proto == ExtProto::Dashboard {
+        // No bind list: everything wired into the node is exposed, and the dashboard page is
+        // where the user picks what to show.
+        ui.add_space(space::SECTION - 2.0);
+        let n = port.outputs.len();
+        let msg = if n == 0 {
+            "Nothing wired yet — draw an arrow from an Input into this node and its points become available on the dashboard.".to_string()
+        } else {
+            format!("{n} point{} wired in — all available on the dashboard.", if n == 1 { "" } else { "s" })
+        };
+        ui.label(RichText::new(msg).font(font_ui(11.5)).color(p.muted));
+        return dirty;
     }
     ui.add_space(space::SECTION - 2.0);
     section(ui, if incoming { spec.in_heading } else { spec.out_heading }, p);
@@ -1277,6 +1375,89 @@ fn n(r: Rect, x: f32, y: f32) -> egui::Pos2 {
     egui::pos2(r.min.x + r.width() * x, r.min.y + r.height() * y)
 }
 
+/// Binds for a Dashboard node: every wired point gets one (marked `auto`), in wire order, keeping
+/// the units already set; manual binds (no `auto` mark) are left alone; auto binds whose point is
+/// no longer wired go away.
+pub fn dashboard_auto_binds(current: &[Obj], wired: &[String]) -> Vec<Obj> {
+    let mut next: Vec<Obj> = current.iter().filter(|b| !matches!(b.get("auto"), Some(Value::Bool(true)))).cloned().collect();
+    for point in wired {
+        if next.iter().any(|b| text_of(b, "point") == *point) {
+            continue;
+        }
+        let mut b = current.iter().find(|b| text_of(b, "point") == *point).cloned().unwrap_or_else(|| obj_with_defaults(DASHBOARD.out_fields));
+        b.insert("point".into(), Value::from(point.clone()));
+        b.insert("auto".into(), Value::Bool(true));
+        next.push(b);
+    }
+    next
+}
+
+/// Connection id for a Dashboard node.
+pub fn dashboard_conn_id(hub_id: u64, port_id: u64) -> String {
+    format!("dash_{hub_id}_{port_id}")
+}
+
+/// A Dashboard node *is* its connection. Keep the `dashboard` connection list in step with the
+/// Dashboard Output nodes: one connection per node (id derived from the node, title / port / label
+/// from the node), none left over. A node from an older project (a hand-made connection picked in
+/// the old dropdown) adopts that connection's title and port; a fresh node gets the first free
+/// port from 8780. Idempotent; returns true when anything changed.
+pub fn sync_dashboard_conns(hubs: &mut crate::hubs::HubModel, conns: &mut Vec<Obj>) -> bool {
+    use crate::hubs::HubProto;
+    let old = conns.clone();
+    let mut want: Vec<Obj> = Vec::new();
+    let mut used: Vec<u16> = Vec::new();
+    // Ports already chosen, so a new node can't collide with them.
+    for h in &hubs.hubs {
+        for o in h.outputs.iter().filter(|o| o.protocol == HubProto::Dashboard) {
+            if o.dash_port != 0 {
+                used.push(o.dash_port);
+            }
+        }
+    }
+    for h in &mut hubs.hubs {
+        let hub_id = h.id;
+        for o in h.outputs.iter_mut().filter(|o| o.protocol == HubProto::Dashboard) {
+            if o.dash_port == 0 || o.dash_title.is_empty() {
+                // Adopt the old hand-made connection this node pointed at, if any.
+                if let Some(c) = old.iter().find(|c| text_of(c, "id") == o.ext_connection) {
+                    if o.dash_port == 0 {
+                        o.dash_port = text_of(c, "port").parse().unwrap_or(0);
+                    }
+                    if o.dash_title.is_empty() {
+                        o.dash_title = text_of(c, "title");
+                    }
+                }
+            }
+            if o.dash_port == 0 {
+                let free = (8780u16..=65535).find(|p| !used.contains(p)).unwrap_or(8780);
+                o.dash_port = free;
+                used.push(free);
+            }
+            let id = dashboard_conn_id(hub_id, o.id);
+            o.ext_connection = id.clone();
+            let mut c = old.iter().find(|c| text_of(c, "id") == id).cloned().unwrap_or_default();
+            c.insert("id".into(), Value::from(id));
+            c.insert("label".into(), Value::from(o.label.clone()));
+            c.insert("title".into(), Value::from(if o.dash_title.trim().is_empty() { o.label.clone() } else { o.dash_title.clone() }));
+            c.insert("host".into(), Value::from("0.0.0.0"));
+            c.insert("port".into(), Value::from(o.dash_port));
+            c.entry("enabled").or_insert(Value::Bool(true));
+            want.push(c);
+        }
+    }
+    if want == old {
+        return false;
+    }
+    *conns = want;
+    true
+}
+
+/// Address to open in this machine's browser: a wildcard listen host becomes `localhost`.
+fn viewer_url(endpoint: &str) -> String {
+    endpoint.replacen("//0.0.0.0", "//localhost", 1).replacen("//[::]", "//localhost", 1)
+}
+
 /// Rail / banner icon for an ext protocol.
 pub fn paint_icon(painter: &Painter, proto: ExtProto, r: Rect, stroke: Stroke, ink: Color32) {
     match proto {
@@ -1299,6 +1480,14 @@ pub fn paint_icon(painter: &Painter, proto: ExtProto, r: Rect, stroke: Stroke, i
             painter.line_segment([n(r, 0.54, 0.36), n(r, 0.60, 0.42)], s2);
             painter.line_segment([n(r, 0.46, 0.58), n(r, 0.60, 0.58)], s2);
             painter.line_segment([n(r, 0.46, 0.58), n(r, 0.52, 0.64)], s2);
+        }
+        ExtProto::Dashboard => {
+            // Dashboard: a window with a gauge arc and a bar.
+            painter.rect_stroke(Rect::from_min_max(n(r, 0.08, 0.16), n(r, 0.92, 0.84)), Rounding::same(3.0), stroke);
+            painter.circle_stroke(n(r, 0.34, 0.56), r.width() * 0.16, stroke);
+            painter.line_segment([n(r, 0.34, 0.56), n(r, 0.42, 0.44)], Stroke::new(stroke.width, ink));
+            painter.rect_filled(Rect::from_min_max(n(r, 0.62, 0.56), n(r, 0.72, 0.74)), Rounding::same(1.0), ink);
+            painter.rect_filled(Rect::from_min_max(n(r, 0.76, 0.40), n(r, 0.86, 0.74)), Rounding::same(1.0), ink);
         }
         ExtProto::Sparkplug => {
             // Spark: edge node with a flash.
@@ -1360,6 +1549,7 @@ pub fn paint_hero(painter: &Painter, proto: ExtProto, r: Rect) {
             ExtProto::Dnp3 => &["class 0", "events", "CROB"],
             ExtProto::Can => &["SocketCAN", "J1939", "DBC"],
             ExtProto::Gen => &["sine", "walk", "formula"],
+            ExtProto::Dashboard => &["gauges", "charts", "live"],
         };
         for (i, t) in tags.iter().enumerate() {
             let c = n(r, 0.76, 0.28 + i as f32 * 0.22);
@@ -1376,6 +1566,75 @@ pub fn paint_hero(painter: &Painter, proto: ExtProto, r: Rect) {
 mod tests {
     use super::*;
 
+    fn dash_model() -> crate::hubs::HubModel {
+        let mut m = crate::hubs::HubModel::sample();
+        let hub = m.hubs[1].id;
+        m.hub_mut(hub).unwrap().outputs[0].protocol = crate::hubs::HubProto::Dashboard;
+        m
+    }
+
+    #[test]
+    fn dashboard_node_owns_its_connection() {
+        let mut m = dash_model();
+        let mut conns: Vec<Obj> = Vec::new();
+        assert!(sync_dashboard_conns(&mut m, &mut conns));
+        assert_eq!(conns.len(), 1);
+        let port = m.hubs[1].outputs[0].dash_port;
+        assert_eq!(port, 8780, "first free port");
+        assert_eq!(m.hubs[1].outputs[0].ext_connection, text_of(&conns[0], "id"));
+        assert_eq!(text_of(&conns[0], "port"), "8780");
+        assert!(!sync_dashboard_conns(&mut m, &mut conns), "idempotent");
+        // Edits on the node flow to the connection; a second node gets the next port.
+        m.hubs[1].outputs[0].dash_title = "Plant".into();
+        m.hubs[1].outputs[0].dash_port = 9000;
+        let hub = m.hubs[1].id;
+        m.add_port(hub, false);
+        let n = m.hubs[1].outputs.len() - 1;
+        m.hubs[1].outputs[n].protocol = crate::hubs::HubProto::Dashboard;
+        assert!(sync_dashboard_conns(&mut m, &mut conns));
+        assert_eq!(conns.len(), 2);
+        assert_eq!((text_of(&conns[0], "title"), text_of(&conns[0], "port")), ("Plant".into(), "9000".into()));
+        assert_eq!(m.hubs[1].outputs[n].dash_port, 8780);
+        // Removing the node removes its connection.
+        m.hubs[1].outputs[n].protocol = crate::hubs::HubProto::Mqtt;
+        assert!(sync_dashboard_conns(&mut m, &mut conns));
+        assert_eq!(conns.len(), 1);
+    }
+
+    #[test]
+    fn old_hand_made_connection_is_adopted() {
+        let mut m = dash_model();
+        m.hubs[1].outputs[0].ext_connection = "web".into();
+        let mut conns = vec![serde_json::json!({"id":"web","title":"Old","port":8800}).as_object().unwrap().clone()];
+        assert!(sync_dashboard_conns(&mut m, &mut conns));
+        assert_eq!(m.hubs[1].outputs[0].dash_port, 8800);
+        assert_eq!(m.hubs[1].outputs[0].dash_title, "Old");
+        assert_eq!(conns.len(), 1);
+        assert_ne!(text_of(&conns[0], "id"), "web");
+    }
+
+    #[test]
+    fn wired_points_become_dashboard_binds() {
+        let wired = vec!["a".to_string(), "b".to_string()];
+        let mut binds = dashboard_auto_binds(&[], &wired);
+        assert_eq!(binds.iter().map(|b| text_of(b, "point")).collect::<Vec<_>>(), ["a", "b"]);
+        assert!(binds.iter().all(|b| b.get("auto") == Some(&Value::Bool(true))));
+        // Re-sync keeps existing binds; unwiring drops the auto bind; a manual bind survives.
+        let mut manual = obj_with_defaults(DASHBOARD.out_fields);
+        manual.insert("point".into(), Value::from("m"));
+        binds.push(manual);
+        let next = dashboard_auto_binds(&binds, &["a".to_string()]);
+        assert_eq!(next.iter().map(|b| text_of(b, "point")).collect::<Vec<_>>(), ["m", "a"]);
+    }
+
+    #[test]
+    fn dashboard_labels_and_viewer_url() {
+        let b = obj_with_defaults(ExtProto::Dashboard.spec().out_fields);
+        assert_eq!(bind_label(ExtProto::Dashboard, &b), "dashboard");
+        assert_eq!(viewer_url("http://0.0.0.0:8780/"), "http://localhost:8780/");
+        assert_eq!(viewer_url("http://10.0.0.5:8780/"), "http://10.0.0.5:8780/");
+    }
+
     #[test]
     fn every_proto_has_a_spec_engine_and_leaf_fields() {
         for p in ExtProto::ALL {
@@ -1386,7 +1645,7 @@ mod tests {
             }
             // Defaults never contain a leaf value, so an untouched draft is not addable.
             let d = obj_with_defaults(spec.in_fields);
-            assert!(ext_leaf(p.core(), |k| text_of(&d, k)).is_none() || matches!(p, ExtProto::Dnp3 | ExtProto::WebSocket), "{:?}", p);
+            assert!(ext_leaf(p.core(), |k| text_of(&d, k)).is_none() || matches!(p, ExtProto::Dnp3 | ExtProto::WebSocket | ExtProto::Dashboard), "{:?}", p);
             let mut keys = std::collections::HashSet::new();
             for f in spec.conn_fields {
                 assert!(keys.insert(f.key), "{:?} duplicate conn field {}", p, f.key);

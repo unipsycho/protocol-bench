@@ -119,6 +119,8 @@ pub const EXT_PROTOCOLS: &[ExtSpec] = &[
     ExtSpec { id: "dnp3", prefix: "dnp3", leaf_keys: &["kind", "index"], required: &["kind", "index"] },
     ExtSpec { id: "can", prefix: "can", leaf_keys: &["id", "start", "len"], required: &["id", "start", "len"] },
     ExtSpec { id: "gen", prefix: "gen", leaf_keys: &["name"], required: &["name"] },
+    // Output-only for now; Input binds (control widgets) arrive with write-back.
+    ExtSpec { id: "dashboard", prefix: "dash", leaf_keys: &[], required: &[] },
 ];
 
 /// Spec for a section key / port protocol name (case-insensitive).

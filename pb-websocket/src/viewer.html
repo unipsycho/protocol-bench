@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Protocol Bench — WebSocket viewer</title>
+<style>
+:root{color-scheme:light dark;--bg:#fff;--fg:#1c2128;--mut:#6b7480;--line:#d9dde3;--ok:#1a8f4a;--bad:#c0392b;--acc:#0b6a96}
+@media(prefers-color-scheme:dark){:root{--bg:#14181d;--fg:#e4e8ed;--mut:#8b95a1;--line:#2a313a;--ok:#4cd080;--bad:#ff6b5b;--acc:#6cd4ff}}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif}
+header{display:flex;gap:14px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line)}
+h1{font-size:15px;margin:0}#st{font-size:12px}#st.up{color:var(--ok)}#st.down{color:var(--bad)}
+#cnt{margin-left:auto;color:var(--mut);font-size:12px}
+main{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:16px}
+@media(max-width:800px){main{grid-template-columns:1fr}}
+h2{font-size:11px;letter-spacing:.08em;color:var(--mut);margin:0 0 6px;font-weight:600}
+table{width:100%;border-collapse:collapse}td{padding:4px 6px;border-bottom:1px solid var(--line)}
+td.v{text-align:right;font:13px ui-monospace,monospace;color:var(--acc)}
+td.t{color:var(--mut);font-size:11px;text-align:right;width:70px}
+#log{font:12px ui-monospace,monospace;height:60vh;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:6px;white-space:pre-wrap;word-break:break-all}
+#log div{padding:1px 0;border-bottom:1px dotted var(--line)}
+.flash{animation:f .6s}@keyframes f{from{background:color-mix(in srgb,var(--acc) 30%,transparent)}}
+</style></head><body>
+<header><h1>WebSocket viewer</h1><span id="st" class="down">connecting…</span><span id="cnt"></span></header>
+<main>
+<section><h2>LATEST VALUES</h2><table><tbody id="vals"></tbody></table><p id="empty" style="color:var(--mut)">Waiting for data…</p></section>
+<section><h2>RAW MESSAGES</h2><div id="log"></div></section>
+</main>
+<script>
+const $=id=>document.getElementById(id),rows={};let n=0;
+function flat(o,p,out){if(o&&typeof o==="object")for(const k in o)flat(o[k],p?p+"."+k:k,out);else out[p]=o;return out}
+function set(k,v){let r=rows[k];if(!r){r=rows[k]=document.createElement("tr");r.innerHTML="<td></td><td class=v></td><td class=t></td>";r.cells[0].textContent=k;
+ const b=$("vals"),ks=Object.keys(rows).sort();b.innerHTML="";ks.forEach(x=>b.appendChild(rows[x]));$("empty").hidden=true}
+ r.cells[1].textContent=String(v);r.cells[2].textContent=new Date().toLocaleTimeString();r.classList.remove("flash");void r.offsetWidth;r.classList.add("flash")}
+function connect(){
+ const ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/");
+ ws.onopen=()=>{$("st").textContent="connected";$("st").className="up"};
+ ws.onclose=()=>{$("st").textContent="disconnected — retrying";$("st").className="down";setTimeout(connect,1500)};
+ ws.onmessage=e=>{n++;$("cnt").textContent=n+" messages";
+  const l=$("log"),d=document.createElement("div");d.textContent=new Date().toLocaleTimeString()+"  "+e.data;l.prepend(d);while(l.childNodes.length>200)l.lastChild.remove();
+  try{const m=JSON.parse(e.data);
+   if(m&&typeof m==="object"&&"point"in m&&"value"in m)set(m.point,m.value);else{const f=flat(m,"",{});for(const k in f)set(k,f[k])}}catch{}};
+}
+connect();
+</script></body></html>

@@ -19,7 +19,7 @@ Start the service (with the protocol packs it loads), then the UI:
 ```bash
 # 1. Build the packs and the service, and put the packs in modules/
 cargo build -p pb-mqtt -p pb-opcua -p pb-streams -p pb-http -p pb-modbus -p pb-files -p pb-snmp -p pb-las \
-            -p pb-wits -p pb-websocket -p pb-sparkplug -p pb-dnp3 -p pb-can -p pb-gen -p pb-service
+            -p pb-wits -p pb-websocket -p pb-sparkplug -p pb-dnp3 -p pb-can -p pb-gen -p pb-dashboard -p pb-service
 mkdir -p modules && cp target/debug/libpb_*.so modules/     # pb_*.dll on Windows
 
 # 2. Service (always-on; owns project.json, serves localhost JSON IPC)
@@ -72,6 +72,7 @@ The smokes need python3 and use a private config dir, so a running UI never atta
 | `pb-mqtt`, `pb-opcua`, `pb-streams`, `pb-http`, `pb-modbus`, `pb-files`, `pb-snmp`, `pb-las` | Protocol packs (`cdylib`) — MQTT client + embedded broker, OPC UA client + server, serial / TCP streams, HTTP / REST, Modbus TCP / RTU client + server (register maps with scaling), File follow (CSV / JSON lines), SNMP v1 / v2c GET, LAS 2.0 follow + write |
 | `pb-wits`, `pb-websocket`, `pb-sparkplug`, `pb-dnp3`, `pb-can` | Ext protocol packs (`cdylib`) — WITS level 0 in / out (TCP / serial), WebSocket JSON client + server, Sparkplug B host + edge node, DNP3 TCP master (polls + controls), CAN / SocketCAN signals (J1939 PGNs) |
 | `pb-gen` | Generator pack (`cdylib`) — synthetic signals (waveforms, random walks, process shapes, counters, formulas) on interval / random-timer / burst triggers; a source only. Models live in the plain rlib `pb-signal`, the expression language in `pb-expr` (also behind Calculation-node formulas) |
+| `pb-dashboard` | Dashboard output pack (`cdylib`) — hosts a live browser dashboard on its own port, fed by hub Output binds (the egui/wasm app in `pb-dash-web` is built by `scripts/build-dashboard.sh` and embedded; shared layout / wire types in `pb-dash-model`, HTTP helper in `pb-webserve`). Snapping-grid page with Numeric / Text / Gauge / Bar / Indicator / Chart / Label widgets, in-page editing, several saved dashboards per node (`docs/dashboard-plan.md`) |
 | `pb-extkit` | Shared runtime for the ext packs: workers per connection, config diffing, output routing, status / "seen on the wire" |
 | `pb-proto` | Pure codecs shared by packs and the simulator: WITS, Sparkplug B protobuf, DNP3 (link / transport / application + demo outstation), CAN signals + SocketCAN |
 | `pb-sim` | Demo field devices (frac spread, bottling line, lift station) and `watch` / `check` point tools |

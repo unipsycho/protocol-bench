@@ -107,7 +107,7 @@ pub fn paint_pane_icon(painter: &Painter, rect: Rect, pane: DockPane, ink: Color
         DockPane::Http => icon_http(painter, rect, stroke, ink),
         DockPane::Las => icon_las(painter, rect, stroke, ink),
         DockPane::Snmp => icon_snmp(painter, rect, stroke, ink),
-        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can | DockPane::Gen => {
+        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can | DockPane::Gen | DockPane::Dashboard => {
             if let Some(e) = pane.ext() {
                 crate::ext_proto::paint_icon(painter, e, rect, stroke, ink);
             }
@@ -137,7 +137,7 @@ pub fn paint_hero(painter: &Painter, pane: DockPane, rect: Rect) {
         DockPane::Http => hero_http(painter, rect),
         DockPane::Las => hero_las(painter, rect),
         DockPane::Snmp => hero_snmp(painter, rect),
-        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can | DockPane::Gen => {
+        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can | DockPane::Gen | DockPane::Dashboard => {
             if let Some(e) = pane.ext() {
                 crate::ext_proto::paint_hero(painter, e, rect);
             }

@@ -18,6 +18,10 @@ members = [
     "pb-snmp",
     "pb-las",
     "pb-extkit",
+    "pb-webserve",
+    "pb-dash-model",
+    "pb-dash-web",
+    "pb-dashboard",
     "pb-proto",
     "pb-wits",
     "pb-websocket",
@@ -53,6 +57,8 @@ pb-tail = { path = "pb-tail" }
 pb-snmp = { path = "pb-snmp" }
 pb-las = { path = "pb-las" }
 pb-extkit = { path = "pb-extkit" }
+pb-webserve = { path = "pb-webserve" }
+pb-dash-model = { path = "pb-dash-model" }
 pb-expr = { path = "pb-expr" }
 pb-signal = { path = "pb-signal" }
 pb-proto = { path = "pb-proto" }

@@ -46,10 +46,12 @@ pub enum EngineId {
     Can,
     /// Generator: synthetic signals instead of a device.
     Gen,
+    /// Dashboard: hosts a browser dashboard fed by Output binds.
+    Dashboard,
 }
 
 impl EngineId {
-    pub const ALL: [EngineId; 14] = [
+    pub const ALL: [EngineId; 15] = [
         EngineId::Streams,
         EngineId::Modbus,
         EngineId::Mqtt,
@@ -64,6 +66,7 @@ impl EngineId {
         EngineId::Dnp3,
         EngineId::Can,
         EngineId::Gen,
+        EngineId::Dashboard,
     ];
 
     /// Slot for an ext protocol section key (`wits`, `websocket`, …).
@@ -73,7 +76,7 @@ impl EngineId {
 
     /// True for the protocols configured through the generic ext path.
     pub fn is_ext(self) -> bool {
-        matches!(self, Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen)
+        matches!(self, Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen | Self::Dashboard)
     }
 
     /// Slots whose packs take host point writes (Output binds). The engine sends egress to
@@ -99,6 +102,7 @@ impl EngineId {
             Self::Dnp3 => "DNP3",
             Self::Can => "CAN",
             Self::Gen => "Generator",
+            Self::Dashboard => "Dashboard",
         }
     }
 
@@ -119,6 +123,7 @@ impl EngineId {
             Self::Dnp3 => Some("dnp3"),
             Self::Can => Some("can"),
             Self::Gen => Some("gen"),
+            Self::Dashboard => Some("dashboard"),
         }
     }
 
@@ -147,6 +152,7 @@ impl EngineId {
             Self::Dnp3 => "DNP3 pack — TCP master: class polls, binary / analog / counter points, controls.",
             Self::Can => "CAN pack — SocketCAN signals in (frame decode) and out (frame encode).",
             Self::Gen => "Generator pack — synthetic signals (waveforms, random walks, process shapes, counters, formulas) on interval / random / burst triggers.",
+            Self::Dashboard => "Dashboard pack — hosts a live browser dashboard (gauges, numerics, charts) fed by Output binds.",
         }
     }
 

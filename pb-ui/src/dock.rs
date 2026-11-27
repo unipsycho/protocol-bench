@@ -40,6 +40,8 @@ pub enum DockPane {
     Can,
     /// Generator (synthetic signals).
     Gen,
+    /// Dashboard output (browser dashboard).
+    Dashboard,
     /// One pane that hosts every protocol's config behind a dropdown.
     Protocols,
     /// In-app user guide.
@@ -110,6 +112,7 @@ impl DockPane {
             Self::Dnp3 => Some(ExtProto::Dnp3),
             Self::Can => Some(ExtProto::Can),
             Self::Gen => Some(ExtProto::Gen),
+            Self::Dashboard => Some(ExtProto::Dashboard),
             _ => None,
         }
     }
@@ -122,6 +125,7 @@ impl DockPane {
             ExtProto::Dnp3 => Self::Dnp3,
             ExtProto::Can => Self::Can,
             ExtProto::Gen => Self::Gen,
+            ExtProto::Dashboard => Self::Dashboard,
         }
     }
 
@@ -141,7 +145,7 @@ impl DockPane {
             Self::Http => "HTTP / REST",
             Self::Las => "LAS",
             Self::Snmp => "SNMP",
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => self.ext().map(|e| e.title()).unwrap_or(""),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen | Self::Dashboard => self.ext().map(|e| e.title()).unwrap_or(""),
             Self::Protocols => "Protocols",
             Self::Help => "Help",
         }
@@ -163,7 +167,7 @@ impl DockPane {
             Self::Http => "http",
             Self::Las => "las",
             Self::Snmp => "snmp",
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => self.ext().map(|e| e.id()).unwrap_or(""),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen | Self::Dashboard => self.ext().map(|e| e.id()).unwrap_or(""),
             Self::Protocols => "protocols",
             Self::Help => "help",
         }
@@ -180,7 +184,7 @@ impl DockPane {
             Self::Http => Some(EngineId::Http),
             Self::Las => Some(EngineId::Las),
             Self::Snmp => Some(EngineId::Snmp),
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => self.ext().map(|e| e.engine()),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen | Self::Dashboard => self.ext().map(|e| e.engine()),
             _ => None,
         }
     }
@@ -202,7 +206,7 @@ impl DockPane {
             Self::Http => Proto::HTTP,
             Self::Las => Proto::LAS,
             Self::Snmp => Proto::SNMP,
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => self.ext().map(|e| e.ink_core()).unwrap_or(Proto::TEAL),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen | Self::Dashboard => self.ext().map(|e| e.ink_core()).unwrap_or(Proto::TEAL),
             Self::Protocols => Proto::COPPER,
             Self::Help => Proto::TEAL,
         }
@@ -228,9 +232,24 @@ impl DockPane {
             Self::Http => Proto::HTTP_DEEP,
             Self::Las => Proto::LAS_DEEP,
             Self::Snmp => Proto::SNMP_DEEP,
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => self.ext().map(|e| e.ink_deep()).unwrap_or(Proto::TEAL_DEEP),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen | Self::Dashboard => self.ext().map(|e| e.ink_deep()).unwrap_or(Proto::TEAL_DEEP),
             Self::Protocols => Proto::COPPER_DEEP,
             Self::Help => Proto::TEAL_DEEP,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every ext protocol has a pane in the Protocols dropdown (a new protocol that is wired
+    /// everywhere but missing here is invisible to the user). The Dashboard is the exception on
+    /// purpose: its node on the hub diagram is its only configuration.
+    #[test]
+    fn every_ext_protocol_is_in_the_protocols_dropdown() {
+        for e in ExtProto::ALL.into_iter().filter(|e| *e != ExtProto::Dashboard) {
+            assert!(DockPane::PROTOCOLS.contains(&DockPane::from_ext(e)), "{e:?} missing from DockPane::PROTOCOLS");
         }
     }
 }

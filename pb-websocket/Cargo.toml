@@ -13,6 +13,7 @@ name = "pb_websocket"
 [dependencies]
 pb-abi = { workspace = true }
 pb-extkit = { workspace = true }
+pb-webserve = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 pb-json = { workspace = true }

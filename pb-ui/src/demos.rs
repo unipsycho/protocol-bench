@@ -611,7 +611,20 @@ pub fn generator_plant() -> ProjectFile {
         "tank_level", "pump_run", "pump_kw", "temperature", "humidity", "pressure", "flow", "load_kw", "energy_kwh", "wind", "battery_v", "heartbeat", "alarm", "parts",
     ];
     p.mqtt_outputs = names.iter().map(|n| mqtt_out(n, &format!("plant/gen/{n}"))).collect();
-    f.hubs = Some(model(hub("Generator plant", HubProto::Mqtt, sources, vec![p])));
+    // The same points on a live browser dashboard (http://<this machine>:8780/). The node *is* the
+    // connection; its points come from the arrows drawn into it (one per generator node).
+    let mut d = port(9, HubProto::Dashboard, "Plant dashboard");
+    d.dash_title = "Plant".into();
+    d.dash_port = 8780;
+    let names_owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    d.ext_outputs = crate::ext_proto::dashboard_auto_binds(&[], &names_owned);
+    let gen_ids: Vec<u64> = sources.iter().map(|s| s.id).collect();
+    let h = hub("Generator plant", HubProto::Mqtt, sources, vec![p, d]);
+    let hub_id = h.id;
+    let mut m = model(h);
+    m.feeds.extend(gen_ids.iter().map(|id| crate::hubs::HubFeed { from_hub: hub_id, from_node: *id, to_hub: hub_id, to_node: 9 }));
+    crate::ext_proto::sync_dashboard_conns(&mut m, &mut f.ext.dashboard.connections);
+    f.hubs = Some(m);
     f
 }
 

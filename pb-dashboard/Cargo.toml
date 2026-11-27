@@ -1,0 +1,21 @@
+[package]
+name = "pb-dashboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Dashboard output pack: hosts the browser dashboard app and feeds it live points"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "pb_dashboard"
+
+[dependencies]
+pb-abi = { workspace = true }
+pb-extkit = { workspace = true }
+pb-webserve = { workspace = true }
+pb-dash-model = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tungstenite = { version = "0.21" }
