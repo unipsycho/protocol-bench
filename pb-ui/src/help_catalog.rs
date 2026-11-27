@@ -606,7 +606,7 @@ More samples (`modbus-hub.json`, `edge-logger.json`, with `scripts/field-sim.py`
         category: Category::Project,
         accent: None,
         tags: &["demo", "pb-sim", "simulator", "frac", "bottling", "factory", "water", "lift station", "wastewater", "web demo", "headless"],
-        summary: "Three runnable plant projects with simulated devices for every protocol.",
+        summary: "Three runnable plant projects with simulated devices for every protocol, plus a generator-only one.",
         body: r#"
 `pb-sim` (in this repository, all Rust) plays the field devices; the projects live in `protocol-bench-projects/`.
 
@@ -620,6 +620,7 @@ scripts/dev.sh --project ../protocol-bench-projects/frac-spread.json
 | **frac-spread.json** | MQTT (broker :1885) | 4 frac pumps + blender (Modbus TCP 5021–5025), wellhead RTU (DNP3 :20000), pressure-pumping WITS feed (:5101), pump 1 engine (CAN J1939, vcan0, disabled until present) | WITS to the data van (:5100), WebSocket dashboard (:8765), `frac/#` topics, stage LAS log, ESD → RTU CROB, pump 1 rate / enable from `frac/cmd/#` |
 | **bottling-line.json** | MQTT (broker :1886) | Line PLC (5031), conveyor / filler VFDs (5032 / 5034), energy meter (5033), robot cell as a Sparkplug B edge node | ISA-95 UNS `plant/bottling/line2/#`, Sparkplug B gateway edge node, WebSocket dashboard (:8766), line run + conveyor speed from MQTT |
 | **water-lift-station.json** | OPC UA server (:4855) | Lift station RTU (DNP3 :20001), chlorine analyzer (Modbus TCP 5041) | OPC UA for SCADA, two-way web HMI on WebSocket :8767 (pump commands → DNP3 CROBs) |
+| **generator-plant.json** | MQTT (broker :1887) | None — six Generator nodes make the data (every signal type and trigger) | UNS topics `plant/gen/#` |
 
 ## Things to try
 
@@ -630,7 +631,7 @@ scripts/dev.sh --project ../protocol-bench-projects/frac-spread.json
 
 ## Headless (web demos)
 
-Run the service without the UI: `PB_AUTO_RUN_HUBS=1 PB_MODULES=… PB_PROJECT=… pb-service` starts the embedded broker / OPC UA server too. `pb-sim watch` prints the live point table; `scripts/demo-smoke.sh` checks all three demos end to end.
+Run the service without the UI: `PB_AUTO_RUN_HUBS=1 PB_MODULES=… PB_PROJECT=… pb-service` starts the embedded broker / OPC UA server too. `pb-sim watch` prints the live point table; `scripts/demo-smoke.sh` checks all four demos end to end (the generator demo needs no simulator and also verifies the broker topics and that the data moves).
 "#,
         related: &["demo-projects", "wits", "dnp3", "sparkplug", "websocket", "modbus-register-map"],
     },
@@ -1556,7 +1557,7 @@ i> Not yet: SNMPv3, SET Output, walks and traps.
     // ───────────────────────────── Service ─────────────────────────────
     Article {
         id: "ext-protocols",
-        title: "WITS, WebSocket, Sparkplug B, DNP3, CAN — how they work",
+        title: "WITS, WebSocket, Sparkplug B, DNP3, CAN, Generator — how they work",
         category: Category::Protocols,
         accent: None,
         tags: &["wits", "websocket", "sparkplug", "dnp3", "can", "panel", "seen on the wire", "connection", "bind"],
@@ -1580,9 +1581,9 @@ The five newer protocols share one layout, so once you know one you know them al
 
 > Inputs may carry **scale / offset** (`value = raw × scale + offset`). Outputs that write numbers divide it back out.
 
-i> Each protocol is its own pack in the service (`libpb_wits`, `libpb_websocket`, `libpb_sparkplug`, `libpb_dnp3`, `libpb_can`). A pack that is not installed does not appear in the Protocols dropdown.
+i> Each protocol is its own pack in the service (`libpb_wits`, `libpb_websocket`, `libpb_sparkplug`, `libpb_dnp3`, `libpb_can`, `libpb_gen`). A pack that is not installed does not appear in the Protocols dropdown.
 "#,
-        related: &["wits", "websocket", "sparkplug", "dnp3", "can-bus"],
+        related: &["wits", "websocket", "sparkplug", "dnp3", "can-bus", "generator"],
     },
     Article {
         id: "wits",
@@ -1756,6 +1757,69 @@ Each frame id gets an 8-byte buffer; every Output bind writes its signal into it
 !> SocketCAN is Linux-only. On other platforms the panel reports it.
 "#,
         related: &["ext-protocols", "industrial-demos"],
+    },
+    Article {
+        id: "generator",
+        title: "Generator (synthetic data)",
+        category: Category::Protocols,
+        accent: Some(Color32::from_rgb(0x7d, 0xe0, 0x9a)),
+        tags: &["generator", "gen", "synthetic", "simulate", "random", "random walk", "noise", "sine", "formula", "trigger", "burst", "demo data", "test data"],
+        summary: "Make up data — waveforms, random walks, process shapes, counters, formulas — on a regular, random or burst timer.",
+        body: r#"
+A **Generator** is a source with no device behind it. It publishes ordinary points, so you can wire them to a hub, an Aggregator, a Calculation or an Output exactly like Modbus or MQTT inputs. Use it to demo a project, test a dashboard, or exercise downstream logic before real devices exist.
+
+> **One direction only.** A generator is an Input: you can draw arrows *out of* it, but nothing can be wired *into* it.
+
+## Add signals
+
+1. Add a hub **Input** node and set its protocol to **Generator** (a board is created for you).
+2. Click **+ Add signal**. Pick a tab — **Real-world** presets (temperature, tank level, pump running, pressure, flow, energy …) or a family: **Waveform**, **Random**, **Process**, **Digital**, **Counter**, **Formula**. Each card draws its own shape.
+3. Name it, adjust the settings (only the ones that type has are shown), choose *when* it generates, and watch the **preview** redraw. The preview runs the same code as the pack.
+4. **Add signal**. The point appears (`gen_N`, or the name you give the point) and goes live at once.
+
+## Signal types
+
+| Family | Types |
+|---|---|
+| Waveform | Constant, Sine, Square, Triangle, Sawtooth, Ramp (hold / wrap / bounce) |
+| Random | Noise, Uniform, Random walk, Drift (a walk pulled back to a mean) |
+| Process | Wandering setpoint (smooth chase of a random target), Sequence (your list of values) |
+| Digital | On / off cycle, Toggle, Random on / off |
+| Counter | Counter (step, optional roll-over), Totaliser (rate × time) |
+| Formula | Your own expression |
+
+## When it generates
+
+| Trigger | Meaning |
+|---|---|
+| **Regular interval** | A value every N seconds |
+| **Random timer** | The next value comes after a random wait between a minimum and a maximum — irregular reporters |
+| **Bursts** | A quick run of values, then a random quiet spell — batch dumps and event storms |
+
+Waveforms and totalisers advance by the *elapsed* time, so irregular triggers still give correct shapes.
+
+## Formulas
+
+`t` (seconds), `dt` (since the last value), `prev` (its last value), `n` (count), the **name of any other signal on the board**, and `+ - * / % ^`, comparisons, `&&`, `||`, `cond ? a : b`, `sin cos tan abs sqrt pow exp ln min max clamp round floor ceil if(c,a,b)`, plus random numbers: `rand()`, `rand(lo, hi)`, `randn()` (gaussian), `noise(x)`.
+
+```
+prev + randn() * 0.5                      a random walk
+pump_run * (7.5 + 0.6 * sin(t / 9))       power only while another signal is true
+50 + 10 * sin(t / 20) + noise(0.3)        a wave with jitter
+```
+
+The same language works in a **Calculation** node's *Expression / formula* (there `x` is the edge value).
+
+## Board settings
+
+- **Random seed** — `0` gives different data every run; any other number repeats the same data (each signal keeps its own stream).
+- **Time scale** — model seconds per real second. `60` makes a one-minute waveform pass every second, handy for a "day" in a minute.
+
+!> Changing a signal restarts its board: counters and random walks start again from their start values.
+
+i> Try `generator-plant.json` in the projects folder: six generator nodes → an MQTT hub with every signal type and trigger.
+"#,
+        related: &["ext-protocols", "mqtt", "industrial-demos"],
     },
     Article {
         id: "running-service",

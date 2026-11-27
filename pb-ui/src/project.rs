@@ -1489,7 +1489,7 @@ HubProto::Modbus => {
                         }
                     }
                 }
-                HubProto::Wits | HubProto::WebSocket | HubProto::Sparkplug | HubProto::Dnp3 | HubProto::Can => {
+                HubProto::Wits | HubProto::WebSocket | HubProto::Sparkplug | HubProto::Dnp3 | HubProto::Can | HubProto::Gen => {
                     let Some(e) = port.protocol.ext() else { continue };
                     let conn = port.ext_connection.clone();
                     for bind in &mut port.ext_inputs {

@@ -1,0 +1,10 @@
+[package]
+name = "pb-expr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Small arithmetic expression language (functions, variables, seeded random) shared by calc nodes and generators"
+
+[dependencies]

@@ -122,7 +122,7 @@ pub const CALC_KINDS: &[CalcKind] = &[
     CalcKind {
         id: "formula",
         name: "Expression / formula",
-        blurb: "Free expression over this one stream (x / A) — operators + ( ). Multi-point combine is Aggregator.",
+        blurb: "Free expression over this one stream (x / A): + - * / ^ ( ), comparisons, functions, and random numbers — e.g. prev + randn() for a random walk. Multi-point combine is Aggregator.",
         example: "(x * 1.8) + 32",
         time_based: false,
     },
@@ -535,14 +535,11 @@ fn compute_preview(kind: &CalcKind, step: &HubStep, x: f64) -> Result<String, St
             if expr.is_empty() {
                 return Err("enter a formula to preview".into());
             }
-            // Tiny evaluator: replace x / A with the sample, then allow + - * / ( ) numbers.
-            let mut s = expr.replace('x', &format!("({x})"));
-            s = s.replace('A', &format!("({x})"));
-            s = s.replace('B', &format!("({})", b.unwrap_or(0.0)));
-            match eval_simple_arith(&s) {
-                Some(v) => Ok(fmt_num(v)),
-                None => Err("formula preview supports + − × ÷ ( ) and x/A/B only".into()),
-            }
+            // The same evaluator the engine runs. A preview is one sample: `prev` is the input,
+            // `t` / `dt` / `n` start at 0, and random functions give a single draw.
+            let bv = b.unwrap_or(0.0);
+            let vars = [("x", x), ("X", x), ("A", x), ("a", x), ("B", bv), ("b", bv), ("t", 0.0), ("dt", 0.0), ("prev", x), ("n", 0.0)];
+            pb_expr::eval_with(expr, &vars, &mut pb_expr::Rng::from_clock()).map(fmt_num)
         }
         "rolling_avg" | "ema" | "rate_of_change" | "min_max_hold" | "time_window" => {
             // Pass-through until the edge runner owns window state.
@@ -550,87 +547,6 @@ fn compute_preview(kind: &CalcKind, step: &HubStep, x: f64) -> Result<String, St
         }
         _ => Ok(fmt_num(x)),
     }
-}
-
-/// Recursive-descent arithmetic for formula preview (no functions).
-fn eval_simple_arith(expr: &str) -> Option<f64> {
-    let chars: Vec<char> = expr.chars().filter(|c| !c.is_whitespace()).collect();
-    let mut i = 0usize;
-    fn parse_expr(chars: &[char], i: &mut usize) -> Option<f64> {
-        let mut v = parse_term(chars, i)?;
-        while *i < chars.len() {
-            match chars[*i] {
-                '+' => {
-                    *i += 1;
-                    v += parse_term(chars, i)?;
-                }
-                '-' => {
-                    *i += 1;
-                    v -= parse_term(chars, i)?;
-                }
-                _ => break,
-            }
-        }
-        Some(v)
-    }
-    fn parse_term(chars: &[char], i: &mut usize) -> Option<f64> {
-        let mut v = parse_factor(chars, i)?;
-        while *i < chars.len() {
-            match chars[*i] {
-                '*' => {
-                    *i += 1;
-                    v *= parse_factor(chars, i)?;
-                }
-                '/' => {
-                    *i += 1;
-                    let d = parse_factor(chars, i)?;
-                    if d == 0.0 {
-                        return None;
-                    }
-                    v /= d;
-                }
-                _ => break,
-            }
-        }
-        Some(v)
-    }
-    fn parse_factor(chars: &[char], i: &mut usize) -> Option<f64> {
-        if *i >= chars.len() {
-            return None;
-        }
-        match chars[*i] {
-            '+' => {
-                *i += 1;
-                parse_factor(chars, i)
-            }
-            '-' => {
-                *i += 1;
-                Some(-(parse_factor(chars, i)?))
-            }
-            '(' => {
-                *i += 1;
-                let v = parse_expr(chars, i)?;
-                if *i >= chars.len() || chars[*i] != ')' {
-                    return None;
-                }
-                *i += 1;
-                Some(v)
-            }
-            c if c.is_ascii_digit() || c == '.' => {
-                let start = *i;
-                while *i < chars.len() && (chars[*i].is_ascii_digit() || chars[*i] == '.') {
-                    *i += 1;
-                }
-                chars[start..*i].iter().collect::<String>().parse().ok()
-            }
-            _ => None,
-        }
-    }
-    let v = parse_expr(&chars, &mut i)?;
-    if i != chars.len() {
-        return None;
-    }
-    Some(v)
 }
 
 fn preview_output(
@@ -850,7 +766,7 @@ fn detail_editor(
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "Use point ids or x for the edge value. Functions: min, max, abs, clamp, sqrt.",
+                "x (or A) is the edge value, B is Param B, prev the last output, t / dt seconds, n a count. Functions: sin cos abs sqrt pow ln min max clamp round if(c,a,b), rand() randn() noise(x).",
             )
             .font(font_ui(11.0))
             .color(p.muted),
@@ -956,3 +872,52 @@ const SAMPLE_MODES: &[(&str, &str)] = &[
     ("50", "50"),
 ];
 
+
+#[cfg(test)]
+mod formula_preview_tests {
+    use super::*;
+
+    fn step(formula: &str, b: &str) -> HubStep {
+        let mut model = crate::hubs::HubModel::sample();
+        let hub = model.hubs[0].id;
+        let edge = model.hubs[0].sources[0].id;
+        let id = model.add_step(hub, false, edge).expect("calc step");
+        let mut s = model.hubs[0].calculations.iter().find(|c| c.id == id).cloned().expect("step");
+        s.calc_kind = "formula".into();
+        s.formula = formula.into();
+        s.param_b = b.into();
+        s
+    }
+
+    fn preview(formula: &str, b: &str, x: f64) -> Result<String, String> {
+        compute_preview(kind_by_id("formula").unwrap(), &step(formula, b), x)
+    }
+
+    #[test]
+    fn preview_uses_the_engine_evaluator() {
+        // The old preview was arithmetic only; functions, powers, ternaries and B all work now.
+        assert_eq!(preview("(A * 1.8) + 32", "", 100.0).unwrap(), "212");
+        assert_eq!(preview("x ^ 2 + B", "1", 3.0).unwrap(), "10");
+        assert_eq!(preview("clamp(x, 0, 10) + abs(-2)", "", 50.0).unwrap(), "12");
+        assert_eq!(preview("x > 5 ? 1 : 0", "", 9.0).unwrap(), "1");
+        assert_eq!(preview("prev + n + t + dt", "", 4.0).unwrap(), "4", "prev is the input; the clocks start at 0");
+    }
+
+    #[test]
+    fn random_formulas_preview_a_single_draw_in_range() {
+        for _ in 0..50 {
+            let v: f64 = preview("x + rand(0, 1)", "", 10.0).unwrap().parse().unwrap();
+            assert!((10.0..=11.0).contains(&v));
+        }
+        assert!(preview("prev + randn() * 0.2", "", 50.0).is_ok());
+    }
+
+    #[test]
+    fn preview_reports_what_is_wrong() {
+        assert!(preview("", "", 1.0).unwrap_err().contains("enter a formula"));
+        assert!(preview("1 +", "", 1.0).unwrap_err().contains("column"));
+        assert!(preview("x / 0", "", 1.0).unwrap_err().contains("division by zero"));
+        assert!(preview("wat(1)", "", 1.0).unwrap_err().contains("unknown function"));
+        assert!(preview("zzz + 1", "", 1.0).unwrap_err().contains("unknown variable"));
+    }
+}

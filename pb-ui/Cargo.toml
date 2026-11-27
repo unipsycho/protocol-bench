@@ -16,6 +16,8 @@ pb-engine = { workspace = true }
 pb-ipc = { workspace = true }
 pb-points = { workspace = true }
 pb-modbus = { workspace = true }
+pb-signal = { workspace = true }
+pb-expr = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 serde = { workspace = true }
@@ -27,3 +29,6 @@ chrono = { workspace = true }
 ureq = { version = "2.12", features = ["json"] }
 # Native open/save; spawned off the UI thread (Hyprland stalls if blocking).
 rfd = "0.15"
+
+[dev-dependencies]
+pb-extkit = { workspace = true }

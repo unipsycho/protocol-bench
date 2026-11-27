@@ -322,8 +322,8 @@ pub fn call_tool(name: &str, args: &Value, rt: &Arc<Mutex<Runtime>>) -> Result<V
         }
         "add_connection" => {
             let proto = str_arg(args, "protocol")?.to_ascii_lowercase();
-            if !matches!(proto.as_str(), "modbus" | "wits" | "websocket" | "sparkplug" | "dnp3" | "can") {
-                return Err(format!("add_connection supports modbus, wits, websocket, sparkplug, dnp3, can (got \"{proto}\"); use set_project_section for others"));
+            if !matches!(proto.as_str(), "modbus" | "wits" | "websocket" | "sparkplug" | "dnp3" | "can" | "gen") {
+                return Err(format!("add_connection supports modbus, wits, websocket, sparkplug, dnp3, can, gen (got \"{proto}\"); use set_project_section for others"));
             }
             let conn = args.get("connection").filter(|c| c.is_object()).cloned().ok_or("\"connection\" must be an object")?;
             let cid = conn.get("id").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).ok_or("connection needs an \"id\"")?.to_string();

@@ -4,7 +4,7 @@ Date: 2026-11-13. Reviewed against the code: 2026-11-26. Status: living draft. B
 
 Research: competitive landscape and protocol notes live in the research store (not in this repo). Free vs paid isolation: [free-vs-paid-isolation.md](free-vs-paid-isolation.md). Pack loading: [protocol-pack-loading.md](protocol-pack-loading.md).
 
-Checkout: `/home/mike/Documents/AAI-Projects/protocolbench` — run instructions in [../README.md](../README.md). Workspace: `pb-abi`, `pb-points`, `pb-engine`, `pb-ipc`, `pb-extkit`, `pb-proto`, protocol packs (`pb-mqtt`, `pb-opcua`, `pb-streams`, `pb-http`, `pb-modbus`, `pb-files`, `pb-snmp`, `pb-las`, `pb-wits`, `pb-websocket`, `pb-sparkplug`, `pb-dnp3`, `pb-can`), `pb-service`, `pb-ui`, `pb-sim`.
+Checkout: `/home/mike/Documents/AAI-Projects/protocolbench` — run instructions in [../README.md](../README.md). Workspace: `pb-abi`, `pb-points`, `pb-engine`, `pb-ipc`, `pb-extkit`, `pb-proto`, protocol packs (`pb-mqtt`, `pb-opcua`, `pb-streams`, `pb-http`, `pb-modbus`, `pb-files`, `pb-snmp`, `pb-las`, `pb-wits`, `pb-websocket`, `pb-sparkplug`, `pb-dnp3`, `pb-can`, `pb-gen`), shared libraries `pb-expr` (expression language) and `pb-signal` (generator models), `pb-service`, `pb-ui`, `pb-sim`.
 
 ## Product
 

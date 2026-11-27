@@ -81,6 +81,7 @@ impl ServiceStatus {
                 "sparkplug" => "Sparkplug B",
                 "dnp3" => "DNP3",
                 "can" => "CAN",
+                "gen" => "Generator",
                 other => other,
             };
             out.push(format!("{name}: {}", s.state));

@@ -56,7 +56,7 @@ fn assert_sections_eq(name: &str, a: &ProjectFile, b: &ProjectFile) {
     let jb = serde_json::to_value(b).unwrap();
     let keys = [
         "mqtt", "opcua", "http", "streams", "las", "snmp", "modbus", "files", "wits", "websocket",
-        "sparkplug", "dnp3", "can", "hubs", "points", "settings", "layout", "next_point_seq",
+        "sparkplug", "dnp3", "can", "gen", "hubs", "points", "settings", "layout", "next_point_seq",
     ];
     for key in keys {
         assert_eq!(ja.get(key), jb.get(key), "{name}: section `{key}` changed on load/save");
@@ -69,6 +69,7 @@ fn demo_projects() -> Vec<(&'static str, ProjectFile)> {
         ("frac_spread", crate::demos::frac_spread("/tmp/pb-data")),
         ("bottling_line", crate::demos::bottling_line()),
         ("water_lift_station", crate::demos::water_lift_station()),
+        ("generator_plant", crate::demos::generator_plant()),
         ("default", ProjectFile::default()),
     ]
 }
@@ -120,6 +121,7 @@ fn sample_projects_survive_open_and_save() {
                 + f.ext.sparkplug.connections.len()
                 + f.ext.dnp3.connections.len()
                 + f.ext.can.connections.len()
+                + f.ext.gen.connections.len()
         };
         assert_eq!(count(&file), count(&once), "{name}: connections dropped");
     }
@@ -274,6 +276,7 @@ fn sparse_project() -> ProjectFile {
         "sparkplug": { "connections": [] },
         "dnp3": { "connections": [] },
         "can": { "connections": [] },
+        "gen": { "connections": [] },
         "hubs": { "hubs": [] }
     }))
     .expect("sparse project parses")
@@ -307,7 +310,7 @@ fn blank_project_has_nothing_and_survives_open_and_save() {
         ("mqtt", "clients"), ("opcua", "clients"), ("http", "clients"), ("streams", "endpoints"),
         ("las", "endpoints"), ("snmp", "targets"), ("modbus", "connections"), ("files", "sources"),
         ("wits", "connections"), ("websocket", "connections"), ("sparkplug", "connections"),
-        ("dnp3", "connections"), ("can", "connections"),
+        ("dnp3", "connections"), ("can", "connections"), ("gen", "connections"),
     ] {
         let n = v[sec][key].as_array().map_or(0, |a| a.len());
         assert_eq!(n, 0, "blank project has no {sec} {key}");

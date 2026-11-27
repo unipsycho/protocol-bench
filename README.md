@@ -1,6 +1,6 @@
 # Protocol Bench
 
-Native Rust product for moving values between industrial and oilfield links (serial / TCP streams, Modbus, MQTT, OPC UA, HTTP / REST, SNMP, LAS, CSV / JSON-lines file follow, WITS, WebSocket, Sparkplug B, DNP3, CAN). An always-on **service** (`pb-service`) holds the points and runs the protocol packs; a separate **UI** (`protocol-bench`, egui / eframe) configures and monitors it.
+Native Rust product for moving values between industrial and oilfield links (serial / TCP streams, Modbus, MQTT, OPC UA, HTTP / REST, SNMP, LAS, CSV / JSON-lines file follow, WITS, WebSocket, Sparkplug B, DNP3, CAN, plus a Generator source that makes up data). An always-on **service** (`pb-service`) holds the points and runs the protocol packs; a separate **UI** (`protocol-bench`, egui / eframe) configures and monitors it.
 
 > Your protocol hub for every stream. — Agile Automation
 
@@ -19,7 +19,7 @@ Start the service (with the protocol packs it loads), then the UI:
 ```bash
 # 1. Build the packs and the service, and put the packs in modules/
 cargo build -p pb-mqtt -p pb-opcua -p pb-streams -p pb-http -p pb-modbus -p pb-files -p pb-snmp -p pb-las \
-            -p pb-wits -p pb-websocket -p pb-sparkplug -p pb-dnp3 -p pb-can -p pb-service
+            -p pb-wits -p pb-websocket -p pb-sparkplug -p pb-dnp3 -p pb-can -p pb-gen -p pb-service
 mkdir -p modules && cp target/debug/libpb_*.so modules/     # pb_*.dll on Windows
 
 # 2. Service (always-on; owns project.json, serves localhost JSON IPC)
@@ -53,7 +53,7 @@ cargo test --workspace         # includes pb-service/tests: real service binary 
 ./scripts/modbus-rtu-smoke.sh   # Modbus RTU master + slave over a virtual serial pair (pty), no hardware
 ./scripts/files-smoke.sh        # File follow: appends, restart catch-up, rotation, column picker
 ./scripts/snmp-las-smoke.sh     # fake SNMP agent + LAS file follow / write
-./scripts/demo-smoke.sh         # pb-sim devices → every pack → the three industrial demos (all Rust)
+./scripts/demo-smoke.sh         # pb-sim devices → every pack → the three industrial demos, plus the generator demo (no devices; checks points, MQTT topics, moving data)
 ./scripts/pb-service-smoke.sh   # IPC smoke (also mqtt-smoke.sh, opcua-smoke.sh)
 ```
 
@@ -71,6 +71,7 @@ The smokes need python3 and use a private config dir, so a running UI never atta
 | `pb-abi` | Stable C ABI shared by the host and packs, plus the `Pack` trait / `export_pack!` macro that packs implement |
 | `pb-mqtt`, `pb-opcua`, `pb-streams`, `pb-http`, `pb-modbus`, `pb-files`, `pb-snmp`, `pb-las` | Protocol packs (`cdylib`) — MQTT client + embedded broker, OPC UA client + server, serial / TCP streams, HTTP / REST, Modbus TCP / RTU client + server (register maps with scaling), File follow (CSV / JSON lines), SNMP v1 / v2c GET, LAS 2.0 follow + write |
 | `pb-wits`, `pb-websocket`, `pb-sparkplug`, `pb-dnp3`, `pb-can` | Ext protocol packs (`cdylib`) — WITS level 0 in / out (TCP / serial), WebSocket JSON client + server, Sparkplug B host + edge node, DNP3 TCP master (polls + controls), CAN / SocketCAN signals (J1939 PGNs) |
+| `pb-gen` | Generator pack (`cdylib`) — synthetic signals (waveforms, random walks, process shapes, counters, formulas) on interval / random-timer / burst triggers; a source only. Models live in the plain rlib `pb-signal`, the expression language in `pb-expr` (also behind Calculation-node formulas) |
 | `pb-extkit` | Shared runtime for the ext packs: workers per connection, config diffing, output routing, status / "seen on the wire" |
 | `pb-proto` | Pure codecs shared by packs and the simulator: WITS, Sparkplug B protobuf, DNP3 (link / transport / application + demo outstation), CAN signals + SocketCAN |
 | `pb-sim` | Demo field devices (frac spread, bottling line, lift station) and `watch` / `check` point tools |

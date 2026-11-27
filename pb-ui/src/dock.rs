@@ -38,6 +38,8 @@ pub enum DockPane {
     Dnp3,
     /// CAN bus (SocketCAN).
     Can,
+    /// Generator (synthetic signals).
+    Gen,
     /// One pane that hosts every protocol's config behind a dropdown.
     Protocols,
     /// In-app user guide.
@@ -58,7 +60,7 @@ impl DockPane {
     ];
 
     /// Every protocol pane, in dropdown order.
-    pub const PROTOCOLS: [DockPane; 13] = [
+    pub const PROTOCOLS: [DockPane; 14] = [
         DockPane::Streams,
         DockPane::Modbus,
         DockPane::Mqtt,
@@ -72,6 +74,7 @@ impl DockPane {
         DockPane::Sparkplug,
         DockPane::Dnp3,
         DockPane::Can,
+        DockPane::Gen,
     ];
 
     /// True for a protocol pane (one shown inside Protocols or popped out).
@@ -106,6 +109,7 @@ impl DockPane {
             Self::Sparkplug => Some(ExtProto::Sparkplug),
             Self::Dnp3 => Some(ExtProto::Dnp3),
             Self::Can => Some(ExtProto::Can),
+            Self::Gen => Some(ExtProto::Gen),
             _ => None,
         }
     }
@@ -117,6 +121,7 @@ impl DockPane {
             ExtProto::Sparkplug => Self::Sparkplug,
             ExtProto::Dnp3 => Self::Dnp3,
             ExtProto::Can => Self::Can,
+            ExtProto::Gen => Self::Gen,
         }
     }
 
@@ -136,7 +141,7 @@ impl DockPane {
             Self::Http => "HTTP / REST",
             Self::Las => "LAS",
             Self::Snmp => "SNMP",
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can => self.ext().map(|e| e.title()).unwrap_or(""),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => self.ext().map(|e| e.title()).unwrap_or(""),
             Self::Protocols => "Protocols",
             Self::Help => "Help",
         }
@@ -158,7 +163,7 @@ impl DockPane {
             Self::Http => "http",
             Self::Las => "las",
             Self::Snmp => "snmp",
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can => self.ext().map(|e| e.id()).unwrap_or(""),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => self.ext().map(|e| e.id()).unwrap_or(""),
             Self::Protocols => "protocols",
             Self::Help => "help",
         }
@@ -175,7 +180,7 @@ impl DockPane {
             Self::Http => Some(EngineId::Http),
             Self::Las => Some(EngineId::Las),
             Self::Snmp => Some(EngineId::Snmp),
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can => self.ext().map(|e| e.engine()),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => self.ext().map(|e| e.engine()),
             _ => None,
         }
     }
@@ -197,7 +202,7 @@ impl DockPane {
             Self::Http => Proto::HTTP,
             Self::Las => Proto::LAS,
             Self::Snmp => Proto::SNMP,
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can => self.ext().map(|e| e.ink_core()).unwrap_or(Proto::TEAL),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => self.ext().map(|e| e.ink_core()).unwrap_or(Proto::TEAL),
             Self::Protocols => Proto::COPPER,
             Self::Help => Proto::TEAL,
         }
@@ -223,7 +228,7 @@ impl DockPane {
             Self::Http => Proto::HTTP_DEEP,
             Self::Las => Proto::LAS_DEEP,
             Self::Snmp => Proto::SNMP_DEEP,
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can => self.ext().map(|e| e.ink_deep()).unwrap_or(Proto::TEAL_DEEP),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => self.ext().map(|e| e.ink_deep()).unwrap_or(Proto::TEAL_DEEP),
             Self::Protocols => Proto::COPPER_DEEP,
             Self::Help => Proto::TEAL_DEEP,
         }

@@ -32,6 +32,20 @@ pub struct CalcRuntime {
     roc_prev: HashMap<u64, Sample>,
     /// Last digital state for hysteresis.
     hyst_on: HashMap<u64, bool>,
+    /// Formula calcs: compiled expression (cached by source text) and per-step state.
+    formulas: HashMap<u64, FormulaState>,
+}
+
+/// State a formula calc keeps between values: what `prev`, `dt`, `t` and `n` read, and its RNG.
+#[derive(Debug)]
+struct FormulaState {
+    src: String,
+    expr: Result<pb_expr::Expr, String>,
+    rng: pb_expr::Rng,
+    first_ms: u64,
+    last_ms: u64,
+    prev: f64,
+    n: u64,
 }
 
 impl CalcRuntime {
@@ -40,6 +54,7 @@ impl CalcRuntime {
         self.rolling.clear();
         self.roc_prev.clear();
         self.hyst_on.clear();
+        self.formulas.clear();
     }
 }
 
@@ -52,6 +67,101 @@ pub fn deadband_step(held: Option<f64>, x: f64, band: f64) -> (f64, f64) {
         Some(h) if (x - h).abs() > band => (x, x),
         Some(h) => (h, h),
     }
+}
+
+/// Variables a formula sees. `x`/`A` is the input, `B` is Param B as a number, `t` seconds since
+/// this calc's first value, `dt` seconds since its previous value, `prev` its previous output
+/// (the input at first), `n` the number of values so far.
+struct FormulaVars {
+    x: f64,
+    b: f64,
+    t: f64,
+    dt: f64,
+    prev: f64,
+    n: f64,
+}
+
+fn run_formula(expr: &pb_expr::Expr, v: &FormulaVars, rng: &mut pb_expr::Rng) -> Result<f64, String> {
+    let look = |name: &str| match name {
+        "x" | "X" | "A" | "a" => Some(v.x),
+        "B" | "b" => Some(v.b),
+        "t" => Some(v.t),
+        "dt" => Some(v.dt),
+        "prev" => Some(v.prev),
+        "n" => Some(v.n),
+        _ => None,
+    };
+    expr.eval(&look, rng)
+}
+
+fn new_formula_state(cfg: &CalcConfig, src: &str, x: f64, at_ms: u64) -> FormulaState {
+    FormulaState {
+        src: src.to_string(),
+        expr: pb_expr::compile(src).map_err(|e| e.to_string()),
+        rng: pb_expr::Rng::new(pb_expr::Rng::from_clock().next_u64() ^ cfg.id),
+        first_ms: at_ms,
+        last_ms: at_ms,
+        prev: x,
+        n: 0,
+    }
+}
+
+/// Evaluate a formula calc for input `x` at `at_ms`, keeping its state. A bad formula (or an
+/// error such as a division by zero) passes the input through unchanged.
+fn formula_value(cfg: &CalcConfig, rt: &mut CalcRuntime, x: f64, at_ms: u64) -> String {
+    let src = cfg.formula.trim();
+    if src.is_empty() {
+        return fmt_num(x);
+    }
+    if rt.formulas.get(&cfg.id).is_none_or(|s| s.src != src) {
+        rt.formulas.insert(cfg.id, new_formula_state(cfg, src, x, at_ms));
+    }
+    let b = parse_f64(&cfg.param_b).unwrap_or(0.0);
+    let st = rt.formulas.get_mut(&cfg.id).expect("just inserted");
+    let Ok(expr) = &st.expr else { return fmt_num(x) };
+    let vars = FormulaVars { x, b, t: at_ms.saturating_sub(st.first_ms) as f64 / 1000.0, dt: at_ms.saturating_sub(st.last_ms) as f64 / 1000.0, prev: st.prev, n: st.n as f64 };
+    match run_formula(expr, &vars, &mut st.rng) {
+        Ok(y) => {
+            st.prev = y;
+            st.last_ms = at_ms;
+            st.n += 1;
+            fmt_num(y)
+        }
+        Err(_) => fmt_num(x),
+    }
+}
+
+/// Like [`formula_value`] but leaves the state alone (the UI preview): reads `prev` / `n` when the
+/// calc has run, otherwise starts fresh.
+fn formula_peek(cfg: &CalcConfig, rt: &CalcRuntime, x: f64, at_ms: u64) -> String {
+    let src = cfg.formula.trim();
+    if src.is_empty() {
+        return fmt_num(x);
+    }
+    let fresh;
+    let st = match rt.formulas.get(&cfg.id).filter(|s| s.src == src) {
+        Some(s) => s,
+        None => {
+            fresh = new_formula_state(cfg, src, x, at_ms);
+            &fresh
+        }
+    };
+    let Ok(expr) = &st.expr else { return fmt_num(x) };
+    let vars = FormulaVars {
+        x,
+        b: parse_f64(&cfg.param_b).unwrap_or(0.0),
+        t: at_ms.saturating_sub(st.first_ms) as f64 / 1000.0,
+        dt: at_ms.saturating_sub(st.last_ms) as f64 / 1000.0,
+        prev: st.prev,
+        n: st.n as f64,
+    };
+    let mut rng = st.rng.clone();
+    run_formula(expr, &vars, &mut rng).map(fmt_num).unwrap_or_else(|_| fmt_num(x))
+}
+
+/// Syntax check for the formula editor: `Ok` when it compiles, else the message with its column.
+pub fn check_formula(src: &str) -> Result<(), String> {
+    pb_expr::compile(src).map(|_| ()).map_err(|e| e.to_string())
 }
 
 fn parse_f64(s: &str) -> Option<f64> {
@@ -332,6 +442,7 @@ fn peek_one(cfg: &CalcConfig, rt: &CalcRuntime, raw: &str, now_ms: u64) -> Strin
             let hi = parse_f64(&cfg.param_b).unwrap_or(100.0);
             fmt_num(x.clamp(lo.min(hi), lo.max(hi)))
         }
+        "formula" => formula_peek(cfg, rt, x, now_ms),
         _ => raw.to_string(),
     }
 }
@@ -384,6 +495,7 @@ fn apply_one(cfg: &CalcConfig, rt: &mut CalcRuntime, raw: &str, at_ms: u64) -> S
             let hi = parse_f64(&cfg.param_b).unwrap_or(100.0);
             fmt_num(x.clamp(lo.min(hi), lo.max(hi)))
         }
+        "formula" => formula_value(cfg, rt, x, at_ms),
         _ => raw.to_string(),
     }
 }
@@ -391,6 +503,88 @@ fn apply_one(cfg: &CalcConfig, rt: &mut CalcRuntime, raw: &str, at_ms: u64) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn formula(id: u64, src: &str) -> CalcConfig {
+        CalcConfig { id, kind: "formula".into(), source_point: "p".into(), formula: src.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn formula_calc_evaluates_with_the_input_and_b() {
+        let mut rt = CalcRuntime::default();
+        let f = [formula(1, "(A * 1.8) + 32")];
+        assert_eq!(apply_at(&f, &mut rt, "p", "100", 1_000), "212");
+        assert_eq!(apply_at(&f, &mut rt, "p", "-40", 2_000), "-40");
+        let mut g = formula(2, "x * 2 + B");
+        g.param_b = "5".into();
+        assert_eq!(apply_at(&[g], &mut rt, "p", "10", 3_000), "25");
+        // Functions and the ternary work too.
+        let h = [formula(3, "x > 50 ? clamp(x, 0, 80) : abs(x - 100)")];
+        assert_eq!(apply_at(&h, &mut rt, "p", "90", 4_000), "80");
+        assert_eq!(apply_at(&h, &mut rt, "p", "30", 5_000), "70");
+    }
+
+    #[test]
+    fn formula_calc_tracks_prev_dt_t_and_n() {
+        let mut rt = CalcRuntime::default();
+        // A running total: prev + x · dt (a totaliser from a rate, correct for irregular timing).
+        let f = [formula(1, "prev + x * dt")];
+        assert_eq!(apply_at(&f, &mut rt, "p", "10", 0), "10", "first value: prev starts as the input, dt is 0");
+        assert_eq!(apply_at(&f, &mut rt, "p", "10", 2_000), "30");
+        assert_eq!(apply_at(&f, &mut rt, "p", "5", 3_000), "35");
+        let g = [formula(2, "t * 1000 + n")];
+        assert_eq!(apply_at(&g, &mut rt, "p", "0", 10_000), "0");
+        assert_eq!(apply_at(&g, &mut rt, "p", "0", 12_000), "2001");
+        assert_eq!(apply_at(&g, &mut rt, "p", "0", 13_000), "3002");
+    }
+
+    #[test]
+    fn formula_calc_can_make_a_random_walk() {
+        // The original question: random data inside a calculation formula.
+        let mut rt = CalcRuntime::default();
+        let f = [formula(7, "clamp(prev + randn(), 0, 10)")];
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..500u64 {
+            let y = apply_at(&f, &mut rt, "p", "5", i * 100);
+            let v: f64 = y.parse().unwrap();
+            assert!((0.0..=10.0).contains(&v), "{v}");
+            seen.insert(y);
+        }
+        assert!(seen.len() > 50, "it wanders: {} distinct values", seen.len());
+        // rand(lo, hi) stays in range.
+        let r = [formula(8, "rand(10, 20)")];
+        for i in 0..200u64 {
+            let v: f64 = apply_at(&r, &mut rt, "p", "0", i).parse().unwrap();
+            assert!((10.0..=20.0).contains(&v));
+        }
+    }
+
+    #[test]
+    fn bad_formulas_pass_the_input_through() {
+        let mut rt = CalcRuntime::default();
+        for src in ["", "1 +", "nope(1)", "x / 0", "undefined_name + 1"] {
+            assert_eq!(apply_at(&[formula(9, src)], &mut rt, "p", "42", 1_000), "42", "{src:?}");
+        }
+        assert!(check_formula("x * 2").is_ok());
+        assert!(check_formula("x * ").unwrap_err().contains("column"));
+        // Non-numeric input is untouched.
+        assert_eq!(apply_at(&[formula(9, "x + 1")], &mut rt, "p", "abc", 1_000), "abc");
+    }
+
+    #[test]
+    fn editing_a_formula_restarts_its_state_and_peek_does_not_mutate() {
+        let mut rt = CalcRuntime::default();
+        assert_eq!(apply_at(&[formula(1, "prev + 1")], &mut rt, "p", "0", 0), "1");
+        assert_eq!(apply_at(&[formula(1, "prev + 1")], &mut rt, "p", "0", 1_000), "2");
+        // Peeking shows the next value but does not advance it.
+        assert_eq!(peek_for_point(&[formula(1, "prev + 1")], &rt, "p", "0"), "3");
+        assert_eq!(peek_for_point(&[formula(1, "prev + 1")], &rt, "p", "0"), "3");
+        assert_eq!(apply_at(&[formula(1, "prev + 1")], &mut rt, "p", "0", 2_000), "3");
+        // A different formula text starts over (prev = the input again).
+        assert_eq!(apply_at(&[formula(1, "prev + 10")], &mut rt, "p", "100", 3_000), "110");
+        rt.clear();
+        assert_eq!(apply_at(&[formula(1, "prev + 10")], &mut rt, "p", "100", 4_000), "110");
+    }
+
 
     #[test]
     fn deadband_holds_inside_band() {

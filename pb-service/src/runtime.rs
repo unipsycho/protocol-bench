@@ -1243,6 +1243,44 @@ mod ext_tests {
     }
 
     #[test]
+    fn generator_config_carries_signals_triggers_and_sources() {
+        let spec = pb_points::addr::ext_spec("gen").unwrap();
+        let section = serde_json::json!({"connections":[{"id":"plant","seed":42,"speed":2.0}]});
+        let hubs = serde_json::json!({"hubs":[{"protocol":"Mqtt","sources":[
+            {"protocol":"Gen","ext_connection":"plant","ext_inputs":[
+                {"name":"tank_level","model":"triangle","low":20,"high":85,"period":180,"duty":65,"trigger":"interval","every":1,"point":"tank_level"},
+                {"name":"alarm","model":"flip","prob":8,"trigger":"random","every_min":2,"every_max":20,"point":""},
+                {"name":" ","model":"sine","point":""}]},
+            {"protocol":"Gen","ext_connection":"plant","ext_inputs":[
+                {"name":"parts","model":"counter","trigger":"burst","burst_count":6,"burst_gap":0.2,"idle_min":10,"idle_max":25,"point":""}]},
+            {"protocol":"Gen","ext_connection":"","ext_inputs":[{"name":"orphan","point":""}]}],
+            "outputs":[]}]});
+        let out: serde_json::Value = serde_json::from_str(&build_ext_configure(spec, &section, Some(&hubs))).unwrap();
+        assert_eq!(out["connections"][0]["seed"], 42);
+        assert_eq!(out["connections"][0]["speed"], 2.0);
+        let ins = out["inputs"].as_array().unwrap();
+        assert_eq!(ins.len(), 2, "one group per Input node; a node with no board and a nameless signal are dropped");
+        assert_eq!(ins[0]["binds"].as_array().unwrap().len(), 2);
+        assert_eq!(ins[0]["binds"][0]["source"], "gen/plant::tank_level");
+        assert_eq!(ins[0]["binds"][0]["duty"], 65, "model parameters pass through untouched");
+        assert_eq!(ins[0]["binds"][1]["trigger"], "random");
+        assert_eq!(ins[1]["binds"][0]["source"], "gen/plant::parts");
+        assert_eq!(ins[1]["binds"][0]["burst_count"], 6);
+        assert!(out["outputs"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn generator_points_get_short_ids_named_gen_n() {
+        let mut store = PointStore::new();
+        let value = serde_json::json!({"hubs":{"hubs":[{"sources":[
+            {"protocol":"Gen","ext_connection":"plant","ext_inputs":[{"name":"tank_level","point":""},{"name":"pump","point":"pump_run"}]}],
+            "outputs":[]}]}});
+        materialize_hub_binds_json(&value, &mut store);
+        assert_eq!(store.id_for_source("gen/plant::tank_level"), Some("gen_1"));
+        assert_eq!(store.id_for_source("gen/plant::pump"), Some("pump_run"));
+    }
+
+    #[test]
     fn materialize_allocates_ext_ids_with_numeric_fields() {
         let mut store = PointStore::new();
         let value = serde_json::json!({"hubs":{"hubs":[{"sources":[

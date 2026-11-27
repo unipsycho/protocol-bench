@@ -35,6 +35,8 @@ pub enum ExtProto {
     Sparkplug,
     Dnp3,
     Can,
+    /// Generator: synthetic signals, no device.
+    Gen,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -234,8 +236,103 @@ const CAN: UiSpec = UiSpec {
     note: "Test without hardware: sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0.",
 };
 
+/// Every model, in the order the catalog shows them (`gen_ui::MODELS` adds the words).
+pub const GEN_MODELS: &[(&str, &str)] = &[
+    ("constant", "Constant"),
+    ("sine", "Sine"),
+    ("square", "Square"),
+    ("triangle", "Triangle"),
+    ("sawtooth", "Sawtooth"),
+    ("ramp", "Ramp"),
+    ("noise", "Noise"),
+    ("uniform", "Uniform random"),
+    ("walk", "Random walk"),
+    ("drift", "Drift (mean-reverting)"),
+    ("lag", "Wandering setpoint"),
+    ("sequence", "Sequence"),
+    ("cycle", "On / off cycle"),
+    ("toggle", "Toggle"),
+    ("flip", "Random on / off"),
+    ("counter", "Counter"),
+    ("totaliser", "Totaliser"),
+    ("formula", "Formula"),
+];
+
+const GEN_TRIGGERS: &[(&str, &str)] = &[("interval", "Regular interval"), ("random", "Random timer"), ("burst", "Bursts")];
+const GEN_EDGES: &[(&str, &str)] = &[("hold", "Hold at the limit"), ("wrap", "Wrap around"), ("bounce", "Bounce back")];
+
+const M_RANGE: &[&str] = &["sine", "square", "triangle", "sawtooth", "ramp", "uniform", "walk", "lag"];
+const M_PERIODIC: &[&str] = &["sine", "square", "triangle", "sawtooth"];
+const M_DUTY: &[&str] = &["square", "triangle"];
+const M_NOISY: &[&str] = &["sine", "square", "triangle", "sawtooth", "ramp", "lag", "totaliser"];
+const M_START: &[&str] = &["ramp", "walk", "totaliser", "counter"];
+const M_RATE: &[&str] = &["ramp", "totaliser"];
+const M_MEAN: &[&str] = &["noise", "drift"];
+const M_FLOAT: &[&str] = &["constant", "sine", "square", "triangle", "sawtooth", "ramp", "noise", "uniform", "walk", "drift", "lag", "sequence", "totaliser", "formula"];
+
+/// Index ranges of `GEN_FIELDS` by group (the inspector draws each group under its own heading).
+pub const GEN_SHAPE: std::ops::Range<usize> = 2..25;
+pub const GEN_TRIGGER: std::ops::Range<usize> = 25..33;
+pub const GEN_OUT: std::ops::Range<usize> = 33..34;
+
+const GEN_FIELDS: &[Field] = &[
+    // identity (0..2)
+    f("name", "Name", Kind::Text, Def::S(""), 120.0, "the point name — formulas refer to it, e.g. tank_level"),
+    f("model", "Type", Kind::Choice(GEN_MODELS), Def::S("sine"), 170.0, ""),
+    // shape (2..25)
+    fs("value", "Value", num(-1e12, 1e12, 4), Def::N(0.0), 70.0, "", ("model", &["constant"])),
+    fs("low", "Min", num(-1e12, 1e12, 4), Def::N(0.0), 70.0, "lowest value", ("model", M_RANGE)),
+    fs("high", "Max", num(-1e12, 1e12, 4), Def::N(100.0), 70.0, "highest value", ("model", M_RANGE)),
+    fs("period", "Period (s)", num(0.001, 1e7, 3), Def::N(60.0), 62.0, "one full cycle — model seconds", ("model", M_PERIODIC)),
+    fs("phase", "Phase (°)", num(-360.0, 360.0, 0), Def::N(0.0), 62.0, "shift the wave: 90 starts at the peak", ("model", &["sine"])),
+    fs("duty", "Duty (%)", num(1.0, 99.0, 0), Def::N(50.0), 62.0, "square: time spent high · triangle: share spent rising", ("model", M_DUTY)),
+    fs("start", "Start at", num(-1e12, 1e12, 4), Def::N(0.0), 70.0, "first value", ("model", M_START)),
+    fs("rate", "Rate /s", num(-1e9, 1e9, 4), Def::N(1.0), 70.0, "units per second (negative = falling)", ("model", M_RATE)),
+    fs("edge", "At limits", Kind::Choice(GEN_EDGES), Def::S("hold"), 140.0, "what a ramp does at Min / Max", ("model", &["ramp"])),
+    fs("mean", "Mean", num(-1e12, 1e12, 4), Def::N(50.0), 70.0, "centre value", ("model", M_MEAN)),
+    fs("sigma", "Spread σ", num(0.0, 1e9, 4), Def::N(1.0), 62.0, "noise: standard deviation · drift: volatility per √s", ("model", M_MEAN)),
+    fs("reversion", "Pull back", num(0.0, 1e3, 4), Def::N(0.1), 62.0, "per second; 0 = free random walk", ("model", &["drift"])),
+    fs("step", "Step", num(-1e9, 1e9, 4), Def::N(1.0), 70.0, "walk: typical move per value · counter: added each value", ("model", &["walk", "counter"])),
+    fs("wrap", "Roll over at", num(0.0, 1e12, 0), Def::N(0.0), 70.0, "counter wraps to 0 here (0 = never)", ("model", &["counter"])),
+    fs("hold", "Retarget (s)", num(0.001, 1e7, 2), Def::N(30.0), 62.0, "how long each random setpoint lasts", ("model", &["lag"])),
+    fs("tau", "Response (s)", num(0.001, 1e6, 2), Def::N(5.0), 62.0, "time constant — larger = slower to follow", ("model", &["lag"])),
+    fs("noise", "Noise σ", num(0.0, 1e9, 4), Def::N(0.0), 62.0, "random jitter added on top", ("model", M_NOISY)),
+    fs("on_secs", "On (s)", num(0.001, 1e7, 2), Def::N(30.0), 70.0, "", ("model", &["cycle"])),
+    fs("off_secs", "Off (s)", num(0.001, 1e7, 2), Def::N(30.0), 70.0, "", ("model", &["cycle"])),
+    fs("prob", "Chance %", num(0.0, 100.0, 1), Def::N(50.0), 62.0, "probability each value is true", ("model", &["flip"])),
+    fs("values", "Values", Kind::Text, Def::S("10, 20, 30"), 150.0, "comma separated; steps through them", ("model", &["sequence"])),
+    fs("loop", "Repeat", Kind::Bool, Def::B(true), 60.0, "off = stay on the last value", ("model", &["sequence"])),
+    fs("expr", "Formula", Kind::Text, Def::S("50 + 10 * sin(t / 20) + randn()"), 150.0, "t, dt, prev, n, other signal names; sin cos abs min max clamp rand() randn() noise(x) if(c,a,b) …", ("model", &["formula"])),
+    // trigger (25..33)
+    f("trigger", "Generate", Kind::Choice(GEN_TRIGGERS), Def::S("interval"), 140.0, "when a new value is produced"),
+    fs("every", "Every (s)", num(0.001, 86400.0, 3), Def::N(1.0), 62.0, "", ("trigger", &["interval"])),
+    fs("every_min", "Min (s)", num(0.001, 86400.0, 3), Def::N(0.5), 62.0, "shortest wait before the next value", ("trigger", &["random"])),
+    fs("every_max", "Max (s)", num(0.001, 86400.0, 3), Def::N(5.0), 62.0, "longest wait before the next value", ("trigger", &["random"])),
+    fs("burst_count", "Per burst", INT(1.0, 10000.0), Def::N(5.0), 62.0, "values in each burst", ("trigger", &["burst"])),
+    fs("burst_gap", "Gap (s)", num(0.001, 3600.0, 3), Def::N(0.1), 62.0, "time between values inside a burst", ("trigger", &["burst"])),
+    fs("idle_min", "Idle min (s)", num(0.001, 86400.0, 2), Def::N(5.0), 62.0, "quiet time between bursts — shortest", ("trigger", &["burst"])),
+    fs("idle_max", "Idle max (s)", num(0.001, 86400.0, 2), Def::N(15.0), 62.0, "quiet time between bursts — longest", ("trigger", &["burst"])),
+    // output (33..34)
+    fs("decimals", "Decimals", INT(0.0, 9.0), Def::N(3.0), 50.0, "round to this many places", ("model", M_FLOAT)),
+];
+
+const GEN: UiSpec = UiSpec {
+    blurb: "Invents data instead of reading a device — waveforms, random walks, process shapes, counters and your own formulas — on a regular, random or burst timer. Wire its points to a hub, Aggregator, Calculation or Output like any other source.",
+    conn_fields: &[
+        f("seed", "Random seed", INT(0.0, 2_000_000_000.0), Def::N(0.0), 100.0, "0 = different every run · any other number repeats the same data"),
+        f("speed", "Time scale ×", num(0.01, 100000.0, 2), Def::N(1.0), 90.0, "model seconds per real second — 60 makes a minute of waveform pass each second"),
+    ],
+    in_fields: GEN_FIELDS,
+    out_fields: &[],
+    in_heading: "SIGNALS → gen_N",
+    out_heading: "",
+    interval_in: None,
+    interval_out: None,
+    note: "Each signal below is one point. A signal's formula can read any other signal on the same board by name. Nothing can be wired into a generator.",
+};
+
 impl ExtProto {
-    pub const ALL: [ExtProto; 5] = [ExtProto::Wits, ExtProto::WebSocket, ExtProto::Sparkplug, ExtProto::Dnp3, ExtProto::Can];
+    pub const ALL: [ExtProto; 6] = [ExtProto::Wits, ExtProto::WebSocket, ExtProto::Sparkplug, ExtProto::Dnp3, ExtProto::Can, ExtProto::Gen];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -244,6 +341,7 @@ impl ExtProto {
             Self::Sparkplug => "sparkplug",
             Self::Dnp3 => "dnp3",
             Self::Can => "can",
+            Self::Gen => "gen",
         }
     }
 
@@ -254,6 +352,7 @@ impl ExtProto {
             Self::Sparkplug => "Sparkplug B",
             Self::Dnp3 => "DNP3",
             Self::Can => "CAN bus",
+            Self::Gen => "Generator",
         }
     }
 
@@ -272,6 +371,7 @@ impl ExtProto {
             Self::Sparkplug => &SPARKPLUG,
             Self::Dnp3 => &DNP3,
             Self::Can => &CAN,
+            Self::Gen => &GEN,
         }
     }
 
@@ -287,6 +387,7 @@ impl ExtProto {
             Self::Sparkplug => Color32::from_rgb(0xf2, 0x72, 0xb6),
             Self::Dnp3 => Color32::from_rgb(0xb8, 0xe0, 0x5c),
             Self::Can => Color32::from_rgb(0xff, 0xd1, 0x66),
+            Self::Gen => Color32::from_rgb(0x7d, 0xe0, 0x9a),
         }
     }
 
@@ -298,6 +399,7 @@ impl ExtProto {
             Self::Sparkplug => Color32::from_rgb(0x9a, 0x1f, 0x60),
             Self::Dnp3 => Color32::from_rgb(0x4a, 0x6e, 0x10),
             Self::Can => Color32::from_rgb(0x8a, 0x62, 0x00),
+            Self::Gen => Color32::from_rgb(0x1d, 0x76, 0x3f),
         }
     }
 
@@ -339,6 +441,11 @@ fn num_of(o: &Obj, fd: &Field) -> f64 {
     }
 }
 
+/// Whether `fd` shows for the current values of `o` (its `show` rule).
+pub fn is_visible(o: &Obj, fd: &Field, fields: &[Field]) -> bool {
+    visible(o, fd, fields)
+}
+
 fn visible(o: &Obj, fd: &Field, fields: &[Field]) -> bool {
     match fd.show {
         None => true,
@@ -361,6 +468,16 @@ pub fn obj_with_defaults(fields: &[Field]) -> Obj {
     o
 }
 
+/// `v` with at most `dec` decimals and no trailing zeros.
+fn trim_number(v: f64, dec: usize) -> String {
+    let s = format!("{v:.dec$}");
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    }
+}
+
 /// One field editor of width `w`. Returns true when the value changed.
 fn field_widget(ui: &mut Ui, salt: egui::Id, fd: &Field, o: &mut Obj, w: f32) -> bool {
     let h = crate::form::ROW_H - 2.0;
@@ -378,7 +495,12 @@ fn field_widget(ui: &mut Ui, salt: egui::Id, fd: &Field, o: &mut Obj, w: f32) ->
         Kind::Num { min, max, dec } => {
             let mut x = num_of(o, fd);
             let speed = if dec == 0 { 1.0 } else { 10f64.powi(-(dec.min(3) as i32)) };
-            let r = ui.add_sized([w, h], egui::DragValue::new(&mut x).range(min..=max).speed(speed).max_decimals(dec));
+            let mut dv = egui::DragValue::new(&mut x).range(min..=max).speed(speed).max_decimals(dec);
+            if dec > 0 {
+                // "60" not "60.000": show only the decimals a value needs (keeps narrow forms narrow).
+                dv = dv.custom_formatter(move |v, _| trim_number(v, dec)).custom_parser(|s| s.trim().replace(',', ".").parse::<f64>().ok());
+            }
+            let r = ui.add_sized([w, h], dv);
             let r = if fd.hint.is_empty() { r } else { r.on_hover_text(fd.hint) };
             if r.changed() {
                 o.insert(fd.key.into(), if dec == 0 { Value::from(x.round() as i64) } else { Value::from(x) });
@@ -500,7 +622,7 @@ pub fn live_for(host: &HostSnapshot, proto: ExtProto) -> (Vec<LiveLink>, bool) {
     }
 }
 
-fn status_dot(link: Option<&LiveLink>, pack_loaded: bool, enabled: bool, p: &ThemePalette) -> (Color32, String) {
+pub(crate) fn status_dot(link: Option<&LiveLink>, pack_loaded: bool, enabled: bool, p: &ThemePalette) -> (Color32, String) {
     if !pack_loaded {
         return (p.warn, "pack not loaded".into());
     }
@@ -540,6 +662,8 @@ pub struct ExtSections {
     pub dnp3: ExtSection,
     #[serde(default)]
     pub can: ExtSection,
+    #[serde(default)]
+    pub gen: ExtSection,
 }
 
 impl ExtSections {
@@ -550,6 +674,7 @@ impl ExtSections {
             ExtProto::Sparkplug => &self.sparkplug,
             ExtProto::Dnp3 => &self.dnp3,
             ExtProto::Can => &self.can,
+            ExtProto::Gen => &self.gen,
         }
     }
     pub fn get_mut(&mut self, p: ExtProto) -> &mut ExtSection {
@@ -559,6 +684,7 @@ impl ExtSections {
             ExtProto::Sparkplug => &mut self.sparkplug,
             ExtProto::Dnp3 => &mut self.dnp3,
             ExtProto::Can => &mut self.can,
+            ExtProto::Gen => &mut self.gen,
         }
     }
     pub fn from_panels(panels: &ExtPanels) -> Self {
@@ -658,10 +784,19 @@ fn conn_summary(proto: ExtProto, c: &Obj) -> String {
         ExtProto::Sparkplug => format!("{} · {}:{} · {}{}", s("role"), s("host"), s("port"), s("group_id"), if s("edge_node_id").is_empty() { String::new() } else { format!("/{}", s("edge_node_id")) }),
         ExtProto::Dnp3 => format!("{}:{} · {} → {}", s("host"), s("port"), s("master_address"), s("outstation_address")),
         ExtProto::Can => format!("SocketCAN {}", s("interface")),
+        ExtProto::Gen => {
+            let seed = s("seed");
+            let speed = s("speed");
+            let mut out = if seed.is_empty() || seed == "0" { "random seed".to_string() } else { format!("seed {seed}") };
+            if !speed.is_empty() && speed != "1" {
+                out.push_str(&format!(" · ×{speed}"));
+            }
+            out
+        }
     }
 }
 
-fn section(ui: &mut Ui, title: &str, p: &ThemePalette) {
+pub(crate) fn section(ui: &mut Ui, title: &str, p: &ThemePalette) {
     ui.label(RichText::new(title).font(font_ui(10.5)).color(p.muted));
     ui.add_space(space::AFTER_HEADING);
 }
@@ -804,7 +939,8 @@ fn paint_panel_body(ui: &mut Ui, p: &ThemePalette, st: &mut ExtPanelState, host:
     // Seen on the wire.
     if let Some(l) = link.filter(|l| !l.seen.is_empty()) {
         ui.add_space(space::SECTION);
-        section(ui, &format!("SEEN ON THE WIRE  ·  {}", l.seen.len()), p);
+        let heading = if proto == ExtProto::Gen { "LIVE SIGNALS" } else { "SEEN ON THE WIRE" };
+        section(ui, &format!("{heading}  ·  {}", l.seen.len()), p);
         if l.seen.len() > 10 {
             ui.add(egui::TextEdit::singleline(&mut st.seen_filter).hint_text("filter").desired_width(180.0));
         }
@@ -815,9 +951,14 @@ fn paint_panel_body(ui: &mut Ui, p: &ThemePalette, st: &mut ExtPanelState, host:
             if k % 2 == 1 {
                 ui.painter().rect_filled(r, Rounding::same(3.0), tint(p.line, 40));
             }
-            ui.painter().text(r.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, &s.label, font_ui(12.0), p.text);
-            ui.painter().text(r.right_center() - vec2(6.0, 0.0), Align2::RIGHT_CENTER, s.value.chars().take(32).collect::<String>(), font_mono(11.5), ink);
+            let vr = ui.painter().text(r.right_center() - vec2(6.0, 0.0), Align2::RIGHT_CENTER, s.value.chars().take(32).collect::<String>(), font_mono(11.5), ink);
+            let label = crate::register_map::clip_text(ui, &s.label, font_ui(12.0), (vr.min.x - r.min.x - 18.0).max(40.0));
+            ui.painter().text(r.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, label, font_ui(12.0), p.text);
         }
+    }
+    if proto == ExtProto::Gen {
+        ui.add_space(space::SECTION);
+        crate::gen_ui::types_reference(ui, p);
     }
     dirty
 }
@@ -836,6 +977,11 @@ pub fn bind_label(proto: ExtProto, b: &Obj) -> String {
         if !name.is_empty() {
             s = format!("{code} {name}");
         }
+    }
+    if proto == ExtProto::Gen {
+        let model = text_of(b, "model");
+        let name = text_of(b, "name");
+        return if model.is_empty() { name } else { format!("{name} · {model}") };
     }
     if s.is_empty() {
         "(whole message)".into()
@@ -870,7 +1016,7 @@ pub fn bind_source(proto: ExtProto, conn: &str, b: &Obj) -> Option<String> {
     ext_leaf(spec, |k| text_of(b, k)).map(|leaf| ext_bind_source(spec, conn, &leaf))
 }
 
-fn live_value<'a>(host: &'a HostSnapshot, point: &str, source: Option<&str>) -> Option<&'a pb_engine::PointSnapshot> {
+pub(crate) fn live_value<'a>(host: &'a HostSnapshot, point: &str, source: Option<&str>) -> Option<&'a pb_engine::PointSnapshot> {
     let pt = point.trim();
     if !pt.is_empty() {
         if let Some(x) = host.points.iter().find(|p| p.name == pt) {
@@ -889,6 +1035,8 @@ struct PortDraft {
 
 /// Fields of a hub port that the ext protocols use.
 pub struct PortFields<'a> {
+    /// Signal names already used by the board's other Generator nodes (they share one namespace).
+    pub other_names: Vec<String>,
     pub conn: &'a mut String,
     pub interval: &'a mut f32,
     pub inputs: &'a mut Vec<Obj>,
@@ -908,6 +1056,10 @@ pub fn edit_port(
     points: &[String],
     p: &ThemePalette,
 ) -> bool {
+    if proto == ExtProto::Gen {
+        // Generators have their own catalog-style inspector (and no Output side).
+        return incoming && crate::gen_ui::edit_port(ui, port_key, port, conns, host, p);
+    }
     apply_form_spacing(ui);
     let spec = proto.spec();
     let ink = if p.is_light { proto.ink_deep() } else { proto.ink_core() };
@@ -1167,6 +1319,21 @@ pub fn paint_icon(painter: &Painter, proto: ExtProto, r: Rect, stroke: Stroke, i
             painter.line_segment([n(r, 0.72, 0.50), n(r, 0.86, 0.50)], stroke);
             painter.line_segment([n(r, 0.72, 0.64), n(r, 0.86, 0.64)], stroke);
         }
+        ExtProto::Gen => {
+            // A wave leaving a small source box: sine through a dashed baseline.
+            painter.rect_stroke(Rect::from_min_max(n(r, 0.06, 0.30), n(r, 0.30, 0.70)), Rounding::same(2.0), stroke);
+            let mut prev = None;
+            for i in 0..=20 {
+                let x = 0.38 + 0.56 * i as f32 / 20.0;
+                let y = 0.50 - 0.26 * (i as f32 / 20.0 * std::f32::consts::TAU * 1.5).sin();
+                let pt = n(r, x, y);
+                if let Some(q) = prev {
+                    painter.line_segment([q, pt], Stroke::new(stroke.width, ink));
+                }
+                prev = Some(pt);
+            }
+            painter.line_segment([n(r, 0.30, 0.50), n(r, 0.38, 0.50)], stroke);
+        }
         ExtProto::Can => {
             // Twisted pair bus with three nodes.
             painter.line_segment([n(r, 0.06, 0.40), n(r, 0.94, 0.40)], stroke);
@@ -1192,6 +1359,7 @@ pub fn paint_hero(painter: &Painter, proto: ExtProto, r: Rect) {
             ExtProto::Sparkplug => &["BIRTH", "DATA", "DEATH"],
             ExtProto::Dnp3 => &["class 0", "events", "CROB"],
             ExtProto::Can => &["SocketCAN", "J1939", "DBC"],
+            ExtProto::Gen => &["sine", "walk", "formula"],
         };
         for (i, t) in tags.iter().enumerate() {
             let c = n(r, 0.76, 0.28 + i as f32 * 0.22);

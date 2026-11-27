@@ -118,6 +118,7 @@ pub const EXT_PROTOCOLS: &[ExtSpec] = &[
     ExtSpec { id: "sparkplug", prefix: "spb", leaf_keys: &["device", "metric"], required: &["metric"] },
     ExtSpec { id: "dnp3", prefix: "dnp3", leaf_keys: &["kind", "index"], required: &["kind", "index"] },
     ExtSpec { id: "can", prefix: "can", leaf_keys: &["id", "start", "len"], required: &["id", "start", "len"] },
+    ExtSpec { id: "gen", prefix: "gen", leaf_keys: &["name"], required: &["name"] },
 ];
 
 /// Spec for a section key / port protocol name (case-insensitive).

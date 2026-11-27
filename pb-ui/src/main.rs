@@ -27,6 +27,7 @@ mod modbus_panel;
 mod mappings_panel;
 mod files_panel;
 mod form;
+mod gen_ui;
 mod opcua_browse;
 mod opcua_panel;
 mod panels;

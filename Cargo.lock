@@ -3719,10 +3719,15 @@ version = "0.1.0"
 dependencies = [
  "libloading",
  "pb-abi",
+ "pb-expr",
  "pb-points",
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "pb-expr"
+version = "0.1.0"
 
 [[package]]
 name = "pb-extkit"
@@ -3741,6 +3746,18 @@ dependencies = [
  "pb-abi",
  "pb-json",
  "pb-tail",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pb-gen"
+version = "0.1.0"
+dependencies = [
+ "pb-abi",
+ "pb-expr",
+ "pb-extkit",
+ "pb-signal",
  "serde",
  "serde_json",
 ]
@@ -3848,6 +3865,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pb-signal"
+version = "0.1.0"
+dependencies = [
+ "pb-expr",
+ "pb-extkit",
+ "serde_json",
+]
+
+[[package]]
 name = "pb-sim"
 version = "0.1.0"
 dependencies = [
@@ -3910,9 +3936,12 @@ dependencies = [
  "egui",
  "image",
  "pb-engine",
+ "pb-expr",
+ "pb-extkit",
  "pb-ipc",
  "pb-modbus",
  "pb-points",
+ "pb-signal",
  "rfd",
  "serde",
  "serde_json",

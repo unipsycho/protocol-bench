@@ -284,8 +284,11 @@ pub fn paint(
             hubs.choices.modbus_clients = modbus.choices(ModbusRole::Client);
             hubs.choices.modbus_servers = modbus.choices(ModbusRole::Server);
             hubs.choices.file_sources = files.choices();
+            let made_board = crate::gen_ui::ensure_board(hubs, ext);
             hubs.choices.ext_conns = ext.states.iter().map(|st| st.choices()).collect();
-            crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, http, streams, las, snmp, host, engine)
+            let mut change = crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, http, streams, las, snmp, host, engine);
+            change.dirty |= made_board;
+            change
         }
         DockPane::Mqtt => {
             let dirty = mqtt_panel::paint(ui, host, p, engine, mqtt, hubs);
@@ -345,7 +348,7 @@ pub fn paint(
             mappings_panel::paint(ui, host, hubs, p);
             crate::hubs::HubChange::quiet()
         }
-        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can => {
+        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can | DockPane::Gen => {
             let mut change = crate::hubs::HubChange::quiet();
             if let Some(e) = pane.ext() {
                 change.dirty = crate::ext_proto::paint_panel(ui, p, ext.get_mut(e), host);
@@ -649,7 +652,7 @@ fn columns(pane: DockPane) -> &'static [(&'static str, f32)] {
         DockPane::Http => &[("NAME", 0.28), ("URL", 0.52), ("AUTH", 0.20)],
         DockPane::Las => &[("NAME", 0.28), ("PATH", 0.48), ("ROLE", 0.24)],
         DockPane::Snmp => &[("NAME", 0.28), ("HOST", 0.44), ("VER", 0.28)],
-        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can => &[("NAME", 0.30), ("ENDPOINT", 0.50), ("STATE", 0.20)],
+        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can | DockPane::Gen => &[("NAME", 0.30), ("ENDPOINT", 0.50), ("STATE", 0.20)],
         DockPane::Project | DockPane::Hubs | DockPane::Help | DockPane::Calculations | DockPane::Protocols => &[("NAME", 1.0)],
     }
 }
@@ -667,7 +670,7 @@ fn empty_message(pane: DockPane) -> &'static str {
         DockPane::Http => "No clients yet",
         DockPane::Las => "No endpoints yet",
         DockPane::Snmp => "No targets yet",
-        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can => "No connections yet",
+        DockPane::Wits | DockPane::WebSocket | DockPane::Sparkplug | DockPane::Dnp3 | DockPane::Can | DockPane::Gen => "No connections yet",
         DockPane::Project | DockPane::Hubs | DockPane::Help | DockPane::Calculations | DockPane::Protocols => "",
     }
 }

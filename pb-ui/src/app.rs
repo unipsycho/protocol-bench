@@ -1932,6 +1932,7 @@ impl ProtocolBenchApp {
                         ("Sparkplug B", DockPane::Sparkplug),
                         ("DNP3", DockPane::Dnp3),
                         ("CAN", DockPane::Can),
+                        ("Generator", DockPane::Gen),
                         ("Points", DockPane::Points),
                     ] {
                         about_chip(ui, label, pane.ink_core(), p);

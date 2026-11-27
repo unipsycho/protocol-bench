@@ -44,10 +44,12 @@ pub enum EngineId {
     Sparkplug,
     Dnp3,
     Can,
+    /// Generator: synthetic signals instead of a device.
+    Gen,
 }
 
 impl EngineId {
-    pub const ALL: [EngineId; 13] = [
+    pub const ALL: [EngineId; 14] = [
         EngineId::Streams,
         EngineId::Modbus,
         EngineId::Mqtt,
@@ -61,6 +63,7 @@ impl EngineId {
         EngineId::Sparkplug,
         EngineId::Dnp3,
         EngineId::Can,
+        EngineId::Gen,
     ];
 
     /// Slot for an ext protocol section key (`wits`, `websocket`, …).
@@ -70,13 +73,13 @@ impl EngineId {
 
     /// True for the protocols configured through the generic ext path.
     pub fn is_ext(self) -> bool {
-        matches!(self, Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can)
+        matches!(self, Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen)
     }
 
     /// Slots whose packs take host point writes (Output binds). The engine sends egress to
     /// every connected one.
     pub fn takes_egress(self) -> bool {
-        !matches!(self, Self::OpcUa | Self::FileFollow | Self::Snmp)
+        !matches!(self, Self::OpcUa | Self::FileFollow | Self::Snmp | Self::Gen)
     }
 
     /// Human title for the engine (matches the pack `TITLE`).
@@ -95,6 +98,7 @@ impl EngineId {
             Self::Sparkplug => "Sparkplug B",
             Self::Dnp3 => "DNP3",
             Self::Can => "CAN",
+            Self::Gen => "Generator",
         }
     }
 
@@ -114,6 +118,7 @@ impl EngineId {
             Self::Sparkplug => Some("sparkplug"),
             Self::Dnp3 => Some("dnp3"),
             Self::Can => Some("can"),
+            Self::Gen => Some("gen"),
         }
     }
 
@@ -141,6 +146,7 @@ impl EngineId {
             Self::Sparkplug => "Sparkplug B pack — host (decode NBIRTH / NDATA) and edge node (publish).",
             Self::Dnp3 => "DNP3 pack — TCP master: class polls, binary / analog / counter points, controls.",
             Self::Can => "CAN pack — SocketCAN signals in (frame decode) and out (frame encode).",
+            Self::Gen => "Generator pack — synthetic signals (waveforms, random walks, process shapes, counters, formulas) on interval / random / burst triggers.",
         }
     }
 

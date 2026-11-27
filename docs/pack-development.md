@@ -1,6 +1,6 @@
 # Writing and maintaining a protocol pack
 
-How the thirteen in-tree packs (`pb-mqtt`, `pb-opcua`, `pb-streams`, `pb-http`, `pb-modbus`, `pb-files`, `pb-snmp`, `pb-las`, and the ext packs `pb-wits`, `pb-websocket`, `pb-sparkplug`, `pb-dnp3`, `pb-can`) are built, and the rules that are not obvious from reading one of them. Background on *why* packs are `cdylib`s loaded by the service is in [protocol-pack-loading.md](protocol-pack-loading.md).
+How the fourteen in-tree packs (`pb-mqtt`, `pb-opcua`, `pb-streams`, `pb-http`, `pb-modbus`, `pb-files`, `pb-snmp`, `pb-las`, and the ext packs `pb-wits`, `pb-websocket`, `pb-sparkplug`, `pb-dnp3`, `pb-can`, `pb-gen`) are built, and the rules that are not obvious from reading one of them. Background on *why* packs are `cdylib`s loaded by the service is in [protocol-pack-loading.md](protocol-pack-loading.md).
 
 ## Shape of a pack
 
@@ -54,6 +54,15 @@ WITS, WebSocket, Sparkplug B, DNP3 and CAN are "ext" protocols: one generic path
 5. **Service** — nothing: `build_ext_configure` turns hub ports (`ext_connection`, `ext_interval_secs`, `ext_inputs`, `ext_outputs`) into `{connections, inputs, outputs}` for every spec.
 6. **Help** — an article in `help_catalog.rs`, and a device in `pb-sim` if the demos should use it.
 
+## A source with no device: the Generator
+
+`pb-gen` is an ext pack whose "connection" is a *board* (random seed, time scale) and whose Input binds are *signals*. It shows two patterns worth copying:
+
+* **Keep the pure part in an rlib.** The signal models, triggers and previews are in `pb-signal` (and the expression language in `pb-expr`) so the UI can draw a live preview from the *same* code the pack runs without linking a pack crate into the UI binary. `pb-gen` only owns the clock and the publishing.
+* **Source only.** `EngineId::Gen.takes_egress()` is false and the hub's Protocol dropdown does not offer Generator on an Output (`HubProto::offered`). Input nodes are never sinks, so nothing can be wired into one; tests in `pb-ui/src/hubs.rs` pin that.
+
+Its UI is a dedicated inspector (`pb-ui/src/gen_ui.rs`: category tabs, model cards that draw their own shape, presets, preview) on top of the same schema-driven `UiSpec` (`GEN_FIELDS` in `ext_proto.rs`, with `show` rules per model). The persisted bind is the flat JSON the pack reads, so `build_ext_configure` needed no changes.
+
 ## How config reaches a pack
 
 The UI owns the editable project (connections in panels, binds on hub Input/Output nodes). The **service** turns that into each pack's configure JSON — `build_*_configure` in [pb-service/src/runtime.rs](../pb-service/src/runtime.rs) — so the pack never sees hub structure, only `{connections, inputs[], outputs[]}`. When you add a bind field you touch: the UI bind struct (`pb-ui/src/hubs.rs`), the `build_*_configure` function, the pack's config struct, and a unit test in `runtime.rs` that pins the JSON.
@@ -76,5 +85,6 @@ These are deliberate or not-yet-fixed behaviours a reader would otherwise redisc
 * **`ipc.json` / `ipc.token` are not projects.** They are how the UI finds the service. The UI refuses to open or save a project over them, because the file dialog opens in that folder and overwriting `ipc.json` leaves the UI permanently "disconnected".
 * **`project::load` / `project::save` in `pb-ui`** are legacy local-file helpers; the service owns `project.json` now and the UI goes through IPC. They are kept only until the remaining callers are removed.
 * **Egress fan-out.** The engine sends point writes to every *connected* pack whose slot `takes_egress()`; a pack that connects later gets every current value once, then changes.
+* **Generator**: changing any signal restarts its board (the worker key is the whole config), so counters and random walks start over. Triggers are wall-clock; the *time scale* only scales model time (`t`, `dt`). Blank points are published before a signal's first value like any other source, so an Output can briefly send an empty value at start-up.
 * **DNP3** is a TCP master only (no serial, no secure authentication, no outstation role). **Sparkplug B** handles scalar metrics (no DataSets / Templates) and does not publish a primary-host STATE. **CAN** needs Linux SocketCAN; the vcan test is skipped when `vcan0` is absent.
 * **SNMP**: v1/v2c GET only (no v3, SET, walk or traps). **LAS**: `WRAP YES` files are refused; `STOP` is not rewritten while a log is being written; time-indexed logs use epoch seconds. **File follow**: CSV is one physical line per row. Windows file replacement is detected by shrink only (no inode there). New packs have only been run on Linux.

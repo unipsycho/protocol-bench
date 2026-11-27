@@ -87,10 +87,12 @@ pub enum HubProto {
     Sparkplug,
     Dnp3,
     Can,
+    /// Generator — a synthetic source (Input only; nothing wires into it).
+    Gen,
 }
 
 impl HubProto {
-    pub const ALL: [HubProto; 13] = [
+    pub const ALL: [HubProto; 14] = [
         HubProto::Streams,
         HubProto::Modbus,
         HubProto::Mqtt,
@@ -104,7 +106,14 @@ impl HubProto {
         HubProto::Sparkplug,
         HubProto::Dnp3,
         HubProto::Can,
+        HubProto::Gen,
     ];
+
+    /// Protocols the Protocol dropdown offers on an Input (`incoming`) or an Output. A Generator
+    /// only produces data, so it is never offered on an Output.
+    pub fn offered(incoming: bool) -> impl Iterator<Item = HubProto> {
+        Self::ALL.into_iter().filter(move |p| incoming || *p != HubProto::Gen)
+    }
 
     /// The ext protocol behind this node, if any.
     pub fn ext(self) -> Option<crate::ext_proto::ExtProto> {
@@ -115,6 +124,7 @@ impl HubProto {
             Self::Sparkplug => Some(ExtProto::Sparkplug),
             Self::Dnp3 => Some(ExtProto::Dnp3),
             Self::Can => Some(ExtProto::Can),
+            Self::Gen => Some(ExtProto::Gen),
             _ => None,
         }
     }
@@ -132,7 +142,7 @@ impl HubProto {
             Self::Http => "HTTP / REST",
             Self::Las => "LAS",
             Self::Snmp => "SNMP",
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can => self.ext().map(|e| e.title()).unwrap_or(""),
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => self.ext().map(|e| e.title()).unwrap_or(""),
         }
     }
 
@@ -146,7 +156,7 @@ impl HubProto {
             Self::Http => DockPane::Http,
             Self::Las => DockPane::Las,
             Self::Snmp => DockPane::Snmp,
-            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can => {
+            Self::Wits | Self::WebSocket | Self::Sparkplug | Self::Dnp3 | Self::Can | Self::Gen => {
                 self.ext().map(DockPane::from_ext).unwrap_or(DockPane::Hubs)
             }
         }
@@ -4610,7 +4620,7 @@ fn edit_port(
                 .selected_text(current.label())
                 .width(combo_w)
                 .show_ui(ui, |ui| {
-                    for proto in HubProto::ALL {
+                    for proto in HubProto::offered(incoming) {
                         ui.selectable_value(&mut next, proto, proto.label());
                     }
                 });
@@ -4731,8 +4741,22 @@ fn edit_port(
                 model.scoped_points(hub_id, &host.points)
             }
         };
+        // Generator signal names are one namespace per board: collect those on the other nodes.
+        let other_names: Vec<String> = if e == crate::ext_proto::ExtProto::Gen {
+            let board = port_field(model, hub_id, port_id).ext_connection.clone();
+            model
+                .hubs
+                .iter()
+                .flat_map(|h| h.sources.iter())
+                .filter(|s| s.id != port_id && s.protocol == HubProto::Gen && s.ext_connection == board)
+                .flat_map(|s| s.ext_inputs.iter().map(|b| crate::ext_proto::text_of(b, "name")))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let port = port_field(model, hub_id, port_id);
         let fields = crate::ext_proto::PortFields {
+            other_names,
             conn: &mut port.ext_connection,
             interval: &mut port.ext_interval_secs,
             inputs: &mut port.ext_inputs,
@@ -7990,7 +8014,7 @@ fn port_section(
                     .selected_text(current.label())
                     .width(combo_w)
                     .show_ui(ui, |ui| {
-                        for proto in HubProto::ALL {
+                        for proto in HubProto::offered(source) {
                             ui.selectable_value(&mut next, proto, proto.label());
                         }
                     });
@@ -8474,6 +8498,44 @@ mod tests {
         assert_eq!(model.feeds[0].to_node, hub);
         let nodes = layout_nodes(&model.hubs);
         assert!(feed_ends(&nodes, &model.feeds[0]).is_some());
+    }
+
+    #[test]
+    fn generator_sources_feed_forward_but_accept_nothing() {
+        let mut model = unwired_sample();
+        let hub = model.hubs[1].id;
+        let gen = model.hubs[1].sources[0].id;
+        model.hubs[1].sources[0].protocol = HubProto::Gen;
+        let out = model.hubs[1].outputs[0].id;
+        let calc = model.add_step(hub, false, gen).expect("calc");
+        let agg = model.add_step(hub, true, gen).expect("agg");
+        // Arrows out of a generator go to a hub, Calculation, Aggregator or Output.
+        assert!(model.connect_wire_nodes(hub, gen, hub, calc));
+        assert!(model.connect_wire_nodes(hub, gen, hub, agg));
+        assert!(model.connect_wire_nodes(hub, gen, hub, out));
+        assert!(model.connect_wire_nodes(hub, gen, hub, hub));
+        // Nothing wires into one, whichever way the drag goes.
+        assert!(!model.connect_feed(hub, calc, hub, gen));
+        assert!(!model.connect_feed(hub, agg, hub, gen));
+        assert!(!model.connect_feed(hub, hub, hub, gen));
+        assert!(!model.connect_feed(hub, out, hub, gen));
+        let _ = model.connect_wire_nodes(hub, calc, hub, gen);
+        let _ = model.connect_wire_nodes(hub, gen, hub, calc);
+        // Re-pointing an existing arrow's head at a generator is refused too.
+        let idx = model.feeds.iter().position(|f| f.from_node == gen && f.to_node == calc).unwrap();
+        assert!(!model.rewire_feed(idx, false, hub, gen));
+        assert!(model.feeds.iter().all(|f| f.to_node != gen), "no feed ever ends at a generator: {:?}", model.feeds);
+    }
+
+    #[test]
+    fn generator_is_offered_on_inputs_only() {
+        let inputs: Vec<HubProto> = HubProto::offered(true).collect();
+        let outputs: Vec<HubProto> = HubProto::offered(false).collect();
+        assert!(inputs.contains(&HubProto::Gen));
+        assert!(!outputs.contains(&HubProto::Gen));
+        assert_eq!(inputs.len(), outputs.len() + 1);
+        assert_eq!(HubProto::Gen.label(), "Generator");
+        assert!(!HubProto::Gen.hub_capable(), "a generator cannot own a hub");
     }
 
     #[test]

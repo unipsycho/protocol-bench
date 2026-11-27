@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "pb-abi",
+    "pb-expr",
+    "pb-signal",
     "pb-points",
     "pb-json",
     "pb-engine",
@@ -22,6 +24,7 @@ members = [
     "pb-sparkplug",
     "pb-dnp3",
     "pb-can",
+    "pb-gen",
     "pb-sim",
     "pb-service",
     "pb-ui",
@@ -50,6 +53,8 @@ pb-tail = { path = "pb-tail" }
 pb-snmp = { path = "pb-snmp" }
 pb-las = { path = "pb-las" }
 pb-extkit = { path = "pb-extkit" }
+pb-expr = { path = "pb-expr" }
+pb-signal = { path = "pb-signal" }
 pb-proto = { path = "pb-proto" }
 serialport = { version = "4", default-features = false }
 regex = "1"

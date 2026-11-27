@@ -1,4 +1,5 @@
-//! Industrial demo projects (frac spread, bottling line, water lift station).
+//! Demo projects: the industrial ones (frac spread, bottling line, water lift station), which
+//! need `pb-sim`, and the generator plant, which makes its own data.
 //!
 //! Built from the real project types so they always load. `pb-sim` plays the field devices.
 //! Regenerate the files with
@@ -539,12 +540,87 @@ pub fn water_lift_station() -> ProjectFile {
     f
 }
 
+// ---------------------------------------------------------------------------
+// Generator plant (no devices needed)
+// ---------------------------------------------------------------------------
+
+/// One generator signal built the way the UI builds it: a preset (or model) applied to a fresh
+/// draft, then `extra` overrides, with the point named after the signal.
+fn gen_signal(preset: &str, name: &str, extra: &[(&str, Value)]) -> Map<String, Value> {
+    let mut o = crate::gen_ui::new_draft();
+    match crate::gen_ui::PRESETS.iter().find(|p| p.label == preset) {
+        Some(pr) => crate::gen_ui::apply_preset(&mut o, pr),
+        None => crate::gen_ui::pick_model(&mut o, preset),
+    }
+    o.insert("name".into(), Value::from(name));
+    for (k, v) in extra {
+        o.insert((*k).into(), v.clone());
+    }
+    o.insert("point".into(), Value::from(name));
+    o
+}
+
+fn gen_node(id: u64, label: &str, signals: Vec<Map<String, Value>>) -> HubPort {
+    let mut p = port(id, HubProto::Gen, label);
+    p.ext_connection = "plant".into();
+    p.ext_inputs = signals;
+    p
+}
+
+pub fn generator_plant() -> ProjectFile {
+    let mut f = blank_project();
+    f.settings.name = "Generator plant".into();
+    f.settings.description = "Six generator sources — no devices needed — feed one MQTT hub (embedded broker :1887). \
+        Tank + pump, temperature, line pressure + flow, a power meter, weather + battery, and an event node cover \
+        every kind of signal (drift, triangle, on/off cycle, lag, sine, random walk, ramp, totaliser, counter, \
+        a formula that reads another signal) and every trigger (regular interval, random timer, bursts). \
+        Out: UNS topics plant/gen/<signal>. The board uses seed 42 so the data repeats; set it to 0 for fresh data."
+        .into();
+    f.next_point_seq = 200;
+    f.mqtt.embedded.enabled = true;
+    f.mqtt.embedded.port = 1887;
+    f.mqtt.clients = vec![loopback(1887, "pb-gen", &["plant/#"])];
+    f.mqtt.selected_id = "local".into();
+    // No leftover sample Modbus endpoints: this demo opens no device links.
+    f.modbus.connections.clear();
+    f.modbus.selected_id.clear();
+    f.ext.gen.connections = vec![ext_conn(json!({"id":"plant","label":"Plant generators","seed":42,"speed":1}))];
+    f.ext.gen.selected_id = "plant".into();
+
+    let n = |v: f64| json!(v);
+    let sources = vec![
+        gen_node(
+            2,
+            "Tank & pump",
+            vec![
+                gen_signal("Tank level", "tank_level", &[]),
+                gen_signal("Pump running", "pump_run", &[("every", n(1.0))]),
+                // A formula that reads another signal on the board: power only while the pump runs.
+                gen_signal("formula", "pump_kw", &[("expr", json!("pump_run * (7.5 + 0.6 * sin(t / 9)) + noise(0.05)")), ("decimals", json!(2))]),
+            ],
+        ),
+        gen_node(3, "Process temperature", vec![gen_signal("Temperature", "temperature", &[]), gen_signal("Humidity", "humidity", &[("every", n(2.0))])]),
+        gen_node(4, "Line pressure & flow", vec![gen_signal("Discharge pressure", "pressure", &[("every", n(0.5))]), gen_signal("Flow rate", "flow", &[])]),
+        gen_node(5, "Power meter", vec![gen_signal("Daily load", "load_kw", &[("every", n(2.0))]), gen_signal("Energy", "energy_kwh", &[("every", n(2.0))])]),
+        gen_node(6, "Weather & battery", vec![gen_signal("Wind speed", "wind", &[("every", n(1.5))]), gen_signal("Battery voltage", "battery_v", &[("every", n(3.0))])]),
+        gen_node(7, "Events & counters", vec![gen_signal("Heartbeat", "heartbeat", &[]), gen_signal("Random alarm", "alarm", &[]), gen_signal("Parts counter", "parts", &[])]),
+    ];
+    let mut p = port(8, HubProto::Mqtt, "UNS topics");
+    p.mqtt_connection = "local".into();
+    let names = [
+        "tank_level", "pump_run", "pump_kw", "temperature", "humidity", "pressure", "flow", "load_kw", "energy_kwh", "wind", "battery_v", "heartbeat", "alarm", "parts",
+    ];
+    p.mqtt_outputs = names.iter().map(|n| mqtt_out(n, &format!("plant/gen/{n}"))).collect();
+    f.hubs = Some(model(hub("Generator plant", HubProto::Mqtt, sources, vec![p])));
+    f
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn all() -> Vec<(&'static str, ProjectFile)> {
-        vec![("frac-spread.json", frac_spread("/tmp/pb-data")), ("bottling-line.json", bottling_line()), ("water-lift-station.json", water_lift_station())]
+        vec![("frac-spread.json", frac_spread("/tmp/pb-data")), ("bottling-line.json", bottling_line()), ("water-lift-station.json", water_lift_station()), ("generator-plant.json", generator_plant())]
     }
 
     /// Every demo serializes, reloads unchanged, and every Output point is produced by an Input.
@@ -598,6 +674,59 @@ mod tests {
         }
     }
 
+    /// The generator demo: six source nodes, every signal valid and uniquely named, formulas only
+    /// read what exists, every MQTT output has a producer, and nothing is wired into a generator.
+    #[test]
+    fn generator_plant_is_consistent() {
+        let f = generator_plant();
+        let hubs = f.hubs.as_ref().unwrap();
+        let hub = &hubs.hubs[0];
+        let gens: Vec<&HubPort> = hub.sources.iter().filter(|s| s.protocol == HubProto::Gen).collect();
+        assert_eq!(gens.len(), 6, "six generator nodes");
+        let board: Vec<String> = f.ext.gen.connections.iter().map(|c| crate::ext_proto::text_of(c, "id")).collect();
+        assert_eq!(board, ["plant"]);
+        let mut names = std::collections::HashSet::new();
+        let mut triggers = std::collections::HashSet::new();
+        let mut models = std::collections::HashSet::new();
+        for g in &gens {
+            assert_eq!(g.ext_connection, "plant");
+            assert!(!g.ext_inputs.is_empty());
+            for b in &g.ext_inputs {
+                let name = crate::ext_proto::text_of(b, "name");
+                assert!(names.insert(name.clone()), "duplicate signal {name}");
+                assert_eq!(crate::ext_proto::text_of(b, "point"), name, "point named after the signal");
+                assert_eq!(crate::ext_proto::bind_source(crate::ext_proto::ExtProto::Gen, "plant", b).unwrap(), format!("gen/plant::{name}"));
+                pb_signal::preview(b).unwrap_or_else(|e| panic!("{name}: {e}"));
+                triggers.insert(crate::ext_proto::text_of(b, "trigger"));
+                models.insert(crate::ext_proto::text_of(b, "model"));
+            }
+        }
+        assert_eq!(triggers.len(), 3, "interval, random and burst all appear: {triggers:?}");
+        assert!(models.len() >= 9, "a spread of models: {models:?}");
+        // Formulas only read built-ins and signals that exist.
+        for g in &gens {
+            for b in &g.ext_inputs {
+                let bind = pb_extkit::Bind { fields: b.clone(), point: String::new(), source: String::new(), interval: std::time::Duration::from_secs(1) };
+                let sig = pb_signal::Signal::from_bind(&bind, 1, 0).unwrap();
+                for v in sig.formula_vars() {
+                    assert!(pb_signal::BUILTIN_VARS.contains(&v.as_str()) || names.contains(&v), "unknown variable {v}");
+                }
+            }
+        }
+        // Every published topic maps to a signal, every signal is published, and the hub is MQTT.
+        assert_eq!(hub.protocol, HubProto::Mqtt);
+        let out = &hub.outputs[0];
+        let pts: std::collections::HashSet<String> = out.mqtt_outputs.iter().map(|b| b.point.clone()).collect();
+        assert_eq!(pts, names);
+        assert!(out.mqtt_outputs.iter().all(|b| b.topic == format!("plant/gen/{}", b.point)));
+        // Generators are sources only: no generator node among the outputs.
+        assert!(hub.outputs.iter().all(|o| o.protocol != HubProto::Gen));
+        // Every generator is wired to the hub.
+        for g in &gens {
+            assert!(hubs.feeds.iter().any(|fd| fd.from_node == g.id && fd.to_node == hub.id), "{} not wired", g.label);
+        }
+    }
+
     /// Writes the demo projects into `PB_EXPORT_DEMOS` (data files under `<dir>/data`).
     #[test]
     #[ignore]
@@ -607,7 +736,7 @@ mod tests {
         let data = dir.join("data");
         std::fs::create_dir_all(&data).unwrap();
         let data_s = data.to_string_lossy().into_owned();
-        for (name, f) in [("frac-spread.json", frac_spread(&data_s)), ("bottling-line.json", bottling_line()), ("water-lift-station.json", water_lift_station())] {
+        for (name, f) in [("frac-spread.json", frac_spread(&data_s)), ("bottling-line.json", bottling_line()), ("water-lift-station.json", water_lift_station()), ("generator-plant.json", generator_plant())] {
             std::fs::write(dir.join(name), serde_json::to_string_pretty(&f).unwrap() + "\n").unwrap();
         }
     }
