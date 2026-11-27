@@ -10,15 +10,17 @@ description = "Dashboard browser app (egui compiled to wasm); built with scripts
 [dependencies]
 pb-dash-model = { workspace = true }
 serde_json = { workspace = true }
+# egui's built-in fonts are off: the app ships its own (Latin-trimmed Noto Sans plus egui's two
+# emoji fallbacks, see assets/), which keeps the wasm about 1.8 MB smaller.
 # Own egui (newer than the desktop app's workspace 0.29): 0.36 positions glyphs at sub-pixel
 # accuracy with proper shaping, so small text has even letter spacing in the browser.
-egui = "0.36"
+egui = { version = "0.36", default-features = false }
 # The web build wants glow only, no native windowing.
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.36", default-features = false, features = ["glow"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Native build = a demo window with synthetic data, used for development and screenshots.
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11"] }
+eframe = { version = "0.36", default-features = false, features = ["glow", "x11"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

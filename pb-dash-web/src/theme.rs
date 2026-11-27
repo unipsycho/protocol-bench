@@ -119,18 +119,24 @@ pub fn bold_id(size: f32) -> FontId {
     FontId::new(size, bold())
 }
 
-/// Noto Sans Medium as the body font (much easier to read on a wall screen than egui's light
-/// default) plus Noto Sans Bold for values and headings. The built-in fonts stay as fallbacks
-/// for symbols and emoji.
+/// The app's fonts (egui's built-in set is switched off to save size):
+/// * Noto Sans Medium for text and Noto Sans Bold for values and headings, both trimmed to Latin
+///   letters plus common technical symbols (°, µ, Ω, ±, ≤, →, € …) — see `assets/`.
+/// * egui's two emoji / symbol fonts as fallbacks for anything else.
 pub fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert("noto".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("../assets/NotoSans-Medium.ttf"))));
-    fonts.font_data.insert("noto-bold".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("../assets/NotoSans-Bold.ttf"))));
-    let fallbacks: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "noto".into());
-    let mut b = vec!["noto-bold".to_string()];
-    b.extend(fallbacks);
-    fonts.families.insert(bold(), b);
+    use egui::epaint::text::FontTweak;
+    use std::sync::Arc;
+    let mut fonts = FontDefinitions::empty();
+    let data = |bytes: &'static [u8], scale: f32| Arc::new(FontData::from_static(bytes).tweak(FontTweak { scale, ..Default::default() }));
+    fonts.font_data.insert("noto".into(), data(include_bytes!("../assets/NotoSans-Medium.ttf"), 1.0));
+    fonts.font_data.insert("noto-bold".into(), data(include_bytes!("../assets/NotoSans-Bold.ttf"), 1.0));
+    // Same tweaks egui gives these two when it ships them itself.
+    fonts.font_data.insert("emoji".into(), data(include_bytes!("../assets/NotoEmoji-Regular.ttf"), 0.81));
+    fonts.font_data.insert("emoji-icons".into(), data(include_bytes!("../assets/emoji-icon-font.ttf"), 0.90));
+    let chain = |first: &str| vec![first.to_string(), "emoji".to_string(), "emoji-icons".to_string()];
+    fonts.families.insert(FontFamily::Proportional, chain("noto"));
+    fonts.families.insert(FontFamily::Monospace, chain("noto"));
+    fonts.families.insert(bold(), chain("noto-bold"));
     ctx.set_fonts(fonts);
 }
 

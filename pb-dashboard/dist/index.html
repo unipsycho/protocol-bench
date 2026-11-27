@@ -21,7 +21,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
   canvas { display: block; width: 100%; height: 100%; }
   #loading { position: fixed; inset: 0; display: grid; place-items: center; color: #7b8aa3; font: 15px system-ui, sans-serif; }
 </style>
-<link rel="modulepreload" href="/pb-dash-web.js" crossorigin="anonymous" integrity="sha384-Yuiba7CFHXbt1jE4Lqseq1a0oqH4rSBbAwPV8G3aRapjREDakcBy+XFSUmjoSOtj"><link rel="preload" href="/pb-dash-web_bg.wasm" crossorigin="anonymous" integrity="sha384-+R8q2VN4eAApsRHRYAwo3h8JlseSRS4U9Zfd9DTLUvWj4SWMEnro1j2Gl4VLeELg" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/pb-dash-web.js" crossorigin="anonymous" integrity="sha384-bUp11qFU7uvhf2mmq2RkLdIC/wfoYIQxswZIGI+fpGDERvzI+OmXwaEib3lv8bw0"><link rel="preload" href="/pb-dash-web_bg.wasm" crossorigin="anonymous" integrity="sha384-OrHISjVyxwECNuv5YjDQ3FXTw3jrLgVB8c2SM/vxkoQSGOLbBfICc8JPJsYTuMVu" as="fetch" type="application/wasm"></head>
 <body>
 <div id="loading">Loading dashboard…</div>
 <canvas id="pb_dash_canvas"></canvas>
