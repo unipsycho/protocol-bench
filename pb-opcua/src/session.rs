@@ -9,6 +9,7 @@ use opcua::types::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use tokio::sync::mpsc::{self as tmpsc, UnboundedReceiver, UnboundedSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -46,7 +47,7 @@ enum Cmd {
 
 /// Live client session running on a dedicated OS thread + tokio runtime.
 pub struct OpcUaSession {
-    cmd_tx: Sender<Cmd>,
+    cmd_tx: UnboundedSender<Cmd>,
     ev_rx: Receiver<SessionEvent>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
@@ -63,7 +64,9 @@ impl OpcUaSession {
         username: String,
         password: String,
     ) -> Result<Self, String> {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+        // Tokio channel so the async loop is woken by a command instead of polling;
+        // `UnboundedSender::send` is a plain sync call, safe from any thread.
+        let (cmd_tx, cmd_rx) = tmpsc::unbounded_channel::<Cmd>();
         let (ev_tx, ev_rx) = mpsc::channel::<SessionEvent>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_c = Arc::clone(&stop);
@@ -169,7 +172,7 @@ async fn run_session(
     pki_dir: String,
     username: String,
     password: String,
-    cmd_rx: Receiver<Cmd>,
+    mut cmd_rx: UnboundedReceiver<Cmd>,
     ev_tx: Sender<SessionEvent>,
     stop: Arc<AtomicBool>,
 ) {
@@ -247,63 +250,69 @@ async fn run_session(
 
     let mut poll_nodes: Vec<String> = Vec::new();
     let mut poll_every = Duration::from_millis(500);
-    let mut last_poll = tokio::time::Instant::now();
+    let mut next_poll = tokio::time::Instant::now() + poll_every;
 
+    // Event-driven loop: sleeps until a command arrives or the next poll is due.
+    // Both select! branches are cancel-safe (`recv` and `sleep_until`), and the
+    // handlers run in the arm bodies, so a wake-up never cancels a request mid-flight.
+    // `Cmd::Stop`, or every sender being dropped, ends the loop. The `stop` flag is
+    // still checked as a backstop for callers that set it without sending `Stop`.
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        // Drain commands without blocking the event loop forever.
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                Cmd::Stop => {
-                    stop.store(true, Ordering::SeqCst);
-                }
-                Cmd::Browse { node_id } => {
-                    let nid = parse_node_id(&node_id).unwrap_or_else(NodeId::objects_folder_id);
-                    let parent_id = browse_parent_key(&node_id, &nid);
-                    match browse_children(&session, &nid).await {
-                        Ok(nodes) => {
-                            let _ = ev_tx.send(SessionEvent::Browse { parent_id, nodes });
-                        }
-                        Err(e) => {
-                            let _ = ev_tx.send(SessionEvent::Error {
-                                detail: format!("browse: {e}"),
-                            });
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else { break };
+                match cmd {
+                    Cmd::Stop => {
+                        stop.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    Cmd::Browse { node_id } => {
+                        let nid = parse_node_id(&node_id).unwrap_or_else(NodeId::objects_folder_id);
+                        let parent_id = browse_parent_key(&node_id, &nid);
+                        match browse_children(&session, &nid).await {
+                            Ok(nodes) => {
+                                let _ = ev_tx.send(SessionEvent::Browse { parent_id, nodes });
+                            }
+                            Err(e) => {
+                                let _ = ev_tx.send(SessionEvent::Error {
+                                    detail: format!("browse: {e}"),
+                                });
+                            }
                         }
                     }
-                }
-                Cmd::Subscribe {
-                    node_ids,
-                    interval_ms,
-                } => {
-                    poll_every = Duration::from_millis(interval_ms.max(100));
-                    match subscribe_nodes(&session, &node_ids, interval_ms, ev_tx.clone()).await {
-                        Ok(()) => {
-                            poll_nodes = node_ids;
+                    Cmd::Subscribe { node_ids, interval_ms } => {
+                        poll_every = Duration::from_millis(interval_ms.max(100));
+                        match subscribe_nodes(&session, &node_ids, interval_ms, ev_tx.clone()).await {
+                            Ok(()) => {
+                                poll_nodes = node_ids;
+                            }
+                            Err(e) => {
+                                // Subscription unsupported → poll fallback.
+                                let _ = ev_tx.send(SessionEvent::State {
+                                    connected: true,
+                                    detail: format!("subscribe failed ({e}); using poll fallback"),
+                                });
+                                poll_nodes = node_ids;
+                                let _ = read_and_emit(&session, &poll_nodes, &ev_tx).await;
+                            }
                         }
-                        Err(e) => {
-                            // Subscription unsupported → poll fallback.
-                            let _ = ev_tx.send(SessionEvent::State {
-                                connected: true,
-                                detail: format!("subscribe failed ({e}); using poll fallback"),
-                            });
-                            poll_nodes = node_ids;
-                            let _ = read_and_emit(&session, &poll_nodes, &ev_tx).await;
-                        }
+                        next_poll = tokio::time::Instant::now() + poll_every;
                     }
-                }
-                Cmd::Read { node_ids } => {
-                    poll_nodes = node_ids;
-                    let _ = read_and_emit(&session, &poll_nodes, &ev_tx).await;
+                    Cmd::Read { node_ids } => {
+                        poll_nodes = node_ids;
+                        let _ = read_and_emit(&session, &poll_nodes, &ev_tx).await;
+                        next_poll = tokio::time::Instant::now() + poll_every;
+                    }
                 }
             }
+            _ = tokio::time::sleep_until(next_poll), if !poll_nodes.is_empty() => {
+                let _ = read_and_emit(&session, &poll_nodes, &ev_tx).await;
+                next_poll = tokio::time::Instant::now() + poll_every;
+            }
         }
-        if !poll_nodes.is_empty() && last_poll.elapsed() >= poll_every {
-            last_poll = tokio::time::Instant::now();
-            let _ = read_and_emit(&session, &poll_nodes, &ev_tx).await;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     let _ = session.disconnect().await;
