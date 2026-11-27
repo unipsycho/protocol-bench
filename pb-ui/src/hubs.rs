@@ -1919,12 +1919,13 @@ impl HubModel {
             .map(|h| h.id)
     }
 
-    /// Points this hub's Outputs / catalog may pick by default: its own Inputs / steps plus
-    /// anything wired into it from another hub. Nothing else — unwired points (including
-    /// orphans no hub claims) need an explicit wire or the "Show all project points" toggle.
+    /// Points this hub's Outputs / catalog may pick by default: only those whose arrows
+    /// reach one of its nodes. Unwired Inputs (own or other hubs') and orphans no hub claims
+    /// need an explicit wire or the "Show all project points" toggle.
     pub fn scoped_points(&self, hub_id: u64, host_points: &[PointSnapshot]) -> Vec<String> {
-        let mut out = self.hub_origin_points(hub_id, host_points);
-        // Wired in from elsewhere: feeds into any node of this hub.
+        // Only what is wired in: an Input that no arrow drives into this hub stays hidden.
+        let mut out: Vec<String> = Vec::new();
+        // Feeds into any node of this hub.
         for feed in self.feeds.iter().filter(|f| f.to_hub == hub_id) {
             for p in self.points_for_node(feed.from_hub, feed.from_node, host_points) {
                 if !out.contains(&p) {
@@ -8324,6 +8325,11 @@ mod tests {
             ..Default::default()
         });
         let host = vec![snap("mqtt_a"), snap("mqtt_b"), snap("orphan")];
+        let in_a = model.scoped_points(a, &host);
+        // Not wired anywhere yet: nothing is offered, not even hub A's own Input.
+        assert!(in_a.is_empty());
+        let (src_a, out_a0) = (model.hubs[0].sources[0].id, model.hubs[0].outputs[0].id);
+        model.feeds.push(HubFeed { to_hub: a, to_node: out_a0, from_hub: a, from_node: src_a });
         let in_a = model.scoped_points(a, &host);
         assert!(in_a.contains(&"mqtt_a".to_string()));
         assert!(!in_a.contains(&"mqtt_b".to_string()));
