@@ -58,6 +58,7 @@ fn hub(name: &str, proto: HubProto, sources: Vec<HubPort>, outputs: Vec<HubPort>
         calculations: vec![],
         at: None,
         modbus_server: String::new(),
+        modbus_auto: Default::default(),
         opcua_expose_unmapped: true,
         opcua_catalog: vec![],
     }

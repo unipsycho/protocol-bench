@@ -2025,6 +2025,7 @@ mod tests {
             calculations: vec![],
             at: None,
             modbus_server: "hub".into(),
+            modbus_auto: Default::default(),
             opcua_expose_unmapped: true,
             opcua_catalog: vec![],
         }];
@@ -2162,6 +2163,7 @@ mod tests {
             calculations: vec![],
             at: None,
             modbus_server: String::new(),
+            modbus_auto: Default::default(),
             opcua_expose_unmapped: true,
             opcua_catalog: vec![],
         }];

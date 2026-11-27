@@ -903,7 +903,9 @@ fn paint_panel_body(ui: &mut Ui, p: &ThemePalette, st: &mut ExtPanelState, host:
         // Pack states often start with the endpoint already; don't say it twice.
         let ep_tail = summary.split_whitespace().last().unwrap_or("").to_string();
         let subtitle = if !ep_tail.is_empty() && state.contains(&ep_tail) { state.clone() } else { format!("{summary}  ·  {state}") };
-        match connection_list::selectable_row(ui, &label, &subtitle, st.selected == Some(i), true, p) {
+        // Output-owned WebSocket connections go away with their node, not from here.
+        let subtitle = if is_ws_owned(c) { format!("from Output node  ·  {subtitle}") } else { subtitle };
+        match connection_list::selectable_row(ui, &label, &subtitle, st.selected == Some(i), !is_ws_owned(c), p) {
             Some(RowAction::Select) => select = Some(i),
             Some(RowAction::Delete) => st.pending_delete = Some((i, label)),
             None => {}
@@ -951,11 +953,16 @@ fn paint_panel_body(ui: &mut Ui, p: &ThemePalette, st: &mut ExtPanelState, host:
     }
     ui.add_space(space::SECTION);
     section(ui, "CONNECTION", p);
+    let owned = is_ws_owned(c);
+    if owned {
+        ui.label(RichText::new("Created by a WebSocket Output node — set its port, URL and format on that node in Hubs. Inputs can pick it to read what clients send back.").font(font_ui(12.0)).color(p.muted));
+    }
     let salt = egui::Id::new(("pb_ext_conn", proto.id(), i));
     let mut idv = text_of(c, "id");
     let mut label = text_of(c, "label");
     let mut on = enabled;
     let mut changed = false;
+    if !owned {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Id").font(font_ui(12.0)).color(p.muted));
         changed |= ui.add(egui::TextEdit::singleline(&mut idv).desired_width(110.0)).changed();
@@ -974,6 +981,7 @@ fn paint_panel_body(ui: &mut Ui, p: &ThemePalette, st: &mut ExtPanelState, host:
     }
     ui.add_space(4.0);
     dirty |= fields_form(ui, salt, spec.conn_fields, c, p);
+    }
     if proto == ExtProto::Dashboard || (proto == ExtProto::WebSocket && text_of(c, "mode") == "server") {
         ui.add_space(4.0);
         let host = text_of(c, "host");
@@ -1102,8 +1110,38 @@ pub struct PortFields<'a> {
     pub interval: &'a mut f32,
     /// Dashboard node only: (page title, listen port).
     pub dash: Option<(&'a mut String, &'a mut u16)>,
+    /// WebSocket Output only: how it sends (see `HubPort::ws_mode`).
+    pub ws: Option<WsOut<'a>>,
+    /// Outputs with auto binds: removing an auto bind records its point here so it stays gone.
+    pub dismissed: Option<&'a mut Vec<String>>,
     pub inputs: &'a mut Vec<Obj>,
     pub outputs: &'a mut Vec<Obj>,
+}
+
+/// "Connection" picker for a Hub node. Returns true when the pick changed.
+fn conn_combo(ui: &mut Ui, proto: ExtProto, port_key: (u64, u64), conn: &mut String, conns: &[(String, String)], p: &ThemePalette) -> bool {
+    ui.label(RichText::new("Connection").font(font_ui(12.0)).color(p.muted));
+    let shown = conns.iter().find(|(id, _)| id == conn).map(|(_, l)| l.clone()).unwrap_or_else(|| if conn.is_empty() { "(pick connection)".into() } else { conn.clone() });
+    let mut next = conn.clone();
+    egui::ComboBox::from_id_salt(("pb_ext_port_conn", proto.id(), port_key)).selected_text(shown).width(180.0).show_ui(ui, |ui| {
+        ui.selectable_value(&mut next, String::new(), "(none)");
+        for (id, l) in conns {
+            ui.selectable_value(&mut next, id.clone(), l);
+        }
+    });
+    if next != *conn {
+        *conn = next;
+        return true;
+    }
+    false
+}
+
+/// WebSocket Output fields edited inline on the node.
+pub struct WsOut<'a> {
+    pub mode: &'a mut String,
+    pub port: &'a mut u16,
+    pub url: &'a mut String,
+    pub format: &'a mut String,
 }
 
 /// Hub Input / Output inspector for an ext protocol port. Returns true when it changed.
@@ -1113,7 +1151,7 @@ pub fn edit_port(
     proto: ExtProto,
     port_key: (u64, u64),
     incoming: bool,
-    port: PortFields<'_>,
+    mut port: PortFields<'_>,
     conns: &[(String, String)],
     host: &HostSnapshot,
     points: &[String],
@@ -1144,22 +1182,86 @@ pub fn edit_port(
                 dirty |= ui.add(egui::DragValue::new(port.interval).range(0.02..=3600.0).speed(0.05).max_decimals(2)).changed();
             }
         });
+    } else if let (ExtProto::WebSocket, false, Some(ws)) = (proto, incoming, port.ws) {
+        // The node is the server by default: a port, no connection to set up first.
+        section(ui, "WEBSOCKET OUTPUT", p);
+        let modes = [("serve", "Serve (listen on a port)"), ("url", "Connect to a remote URL"), ("connection", "Use a WebSocket panel connection")];
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Send by").font(font_ui(12.0)).color(p.muted));
+            let cur = if ws.mode.is_empty() { "serve" } else { ws.mode.as_str() };
+            let shown = modes.iter().find(|(k, _)| *k == cur).map(|(_, l)| *l).unwrap_or(modes[0].1);
+            let mut next = cur.to_string();
+            egui::ComboBox::from_id_salt(("pb_ws_out_mode", port_key)).selected_text(shown).width(230.0).show_ui(ui, |ui| {
+                for (k, l) in modes {
+                    ui.selectable_value(&mut next, k.to_string(), l);
+                }
+            });
+            if next != *ws.mode {
+                *ws.mode = next;
+                dirty = true;
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            match ws.mode.as_str() {
+                "url" => {
+                    ui.label(RichText::new("URL").font(font_ui(12.0)).color(p.muted));
+                    dirty |= ui.add(egui::TextEdit::singleline(ws.url).desired_width(240.0).hint_text("ws://host:port/path or wss://…")).changed();
+                }
+                "connection" => {
+                    let picks: Vec<(String, String)> = conns.iter().filter(|(id, _)| !id.starts_with("wsout_")).cloned().collect();
+                    dirty |= conn_combo(ui, proto, port_key, port.conn, &picks, p);
+                }
+                _ => {
+                    ui.label(RichText::new("Port").font(font_ui(12.0)).color(p.muted));
+                    let mut v = (*ws.port).max(1) as u32;
+                    if ui.add(egui::DragValue::new(&mut v).range(1..=65535).speed(1.0)).changed() {
+                        *ws.port = v as u16;
+                        dirty = true;
+                    }
+                }
+            }
+            if ws.mode != "connection" {
+                ui.label(RichText::new("Format").font(font_ui(12.0)).color(p.muted));
+                let fmts = [("object", "One object, all keys"), ("change", "One message per change")];
+                let cur = if ws.format == "change" { "change" } else { "object" };
+                let mut next = cur.to_string();
+                egui::ComboBox::from_id_salt(("pb_ws_out_fmt", port_key)).selected_text(fmts.iter().find(|(k, _)| *k == cur).map(|(_, l)| *l).unwrap_or("")).width(170.0).show_ui(ui, |ui| {
+                    for (k, l) in fmts {
+                        ui.selectable_value(&mut next, k.to_string(), l);
+                    }
+                });
+                if next != cur {
+                    *ws.format = next;
+                    dirty = true;
+                }
+            }
+            if let Some((label, _)) = spec.interval_out {
+                ui.label(RichText::new(label).font(font_ui(12.0)).color(p.muted));
+                dirty |= ui.add(egui::DragValue::new(port.interval).range(0.02..=3600.0).speed(0.05).max_decimals(2)).changed();
+            }
+        });
+        match ws.mode.as_str() {
+            "serve" | "" => {
+                let url = format!("http://localhost:{}/", (*ws.port).max(1));
+                ui.horizontal(|ui| {
+                    if ui.button("Open viewer in browser").on_hover_text("Live page served on this port — shows the points it sends").clicked() {
+                        crate::app::open_in_browser(&url);
+                    }
+                    ui.label(RichText::new(format!("ws://<this machine>:{}/", (*ws.port).max(1))).font(font_mono(11.0)).color(p.muted));
+                });
+                ui.label(RichText::new("To read what browsers send back, add a WebSocket Input and pick this node as its connection.").font(font_ui(11.0)).color(p.muted));
+            }
+            "url" => {
+                ui.label(RichText::new("For a server you can't reach by listening — behind a firewall, or a cloud / Node-RED ingest endpoint.").font(font_ui(11.0)).color(p.muted));
+            }
+            _ => {
+                ui.label(RichText::new("Shares a connection from the WebSocket panel — use this to send and receive on one socket you set up there.").font(font_ui(11.0)).color(p.muted));
+            }
+        }
     } else {
     section(ui, &format!("{} CONNECTION", proto.title().to_ascii_uppercase()), p);
     ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("Connection").font(font_ui(12.0)).color(p.muted));
-        let shown = conns.iter().find(|(id, _)| id == port.conn).map(|(_, l)| l.clone()).unwrap_or_else(|| if port.conn.is_empty() { "(pick connection)".into() } else { port.conn.clone() });
-        let mut next = port.conn.clone();
-        egui::ComboBox::from_id_salt(("pb_ext_port_conn", proto.id(), port_key)).selected_text(shown).width(180.0).show_ui(ui, |ui| {
-            ui.selectable_value(&mut next, String::new(), "(none)");
-            for (id, l) in conns {
-                ui.selectable_value(&mut next, id.clone(), l);
-            }
-        });
-        if next != *port.conn {
-            *port.conn = next;
-            dirty = true;
-        }
+        dirty |= conn_combo(ui, proto, port_key, port.conn, conns, p);
         let interval = if incoming { spec.interval_in } else { spec.interval_out };
         if let Some((label, _)) = interval {
             ui.label(RichText::new(label).font(font_ui(12.0)).color(p.muted));
@@ -1195,7 +1297,8 @@ pub fn edit_port(
             }
         }
     }
-    if conns.is_empty() && proto != ExtProto::Dashboard {
+    let ws_owned = proto == ExtProto::WebSocket && !incoming && port.conn.starts_with("wsout_");
+    if conns.is_empty() && proto != ExtProto::Dashboard && !ws_owned {
         ui.label(RichText::new(format!("Add a connection in the {} panel.", proto.title())).font(font_ui(11.0)).color(p.muted));
     }
     if proto == ExtProto::Dashboard {
@@ -1242,6 +1345,7 @@ pub fn edit_port(
             point.clone()
         };
         let left = if incoming { format!("{}  →  {shown_point}", bind_label(proto, b)) } else { format!("{shown_point}  →  {}", bind_label(proto, b)) };
+        let left = if matches!(b.get("auto"), Some(Value::Bool(true))) { format!("{left}   · auto") } else { left };
         let val = lv.map(|x| x.value.chars().take(18).collect::<String>()).unwrap_or_else(|| "—".into());
         let vr = ui.painter().text(egui::pos2(r.max.x - 30.0, r.center().y), Align2::RIGHT_CENTER, val, font_mono(11.5), if lv.is_some() { ink } else { p.muted });
         let room = vr.min.x - (r.min.x + 18.0) - 10.0;
@@ -1257,7 +1361,15 @@ pub fn edit_port(
         }
     }
     if let Some(i) = remove {
-        list.remove(i);
+        let gone = list.remove(i);
+        if matches!(gone.get("auto"), Some(Value::Bool(true))) {
+            if let Some(d) = port.dismissed.as_deref_mut() {
+                let pt = text_of(&gone, "point");
+                if !d.contains(&pt) {
+                    d.push(pt);
+                }
+            }
+        }
         draft.editing = None;
         dirty = true;
     }
@@ -1392,12 +1504,25 @@ fn n(r: Rect, x: f32, y: f32) -> egui::Pos2 {
 /// the units already set; manual binds (no `auto` mark) are left alone; auto binds whose point is
 /// no longer wired go away.
 pub fn dashboard_auto_binds(current: &[Obj], wired: &[String]) -> Vec<Obj> {
+    auto_binds(DASHBOARD.out_fields, current, wired, None)
+}
+
+/// One `auto` bind per wired point (defaults from `fields`), keeping edits already made to an
+/// auto bind (units, JSON key); manual binds are left alone; auto binds no longer wanted go.
+/// `name_key`: a field set to the point id on a new bind (e.g. Sparkplug `metric`).
+pub fn auto_binds(fields: &[Field], current: &[Obj], wired: &[String], name_key: Option<&str>) -> Vec<Obj> {
     let mut next: Vec<Obj> = current.iter().filter(|b| !matches!(b.get("auto"), Some(Value::Bool(true)))).cloned().collect();
     for point in wired {
         if next.iter().any(|b| text_of(b, "point") == *point) {
             continue;
         }
-        let mut b = current.iter().find(|b| text_of(b, "point") == *point).cloned().unwrap_or_else(|| obj_with_defaults(DASHBOARD.out_fields));
+        let mut b = current.iter().find(|b| text_of(b, "point") == *point).cloned().unwrap_or_else(|| {
+            let mut o = obj_with_defaults(fields);
+            if let Some(k) = name_key {
+                o.insert(k.into(), Value::from(point.clone()));
+            }
+            o
+        });
         b.insert("point".into(), Value::from(point.clone()));
         b.insert("auto".into(), Value::Bool(true));
         next.push(b);
@@ -1461,6 +1586,94 @@ pub fn sync_dashboard_conns(hubs: &mut crate::hubs::HubModel, conns: &mut Vec<Ob
     }
     if want == old {
         return false;
+    }
+    *conns = want;
+    true
+}
+
+/// Connection id for a WebSocket Output that owns its connection.
+pub fn ws_out_conn_id(hub_id: u64, port_id: u64) -> String {
+    format!("wsout_{hub_id}_{port_id}")
+}
+
+/// True for a WebSocket connection created and managed by an Output node.
+pub fn is_ws_owned(c: &Obj) -> bool {
+    text_of(c, "id").starts_with("wsout_")
+}
+
+/// A WebSocket Output serves by default: the node *is* the server, so the user sets a port on
+/// the node instead of making a connection first. `url` mode dials a remote server instead;
+/// `connection` mode uses a hand-made connection from the WebSocket panel (left alone here).
+/// Owned connections (`wsout_…`) stay in the `websocket` list so Inputs can pick them — that is
+/// how a web HMI's messages come back in on the same socket. Hand-made connections are never
+/// touched. A node from an older project that already points at a hand-made connection keeps it
+/// (`connection` mode). Idempotent; returns true when anything changed.
+pub fn sync_websocket_out_conns(hubs: &mut crate::hubs::HubModel, conns: &mut Vec<Obj>) -> bool {
+    use crate::hubs::HubProto;
+    let old = conns.clone();
+    let mut model_changed = false;
+    // Ports in use: hand-made servers plus every node's chosen port.
+    let mut used: Vec<u16> = old
+        .iter()
+        .filter(|c| !is_ws_owned(c) && text_of(c, "mode") == "server")
+        .filter_map(|c| text_of(c, "port").parse().ok())
+        .collect();
+    for h in &hubs.hubs {
+        for o in h.outputs.iter().filter(|o| o.protocol == HubProto::WebSocket && o.ws_port != 0) {
+            used.push(o.ws_port);
+        }
+    }
+    let mut owned: Vec<Obj> = Vec::new();
+    for h in &mut hubs.hubs {
+        let hub_id = h.id;
+        for o in h.outputs.iter_mut().filter(|o| o.protocol == HubProto::WebSocket) {
+            let id = ws_out_conn_id(hub_id, o.id);
+            if o.ws_mode.is_empty() {
+                let hand_made = !o.ext_connection.is_empty() && o.ext_connection != id;
+                o.ws_mode = if hand_made { "connection" } else { "serve" }.into();
+                model_changed = true;
+            }
+            if o.ws_mode == "connection" {
+                if o.ext_connection == id {
+                    o.ext_connection.clear();
+                    model_changed = true;
+                }
+                continue;
+            }
+            if o.ws_mode == "serve" && o.ws_port == 0 {
+                let free = (8765u16..=65535).find(|p| !used.contains(p)).unwrap_or(8765);
+                o.ws_port = free;
+                used.push(free);
+                model_changed = true;
+            }
+            if o.ext_connection != id {
+                o.ext_connection = id.clone();
+                model_changed = true;
+            }
+            let mut c = old.iter().find(|c| text_of(c, "id") == id).cloned().unwrap_or_default();
+            c.insert("id".into(), Value::from(id));
+            c.insert("label".into(), Value::from(if o.label.trim().is_empty() { "WebSocket output".to_string() } else { o.label.clone() }));
+            if o.ws_mode == "url" {
+                c.insert("mode".into(), Value::from("client"));
+                c.insert("url".into(), Value::from(if o.ws_url.trim().is_empty() { "ws://127.0.0.1:8765/".to_string() } else { o.ws_url.trim().to_string() }));
+                c.remove("host");
+                c.remove("port");
+            } else {
+                c.insert("mode".into(), Value::from("server"));
+                c.insert("host".into(), Value::from("0.0.0.0"));
+                c.insert("port".into(), Value::from(o.ws_port));
+                c.remove("url");
+            }
+            c.insert("out_format".into(), Value::from(if o.ws_format == "change" { "change" } else { "object" }));
+            c.entry("enabled").or_insert(Value::Bool(true));
+            owned.push(c);
+        }
+    }
+    // Hand-made connections keep their order; owned ones follow.
+    let mut want: Vec<Obj> = old.iter().filter(|c| !is_ws_owned(c)).cloned().collect();
+    want.extend(owned);
+    if want == old {
+        return model_changed;
     }
     *conns = want;
     true
@@ -1624,6 +1837,59 @@ mod tests {
         assert_eq!(m.hubs[1].outputs[0].dash_title, "Old");
         assert_eq!(conns.len(), 1);
         assert_ne!(text_of(&conns[0], "id"), "web");
+    }
+
+    fn ws_model() -> crate::hubs::HubModel {
+        let mut m = crate::hubs::HubModel::sample();
+        let hub = m.hubs[1].id;
+        let o = &mut m.hub_mut(hub).unwrap().outputs[0];
+        o.protocol = crate::hubs::HubProto::WebSocket;
+        o.ext_connection.clear();
+        m
+    }
+
+    #[test]
+    fn websocket_output_serves_by_default() {
+        let mut m = ws_model();
+        let mut conns = vec![serde_json::json!({"id":"feed","mode":"client","url":"ws://x/"}).as_object().unwrap().clone()];
+        assert!(sync_websocket_out_conns(&mut m, &mut conns));
+        let o = &m.hubs[1].outputs[0];
+        assert_eq!((o.ws_mode.as_str(), o.ws_port), ("serve", 8765));
+        assert_eq!(conns.len(), 2, "hand-made connection kept");
+        assert_eq!(text_of(&conns[0], "id"), "feed");
+        assert_eq!(o.ext_connection, text_of(&conns[1], "id"));
+        assert_eq!((text_of(&conns[1], "mode"), text_of(&conns[1], "port")), ("server".into(), "8765".into()));
+        assert!(!sync_websocket_out_conns(&mut m, &mut conns), "idempotent");
+        // Switch to dialing a remote server.
+        m.hubs[1].outputs[0].ws_mode = "url".into();
+        m.hubs[1].outputs[0].ws_url = "wss://cloud.example/ingest".into();
+        assert!(sync_websocket_out_conns(&mut m, &mut conns));
+        assert_eq!((text_of(&conns[1], "mode"), text_of(&conns[1], "url")), ("client".into(), "wss://cloud.example/ingest".into()));
+        assert!(conns[1].get("port").is_none());
+        // Switch to a hand-made connection: the owned one goes away.
+        m.hubs[1].outputs[0].ws_mode = "connection".into();
+        assert!(sync_websocket_out_conns(&mut m, &mut conns));
+        assert_eq!(conns.len(), 1);
+        assert!(m.hubs[1].outputs[0].ext_connection.is_empty());
+    }
+
+    #[test]
+    fn websocket_output_ports_avoid_collisions_and_old_links_stay() {
+        let mut m = ws_model();
+        let hub = m.hubs[1].id;
+        m.add_port(hub, false);
+        let n = m.hubs[1].outputs.len() - 1;
+        m.hubs[1].outputs[n].protocol = crate::hubs::HubProto::WebSocket;
+        m.hubs[1].outputs[n].ext_connection = "hmi".into();
+        let mut conns = vec![serde_json::json!({"id":"hmi","mode":"server","port":8765}).as_object().unwrap().clone()];
+        assert!(sync_websocket_out_conns(&mut m, &mut conns));
+        assert_eq!(m.hubs[1].outputs[0].ws_port, 8766, "skips the hand-made server's port");
+        assert_eq!(m.hubs[1].outputs[n].ws_mode, "connection", "old project keeps its connection");
+        assert_eq!(m.hubs[1].outputs[n].ext_connection, "hmi");
+        // Removing the node removes its connection only.
+        m.hubs[1].outputs[0].protocol = crate::hubs::HubProto::Mqtt;
+        assert!(sync_websocket_out_conns(&mut m, &mut conns));
+        assert_eq!(conns.iter().map(|c| text_of(c, "id")).collect::<Vec<_>>(), ["hmi"]);
     }
 
     #[test]

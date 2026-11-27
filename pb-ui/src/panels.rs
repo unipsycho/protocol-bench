@@ -284,7 +284,9 @@ pub fn paint(
             hubs.choices.modbus_clients = modbus.choices(ModbusRole::Client);
             hubs.choices.modbus_servers = modbus.choices(ModbusRole::Server);
             hubs.choices.file_sources = files.choices();
-            let made_board = crate::gen_ui::ensure_board(hubs, ext) | crate::ext_proto::sync_dashboard_conns(hubs, &mut ext.get_mut(crate::ext_proto::ExtProto::Dashboard).conns);
+            let made_board = crate::gen_ui::ensure_board(hubs, ext) | crate::ext_proto::sync_dashboard_conns(hubs, &mut ext.get_mut(crate::ext_proto::ExtProto::Dashboard).conns)
+                | crate::ext_proto::sync_websocket_out_conns(hubs, &mut ext.get_mut(crate::ext_proto::ExtProto::WebSocket).conns)
+                | crate::hubs::sync_modbus_server_maps(hubs, &mut modbus.conns, &host.points);
             hubs.choices.ext_conns = ext.states.iter().map(|st| st.choices()).collect();
             let mut change = crate::hubs::paint(ui, hubs, p, &conns, mqtt, opcua, http, streams, las, snmp, host, engine);
             change.dirty |= made_board;

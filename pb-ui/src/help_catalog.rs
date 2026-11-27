@@ -1265,6 +1265,8 @@ A **Server connection** is a Modbus server Protocol Bench hosts — TCP listen o
 2. Fill the **REGISTER MAP** with the register editor: which host point is served at which area / address / type / order (and optional scale — masters read raw counts, points keep engineering units).
 3. Create a **Modbus hub** and pick this Server connection. A server runs **only when a hub uses it**.
 
+**Auto-map wired points** (on the hub, on for new hubs) skips most of step 2: every point on an arrow into the hub gets a row in the server's register map as an **f32 holding register**, packed from the **from address** you set (0 = Modicon 40001), around any rows you made yourself. Change an auto row's address, type or scaling in the register map and it sticks; delete it to leave that point out. Cutting the arrow removes its row; turning the option off keeps the rows as ordinary ones.
+
 ## Behaviour
 
 - Point changes update the register image; master writes update the points.
@@ -1635,6 +1637,20 @@ WITS level 0 is the ASCII record stream used between rigs, frac vans and service
 |---|---|
 | **Client** | Dial a `ws://` / `wss://` URL (optionally send a **subscribe message** after connecting). Received JSON messages feed Input binds |
 | **Server** | Listen on host:port. Every browser / dashboard that connects gets Output messages; messages they send feed Input binds — a two-way web HMI |
+
+## WebSocket Output — no connection needed
+
+A WebSocket **Output** node is its own server: add it, set a **Port** on the node (a free one from 8765 is picked for you) and it listens. Its connection appears in the WebSocket panel as *from Output node* and goes away with the node.
+
+| Send by | Use |
+|---|---|
+| **Serve (listen on a port)** | The default. Browsers and apps connect to this machine |
+| **Connect to a remote URL** | When you can't listen — behind an outbound-only firewall, or pushing to a cloud / Node-RED ingest server |
+| **Use a WebSocket panel connection** | Share one socket you set up in the panel, e.g. a client feed that also takes commands |
+
+**Auto-bind wired points** (on for new nodes) sends every point on an arrow into the node, JSON key = point id. Remove one with × to leave it out; manual binds still work alongside. Turning it off keeps the current binds as ordinary ones. The same option is on MQTT, HTTP, Streams, LAS and Sparkplug B Outputs (topic / JSON path / field / curve / metric named after the point) and on WITS Outputs (next free item code in a record you choose, 99 by default), and every Output's point picker lists only points wired into that node unless **Show all project points** is on.
+
+To read what browsers send back (a two-way HMI), add a WebSocket **Input** and pick the Output node's connection — both sides then use the same socket. Inputs always need a connection, made in the panel or by an Output node.
 
 ## Binds
 

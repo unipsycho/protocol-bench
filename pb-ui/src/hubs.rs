@@ -119,6 +119,15 @@ impl HubProto {
         Self::ALL.into_iter().filter(move |p| if incoming { *p != HubProto::Dashboard } else { *p != HubProto::Gen })
     }
 
+    /// Output protocols that can bind every wired point automatically: the bind's name (topic,
+    /// JSON path / key, field, curve, metric) is derived from the point; WITS takes the next free
+    /// item code in a record. Modbus Outputs write a remote device's registers and DNP3 / CAN send
+    /// controls / frames to real equipment, so those keep addresses the user chooses. Dashboard
+    /// is always automatic.
+    pub fn auto_binds(self) -> bool {
+        matches!(self, Self::Mqtt | Self::Http | Self::Streams | Self::Las | Self::WebSocket | Self::Sparkplug | Self::Wits)
+    }
+
     /// The ext protocol behind this node, if any.
     pub fn ext(self) -> Option<crate::ext_proto::ExtProto> {
         use crate::ext_proto::ExtProto;
@@ -450,6 +459,36 @@ pub struct HubPort {
     pub dash_title: String,
     #[serde(default, skip_serializing_if = "is_zero_u16")]
     pub dash_port: u16,
+    /// WebSocket Output: how it sends. `serve` = its own listener (the default — the node *is*
+    /// the server), `url` = dial a remote ws:// server, `connection` = a hand-made connection
+    /// from the WebSocket panel (to share one socket on purpose). Empty = not decided yet;
+    /// `ext_proto::sync_websocket_out_conns` settles it and keeps the owned connection in step.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ws_mode: String,
+    /// WebSocket Output, `serve` mode: listen port (0 = not chosen yet).
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub ws_port: u16,
+    /// WebSocket Output, `url` mode: the remote server to dial.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ws_url: String,
+    /// WebSocket Output, owned modes: `object` (one message, all keys) or `change`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ws_format: String,
+    /// Output: bind every point wired into the node automatically (MQTT, HTTP, Streams, LAS,
+    /// WebSocket, Sparkplug B — see `HubProto::auto_binds`). `None` = the protocol's old default
+    /// (on for MQTT, off otherwise) so existing projects keep behaving as before; new nodes get
+    /// `Some(true)`. Manual binds work alongside; removed auto binds go to `mqtt_out_dismissed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_bind: Option<bool>,
+    /// HTTP / Streams / LAS Output: points currently bound by auto-bind (those bind types carry
+    /// no `auto` mark of their own). MQTT and ext binds mark themselves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_points: Vec<String>,
+    /// WITS Output auto-bind: record the item codes are taken from (`RRII`, items 01–99 in
+    /// order, skipping codes already bound). 0 = 99, a custom record that won't be mistaken for
+    /// the standard ones.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub wits_auto_record: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ext_inputs: Vec<serde_json::Map<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -458,8 +497,8 @@ pub struct HubPort {
     pub draft_modbus: Option<ModbusBind>,
     #[serde(skip)]
     pub draft_file_column: String,
-    /// Auto-bound points the user removed from this Output; sync must not re-add them
-    /// while the wire still delivers them.
+    /// Auto-bound points the user removed from this Output (MQTT, or WebSocket with
+    /// auto-bind on); sync must not re-add them while the wire still delivers them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mqtt_out_dismissed: Vec<String>,
     /// Ephemeral inspector drafts — not persisted.
@@ -524,9 +563,134 @@ fn default_snmp_interval() -> f32 { 10.0 }
 fn default_modbus_interval() -> f32 { 1.0 }
 fn default_ext_interval() -> f32 { 1.0 }
 fn is_zero_u16(v: &u16) -> bool { *v == 0 }
+fn is_zero_u8(v: &u8) -> bool { *v == 0 }
+
+/// Auto-bind for a non-MQTT Output: one bind per wanted point, named after the point.
+/// Returns true when the binds changed.
+fn sync_auto_output_binds(port: &mut HubPort, wanted: &[String]) -> bool {
+    use crate::ext_proto::{auto_binds, ExtProto};
+    match port.protocol {
+        HubProto::WebSocket | HubProto::Sparkplug => {
+            let e = port.protocol.ext().unwrap_or(ExtProto::WebSocket);
+            // WebSocket: empty JSON key already means "point id". Sparkplug: metric = point.
+            let name_key = if e == ExtProto::Sparkplug { Some("metric") } else { None };
+            let next = auto_binds(e.spec().out_fields, &port.ext_outputs, wanted, name_key);
+            if next == port.ext_outputs {
+                return false;
+            }
+            port.ext_outputs = next;
+            true
+        }
+        HubProto::Wits => {
+            let fields = ExtProto::Wits.spec().out_fields;
+            let mut next = auto_binds(fields, &port.ext_outputs, wanted, None);
+            let record = if port.wits_auto_record == 0 { 99 } else { port.wits_auto_record.min(99) };
+            let mut used: Vec<String> = next.iter().map(|b| crate::ext_proto::text_of(b, "item")).collect();
+            for b in next.iter_mut().filter(|b| matches!(b.get("auto"), Some(serde_json::Value::Bool(true)))) {
+                if !crate::ext_proto::text_of(b, "item").trim().is_empty() {
+                    continue;
+                }
+                // Record full (99 items): leave the item blank; the row shows it needs one.
+                if let Some(code) = (1..=99u8).map(|i| format!("{record:02}{i:02}")).find(|c| !used.contains(c)) {
+                    b.insert("item".into(), serde_json::Value::from(code.clone()));
+                    used.push(code);
+                }
+            }
+            if next == port.ext_outputs {
+                return false;
+            }
+            port.ext_outputs = next;
+            true
+        }
+        HubProto::Http => sync_typed_auto(&mut port.http_outputs, &mut port.auto_points, wanted, |b| &b.point, |p| HttpOutputBind { point: p.into(), json_path: p.into() }),
+        HubProto::Las => sync_typed_auto(&mut port.las_outputs, &mut port.auto_points, wanted, |b| &b.point, |p| LasOutputBind { point: p.into(), curve: p.into() }),
+        HubProto::Streams => {
+            let changed = sync_typed_auto(&mut port.stream_outputs, &mut port.auto_points, wanted, |b| &b.point, |p| StreamOutputBind { point: p.into(), field: String::new() });
+            if changed {
+                renumber_stream_emit_fields(&mut port.stream_outputs);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// Auto binds for bind types without an `auto` mark: `auto_pts` lists the points auto-bind
+/// added. Drops those no longer wanted, adds wanted points not bound yet (manual binds win).
+fn sync_typed_auto<T>(list: &mut Vec<T>, auto_pts: &mut Vec<String>, wanted: &[String], point_of: impl Fn(&T) -> &String, make: impl Fn(&str) -> T) -> bool {
+    let mut changed = false;
+    let gone: Vec<String> = auto_pts.iter().filter(|p| !wanted.contains(p)).cloned().collect();
+    if !gone.is_empty() {
+        list.retain(|b| !gone.contains(point_of(b)));
+        auto_pts.retain(|p| wanted.contains(p));
+        changed = true;
+    }
+    for p in wanted {
+        if list.iter().any(|b| point_of(b) == p) {
+            continue;
+        }
+        list.push(make(p));
+        if !auto_pts.contains(p) {
+            auto_pts.push(p.clone());
+        }
+        changed = true;
+    }
+    changed
+}
 fn default_las_index() -> String { "depth".into() }
 
 impl HubPort {
+    /// Auto-bind in effect on this Output (see `auto_bind`).
+    pub fn auto_bind_on(&self) -> bool {
+        self.protocol.auto_binds() && self.auto_bind.unwrap_or(self.protocol == HubProto::Mqtt)
+    }
+
+    /// Output bind count for the current protocol.
+    fn output_bind_count(&self) -> usize {
+        match self.protocol {
+            HubProto::Mqtt => self.mqtt_outputs.len(),
+            HubProto::Http => self.http_outputs.len(),
+            HubProto::Streams => self.stream_outputs.len(),
+            HubProto::Las => self.las_outputs.len(),
+            HubProto::Modbus => self.modbus_outputs.len(),
+            _ => self.ext_outputs.len(),
+        }
+    }
+
+    /// Protocol picked in the UI. An Output switched to a protocol it has no binds for yet
+    /// starts with auto-bind on.
+    pub fn set_protocol_from_ui(&mut self, next: HubProto, output: bool) {
+        self.protocol = next;
+        if output && next.auto_binds() && self.output_bind_count() == 0 {
+            self.auto_bind = Some(true);
+        }
+    }
+
+    /// Turn auto-bind on / off. Off keeps what is bound, as ordinary (manual) binds.
+    pub fn set_auto_bind(&mut self, on: bool) {
+        self.auto_bind = Some(on);
+        if !on {
+            for b in &mut self.mqtt_outputs {
+                b.auto = false;
+            }
+            for b in &mut self.ext_outputs {
+                b.remove("auto");
+            }
+            self.auto_points.clear();
+            self.mqtt_out_dismissed.clear();
+        }
+    }
+
+    /// The user removed an Output bind for `point`: if auto-bind made it, keep it out while the
+    /// wire still delivers it.
+    pub fn dismiss_auto(&mut self, point: &str) {
+        let was_auto = self.auto_points.iter().any(|p| p == point);
+        self.auto_points.retain(|p| p != point);
+        if was_auto && !self.mqtt_out_dismissed.iter().any(|p| p == point) {
+            self.mqtt_out_dismissed.push(point.to_string());
+        }
+    }
+
     pub fn new(id: u64, protocol: HubProto, label: impl Into<String>) -> Self {
         Self {
             id,
@@ -570,6 +734,13 @@ impl HubPort {
             ext_interval_secs: default_ext_interval(),
             dash_title: String::new(),
             dash_port: 0,
+            ws_mode: String::new(),
+            ws_port: 0,
+            ws_url: String::new(),
+            ws_format: String::new(),
+            auto_bind: None,
+            auto_points: Vec::new(),
+            wits_auto_record: 0,
             ext_inputs: Vec::new(),
             ext_outputs: Vec::new(),
             draft_modbus: None,
@@ -676,6 +847,9 @@ pub struct Hub {
     /// Modbus hub: id of the Server connection (Modbus panel) this hub listens on.
     #[serde(default)]
     pub modbus_server: String,
+    /// Modbus hub: serve every point wired into the hub from its server's register map.
+    #[serde(default, skip_serializing_if = "ModbusAutoMap::is_default")]
+    pub modbus_auto: ModbusAutoMap,
     /// OPC UA hub: also publish host points that have no catalog row (internal names).
     #[serde(default = "default_true")]
     pub opcua_expose_unmapped: bool,
@@ -686,6 +860,125 @@ pub struct Hub {
 
 fn default_true() -> bool {
     true
+}
+
+/// Modbus hub auto-map: points on arrows into the hub get rows in its Server connection's
+/// register map (f32 holding registers from `start`, in wire order). Rows the user deletes in
+/// the Modbus panel stay out while still wired; edits to auto rows (address, type, scaling) stick.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModbusAutoMap {
+    #[serde(default)]
+    pub on: bool,
+    /// First holding register address auto rows use (0-based protocol address).
+    #[serde(default)]
+    pub start: u16,
+    /// Server connection the auto rows were written to (to clean up when the hub switches).
+    #[serde(default)]
+    pub conn: String,
+    /// Points whose map rows auto-map added.
+    #[serde(default)]
+    pub points: Vec<String>,
+    /// Auto rows the user deleted; not re-added while the wire still delivers them.
+    #[serde(default)]
+    pub dismissed: Vec<String>,
+}
+
+impl ModbusAutoMap {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// First holding address ≥ `start` with `width` free registers in `map`.
+fn free_holding_address(map: &[ModbusBind], start: u16, width: u16) -> u16 {
+    let used: Vec<(u32, u32)> = map.iter().filter(|b| b.area == "holding").map(|b| (b.address as u32, b.address as u32 + b.width().max(1) as u32)).collect();
+    let mut a = start as u32;
+    while a + width as u32 <= 65536 {
+        match used.iter().find(|(lo, hi)| a < *hi && *lo < a + width as u32) {
+            Some((_, hi)) => a = *hi,
+            None => return a as u16,
+        }
+    }
+    start
+}
+
+/// Keep each Modbus hub's auto rows in its Server connection's register map in step with the
+/// points wired into the hub. Hand-made rows are never touched. Returns true when anything changed.
+pub fn sync_modbus_server_maps(model: &mut HubModel, conns: &mut [crate::modbus_panel::ModbusConn], host_points: &[PointSnapshot]) -> bool {
+    use crate::modbus_panel::ModbusRole;
+    let mut changed = false;
+    let wired_by_hub: Vec<(u64, Vec<String>)> = model
+        .hubs
+        .iter()
+        .filter(|h| h.protocol == HubProto::Modbus)
+        .map(|h| {
+            let mut pts: Vec<String> = Vec::new();
+            for f in model.feeds.iter().filter(|f| f.to_hub == h.id && f.to_node == h.id) {
+                for p in model.points_for_node(f.from_hub, f.from_node, host_points) {
+                    if !pts.contains(&p) {
+                        pts.push(p);
+                    }
+                }
+            }
+            (h.id, pts)
+        })
+        .collect();
+    for (hub_id, wired) in wired_by_hub {
+        let Some(hub) = model.hub_mut(hub_id) else { continue };
+        let server = hub.modbus_server.clone();
+        let a = &mut hub.modbus_auto;
+        // Switched server (or turned off): auto rows left on the old map go; off keeps them as
+        // ordinary rows.
+        if !a.conn.is_empty() && (a.conn != server || !a.on) {
+            if a.on {
+                if let Some(old) = conns.iter_mut().find(|c| c.id == a.conn) {
+                    old.map.retain(|b| !a.points.contains(&b.point));
+                }
+            }
+            a.points.clear();
+            a.dismissed.clear();
+            a.conn.clear();
+            changed = true;
+        }
+        if !a.on || server.is_empty() {
+            continue;
+        }
+        let Some(conn) = conns.iter_mut().find(|c| c.id == server && c.role == ModbusRole::Server) else { continue };
+        if a.conn != server {
+            a.conn = server.clone();
+            changed = true;
+        }
+        let map = &mut conn.map;
+        // Auto rows the user deleted in the register map stay out.
+        let deleted: Vec<String> = a.points.iter().filter(|p| !map.iter().any(|b| &b.point == *p)).cloned().collect();
+        for p in deleted {
+            a.points.retain(|x| x != &p);
+            if !a.dismissed.contains(&p) {
+                a.dismissed.push(p);
+            }
+            changed = true;
+        }
+        let before = a.dismissed.len();
+        a.dismissed.retain(|d| wired.contains(d));
+        changed |= before != a.dismissed.len();
+        let wanted: Vec<&String> = wired.iter().filter(|p| !a.dismissed.contains(p)).collect();
+        let gone: Vec<String> = a.points.iter().filter(|p| !wanted.contains(p)).cloned().collect();
+        if !gone.is_empty() {
+            map.retain(|b| !gone.contains(&b.point));
+            a.points.retain(|p| !gone.contains(p));
+            changed = true;
+        }
+        for p in wanted {
+            if map.iter().any(|b| &b.point == p) {
+                continue;
+            }
+            let address = free_holding_address(map, a.start, 2);
+            map.push(ModbusBind { name: p.clone(), area: "holding".into(), address, dtype: "f32".into(), point: p.clone(), ..ModbusBind::default() });
+            a.points.push(p.clone());
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// One row of an OPC UA hub's public tag catalog. NodeId stays the host point id.
@@ -981,6 +1274,7 @@ impl HubModel {
                     calculations: vec![],
                     at: None,
                     modbus_server: "hub".into(),
+                    modbus_auto: Default::default(),
                     opcua_expose_unmapped: true,
                     opcua_catalog: vec![],
                 },
@@ -1007,6 +1301,7 @@ impl HubModel {
                     calculations: vec![],
                     at: None,
                     modbus_server: String::new(),
+                    modbus_auto: Default::default(),
                     opcua_expose_unmapped: true,
                     opcua_catalog: vec![],
                 },
@@ -1393,6 +1688,7 @@ impl HubModel {
             id,
             name,
             protocol: HubProto::Modbus,
+            modbus_auto: ModbusAutoMap { on: true, ..ModbusAutoMap::default() },
             sources: vec![HubPort::new(source, HubProto::Modbus, "Input")],
             outputs: vec![HubPort::new(output, HubProto::Mqtt, "Output")],
             aggregators: vec![],
@@ -1438,6 +1734,9 @@ impl HubModel {
         };
         // Hub protocol only — sources/outputs keep their own protocols.
         hub.protocol = proto;
+        if proto == HubProto::Modbus && hub.modbus_auto.is_default() {
+            hub.modbus_auto.on = true;
+        }
     }
 
     /// Append a source or output and return its id.
@@ -1451,7 +1750,10 @@ impl HubModel {
         let Some(hub) = self.hub_mut(hub_id) else {
             return None;
         };
-        let port = HubPort::new(id, proto, if source { "Input" } else { "Output" });
+        let mut port = HubPort::new(id, proto, if source { "Input" } else { "Output" });
+        if !source {
+            port.auto_bind = Some(true);
+        }
         if source {
             hub.sources.push(port);
         } else {
@@ -1956,6 +2258,23 @@ impl HubModel {
         out
     }
 
+    /// Points an Output's pickers offer: only those on arrows into that node, unless "Show all
+    /// project points" is on.
+    pub fn output_pick_points(&self, hub_id: u64, port_id: u64, host_points: &[PointSnapshot]) -> Vec<String> {
+        if self.choices.show_all_points {
+            return host_points.iter().map(|pt| pt.name.clone()).collect();
+        }
+        let mut out: Vec<String> = Vec::new();
+        for feed in self.feeds.iter().filter(|f| f.to_hub == hub_id && f.to_node == port_id) {
+            for p in self.points_for_node(feed.from_hub, feed.from_node, host_points) {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
     /// Rebuild auto Output binds from inbound feeds; keep manual binds and topic overrides.
     /// Returns true when feeds or binds changed.
     pub fn sync_output_feed_binds(&mut self, host_points: &[PointSnapshot]) -> bool {
@@ -2008,7 +2327,14 @@ impl HubModel {
                     }
                     continue;
                 }
+                if !port.auto_bind_on() {
+                    continue;
+                }
                 if port.protocol != HubProto::Mqtt {
+                    let wired = by_out.get(&(hub.id, port.id)).cloned().unwrap_or_default();
+                    port.mqtt_out_dismissed.retain(|d| wired.contains(d));
+                    let wanted: Vec<String> = wired.into_iter().filter(|p| !port.mqtt_out_dismissed.contains(p)).collect();
+                    changed |= sync_auto_output_binds(port, &wanted);
                     continue;
                 }
                 let auto_points = by_out
@@ -4666,7 +4992,7 @@ fn edit_port(
                 });
         });
         if next != current {
-            port_field(model, hub_id, port_id).protocol = next;
+            port_field(model, hub_id, port_id).set_protocol_from_ui(next, !incoming);
             change.dirty = true;
         }
         ui.label(
@@ -4704,6 +5030,32 @@ fn edit_port(
             .font(font_ui(11.0))
             .color(p.muted),
         );
+        let port = port_field(model, hub_id, port_id);
+        if port.protocol.auto_binds() {
+            let mut on = port.auto_bind_on();
+            if ui
+                .checkbox(&mut on, "Auto-bind wired points")
+                .on_hover_text("Every point on an arrow into this node gets a bind named after the point. Remove one with × to leave it out; manual binds still work. Turning it off keeps the current binds.")
+                .changed()
+            {
+                port.set_auto_bind(on);
+                change.dirty = true;
+            }
+            if port.protocol == HubProto::Wits && on {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Item codes from record").font(font_ui(12.0)).color(p.muted));
+                    let mut r = if port.wits_auto_record == 0 { 99 } else { port.wits_auto_record } as u32;
+                    if ui
+                        .add(egui::DragValue::new(&mut r).range(1..=99).speed(0.2))
+                        .on_hover_text("Wired points get items RR01, RR02, … in this record. 99 is a custom record; use the one your receiver expects.")
+                        .changed()
+                    {
+                        port.wits_auto_record = r as u8;
+                        change.dirty = true;
+                    }
+                });
+            }
+        }
     }
     // Re-read protocol after possible dropdown change.
     let proto = port_field(model, hub_id, port_id).protocol;
@@ -4736,6 +5088,7 @@ fn edit_port(
             port_id,
             incoming,
             http,
+            host,
             p,
         ));
     }
@@ -4772,15 +5125,7 @@ fn edit_port(
     if let Some(e) = proto.ext() {
         ui.add_space(space::SECTION - 2.0);
         let conns = model.choices.ext_conns.get(e.index()).cloned().unwrap_or_default();
-        let points: Vec<String> = if incoming {
-            Vec::new()
-        } else {
-            if model.choices.show_all_points {
-                host.points.iter().map(|pt| pt.name.clone()).collect()
-            } else {
-                model.scoped_points(hub_id, &host.points)
-            }
-        };
+        let points: Vec<String> = if incoming { Vec::new() } else { model.output_pick_points(hub_id, port_id, &host.points) };
         // Generator signal names are one namespace per board: collect those on the other nodes.
         let other_names: Vec<String> = if e == crate::ext_proto::ExtProto::Gen {
             let board = port_field(model, hub_id, port_id).ext_connection.clone();
@@ -4800,6 +5145,8 @@ fn edit_port(
             conn: &mut port.ext_connection,
             interval: &mut port.ext_interval_secs,
             dash: Some((&mut port.dash_title, &mut port.dash_port)),
+            ws: Some(crate::ext_proto::WsOut { mode: &mut port.ws_mode, port: &mut port.ws_port, url: &mut port.ws_url, format: &mut port.ws_format }),
+            dismissed: Some(&mut port.mqtt_out_dismissed),
             inputs: &mut port.ext_inputs,
             outputs: &mut port.ext_outputs,
         };
@@ -4999,6 +5346,7 @@ fn edit_http_port_binds(
     port_id: u64,
     incoming: bool,
     http: &HttpPanelState,
+    host: &HostSnapshot,
     p: &ThemePalette,
 ) -> HubChange {
     let mut change = HubChange::quiet();
@@ -5286,6 +5634,7 @@ fn edit_http_port_binds(
         ui.add_space(space::AFTER_HEADING);
         let mut remove = None;
         let mut add = false;
+        let pick = model.output_pick_points(hub_id, port_id, &host.points);
         {
             let port = port_field(model, hub_id, port_id);
             for (i, bind) in port.http_outputs.iter().enumerate() {
@@ -5301,7 +5650,7 @@ fn edit_http_port_binds(
                 });
             }
             form::flow(ui, port, p, vec![
-                form::Cell::grow("Point", 90.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_http_out_point)),
+                form::Cell::grow("Point", 90.0, |ui, w, port: &mut HubPort| crate::register_map::point_picker(ui, ("pb_http_out_pt", port_id), w, &mut port.draft_http_out_point, &pick)),
                 form::Cell::grow("JSON path", 100.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_http_out_json_path)),
                 form::Cell::fixed("", 70.0, |ui, _w, _port: &mut HubPort| {
                     add = text_button(ui, "Add bind", false, p).clicked();
@@ -5310,7 +5659,9 @@ fn edit_http_port_binds(
             ]);
         }
         if let Some(i) = remove {
-            port_field(model, hub_id, port_id).http_outputs.remove(i);
+            let port = port_field(model, hub_id, port_id);
+            let gone = port.http_outputs.remove(i);
+            port.dismiss_auto(&gone.point);
             change.dirty = true;
         }
         if add {
@@ -5692,10 +6043,11 @@ fn edit_streams_port_binds(
         change.dirty |= paint_stream_emit_dnd(ui, model, hub_id, port_id, &host.points, p);
 
         let mut add_out = false;
+        let pick = model.output_pick_points(hub_id, port_id, &host.points);
         {
             let port = port_field(model, hub_id, port_id);
             form::flow(ui, port, p, vec![
-                form::Cell::grow("Point", 90.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_stream_out_point)),
+                form::Cell::grow("Point", 90.0, |ui, w, port: &mut HubPort| crate::register_map::point_picker(ui, ("pb_stream_out_pt", port_id), w, &mut port.draft_stream_out_point, &pick)),
                 form::Cell::grow_to("Field #", 60.0, 120.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_stream_out_field)),
                 form::Cell::fixed("", 70.0, |ui, _w, _port: &mut HubPort| {
                     add_out = text_button(ui, "Add emit", false, p).clicked();
@@ -6141,10 +6493,11 @@ fn paint_stream_emit_dnd(
     }
 
     if let Some(i) = remove {
-        let binds = &mut port_field(model, hub_id, port_id).stream_outputs;
-        if i < binds.len() {
-            binds.remove(i);
-            renumber_stream_emit_fields(binds);
+        let port = port_field(model, hub_id, port_id);
+        if i < port.stream_outputs.len() {
+            let gone = port.stream_outputs.remove(i);
+            renumber_stream_emit_fields(&mut port.stream_outputs);
+            port.dismiss_auto(&gone.point);
             dirty = true;
         }
     }
@@ -6782,14 +7135,17 @@ fn edit_las_port_binds(
             });
         }
         if let Some(i) = remove {
-            port_field(model, hub_id, port_id).las_outputs.remove(i);
+            let port = port_field(model, hub_id, port_id);
+            let gone = port.las_outputs.remove(i);
+            port.dismiss_auto(&gone.point);
             change.dirty = true;
         }
         let mut add = false;
+        let pick = model.output_pick_points(hub_id, port_id, &host.points);
         {
             let port = port_field(model, hub_id, port_id);
             form::flow(ui, port, p, vec![
-                form::Cell::grow("Point", 90.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_las_out_point)),
+                form::Cell::grow("Point", 90.0, |ui, w, port: &mut HubPort| crate::register_map::point_picker(ui, ("pb_las_out_pt", port_id), w, &mut port.draft_las_out_point, &pick)),
                 form::Cell::grow("Curve", 90.0, |ui, w, port: &mut HubPort| form::text(ui, w, &mut port.draft_las_out_curve)),
                 form::Cell::fixed("", 70.0, |ui, _w, _port: &mut HubPort| {
                     add = text_button(ui, "Add bind", false, p).clicked();
@@ -6863,6 +7219,32 @@ fn edit_modbus_hub_server(ui: &mut Ui, model: &mut HubModel, hub_id: u64, host: 
                 .font(font_ui(11.0))
                 .color(p.muted),
         );
+    }
+    if let Some(h) = model.hub_mut(hub_id) {
+        ui.add_space(space::AFTER_FIELD);
+        ui.horizontal_wrapped(|ui| {
+            let mut on = h.modbus_auto.on;
+            if ui
+                .checkbox(&mut on, "Auto-map wired points")
+                .on_hover_text("Every point on an arrow into this hub is served as an f32 holding register. Delete a row in the Modbus panel's register map to leave it out; edits to a row stick. Turning it off keeps the rows.")
+                .changed()
+            {
+                h.modbus_auto.on = on;
+                change.dirty = true;
+            }
+            if on {
+                ui.label(egui::RichText::new("from address").font(font_ui(12.0)).color(p.muted));
+                let mut v = h.modbus_auto.start as u32;
+                if ui.add(egui::DragValue::new(&mut v).range(0..=65534).speed(1.0)).on_hover_text("0-based protocol address (0 = Modicon 40001). Applies to points mapped from now on.").changed() {
+                    h.modbus_auto.start = v as u16;
+                    change.dirty = true;
+                }
+            }
+        });
+        if h.modbus_auto.on && !h.modbus_auto.points.is_empty() {
+            let n = h.modbus_auto.points.len();
+            ui.label(egui::RichText::new(format!("{n} point{} auto-mapped — see the register map in the Modbus panel.", if n == 1 { "" } else { "s" })).font(font_ui(11.0)).color(p.muted));
+        }
     }
     change
 }
@@ -7121,13 +7503,7 @@ fn edit_modbus_port_binds(
         .color(p.muted),
     );
     ui.add_space(space::AFTER_HEADING);
-    let points: Vec<String> = if incoming {
-        Vec::new()
-    } else if model.choices.show_all_points {
-        host.points.iter().map(|pt| pt.name.clone()).collect()
-    } else {
-        model.scoped_points(hub_id, &host.points)
-    };
+    let points: Vec<String> = if incoming { Vec::new() } else { model.output_pick_points(hub_id, port_id, &host.points) };
     let conn = port_field(model, hub_id, port_id).modbus_connection.clone();
     let ctx = crate::register_map::MapCtx {
         role: if incoming { crate::register_map::MapRole::Input } else { crate::register_map::MapRole::Output },
@@ -7720,11 +8096,7 @@ fn edit_mqtt_port_binds(
         let mut add = false;
         let show_all = model.choices.show_all_points;
         let mut model_show_all = show_all;
-        let point_names: Vec<String> = if show_all {
-            host.points.iter().map(|p| p.name.clone()).collect()
-        } else {
-            model.scoped_points(hub_id, &host.points)
-        };
+        let point_names: Vec<String> = model.output_pick_points(hub_id, port_id, &host.points);
         {
             let port = port_field(model, hub_id, port_id);
             // Fixed-width slots so every row lines up and nothing overflows:
@@ -8065,7 +8437,7 @@ fn port_section(
                     });
             });
             if next != current {
-                port_field(model, hub_id, port_id).protocol = next;
+                port_field(model, hub_id, port_id).set_protocol_from_ui(next, !source);
                 dirty = true;
             }
             if port_remove_button(ui, p).clicked() {
@@ -8783,6 +9155,181 @@ mod tests {
             binds.iter().any(|b| b.point == "mqtt_1" && b.auto),
             "calc point should auto-bind: {binds:?}"
         );
+    }
+
+    #[test]
+    fn websocket_output_auto_bind_is_optional_and_keeps_manual_binds() {
+        let mut model = unwired_sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let out = model.hubs[1].outputs[0].id;
+        model.hub_mut(hub).unwrap().outputs[0].protocol = HubProto::WebSocket;
+        model.hub_mut(hub).unwrap().sources[0].mqtt_inputs.push(MqttInputBind { point: "mqtt_1".into(), ..Default::default() });
+        model.hub_mut(hub).unwrap().sources[0].mqtt_inputs.push(MqttInputBind { point: "mqtt_2".into(), ..Default::default() });
+        let mut manual = serde_json::Map::new();
+        manual.insert("point".into(), "other".into());
+        manual.insert("key".into(), "renamed".into());
+        model.hub_mut(hub).unwrap().outputs[0].ext_outputs.push(manual);
+        assert!(model.connect_feed(hub, src, hub, out));
+        // Off: only the manual bind.
+        model.sync_output_feed_binds(&[]);
+        assert_eq!(model.hubs[1].outputs[0].ext_outputs.len(), 1);
+        // On: every wired point joins the manual bind.
+        model.hub_mut(hub).unwrap().outputs[0].auto_bind = Some(true);
+        assert!(model.sync_output_feed_binds(&[]));
+        let pts = |m: &HubModel| m.hubs[1].outputs[0].ext_outputs.iter().map(|b| crate::ext_proto::text_of(b, "point")).collect::<Vec<_>>();
+        assert_eq!(pts(&model), ["other", "mqtt_1", "mqtt_2"]);
+        assert!(!model.sync_output_feed_binds(&[]), "stable");
+        // A dismissed point stays out while still wired.
+        model.hub_mut(hub).unwrap().outputs[0].mqtt_out_dismissed.push("mqtt_1".into());
+        assert!(model.sync_output_feed_binds(&[]));
+        assert_eq!(pts(&model), ["other", "mqtt_2"]);
+    }
+
+    #[test]
+    fn auto_bind_names_binds_after_the_point_for_each_protocol() {
+        for proto in [HubProto::Http, HubProto::Streams, HubProto::Las, HubProto::Sparkplug, HubProto::WebSocket] {
+            let mut model = unwired_sample();
+            let hub = model.hubs[1].id;
+            let src = model.hubs[1].sources[0].id;
+            let out = model.hubs[1].outputs[0].id;
+            model.hub_mut(hub).unwrap().sources[0].mqtt_inputs.push(MqttInputBind { point: "mqtt_1".into(), ..Default::default() });
+            model.hub_mut(hub).unwrap().sources[0].mqtt_inputs.push(MqttInputBind { point: "mqtt_2".into(), ..Default::default() });
+            assert!(model.connect_feed(hub, src, hub, out));
+            // An older project's node (auto_bind unset) is left alone.
+            model.hub_mut(hub).unwrap().outputs[0].protocol = proto;
+            model.sync_output_feed_binds(&[]);
+            assert_eq!(model.hubs[1].outputs[0].output_bind_count(), 0, "{proto:?} off by default when unset");
+            // Picking the protocol in the UI turns it on.
+            model.hub_mut(hub).unwrap().outputs[0].protocol = HubProto::Modbus;
+            model.hub_mut(hub).unwrap().outputs[0].set_protocol_from_ui(proto, true);
+            assert!(model.sync_output_feed_binds(&[]), "{proto:?}");
+            let o = &model.hubs[1].outputs[0];
+            let names: Vec<String> = match proto {
+                HubProto::Http => o.http_outputs.iter().map(|b| format!("{}={}", b.point, b.json_path)).collect(),
+                HubProto::Streams => o.stream_outputs.iter().map(|b| format!("{}={}", b.point, b.field)).collect(),
+                HubProto::Las => o.las_outputs.iter().map(|b| format!("{}={}", b.point, b.curve)).collect(),
+                HubProto::Sparkplug => o.ext_outputs.iter().map(|b| format!("{}={}", crate::ext_proto::text_of(b, "point"), crate::ext_proto::text_of(b, "metric"))).collect(),
+                _ => o.ext_outputs.iter().map(|b| format!("{}={}", crate::ext_proto::text_of(b, "point"), crate::ext_proto::text_of(b, "key"))).collect(),
+            };
+            let want: Vec<String> = match proto {
+                HubProto::Streams => vec!["mqtt_1=0".into(), "mqtt_2=1".into()],
+                HubProto::WebSocket => vec!["mqtt_1=".into(), "mqtt_2=".into()],
+                _ => vec!["mqtt_1=mqtt_1".into(), "mqtt_2=mqtt_2".into()],
+            };
+            assert_eq!(names, want, "{proto:?}");
+            assert!(!model.sync_output_feed_binds(&[]), "{proto:?} stable");
+            // × on an auto bind keeps it out.
+            let port = &mut model.hub_mut(hub).unwrap().outputs[0];
+            match proto {
+                HubProto::Http => { let g = port.http_outputs.remove(0); port.dismiss_auto(&g.point); }
+                HubProto::Streams => { let g = port.stream_outputs.remove(0); port.dismiss_auto(&g.point); }
+                HubProto::Las => { let g = port.las_outputs.remove(0); port.dismiss_auto(&g.point); }
+                _ => { port.ext_outputs.remove(0); port.mqtt_out_dismissed.push("mqtt_1".into()); }
+            }
+            model.sync_output_feed_binds(&[]);
+            assert_eq!(model.hubs[1].outputs[0].output_bind_count(), 1, "{proto:?} dismissed stays out");
+            // Off keeps the bind; cutting the arrow then leaves it alone.
+            model.hub_mut(hub).unwrap().outputs[0].set_auto_bind(false);
+            model.feeds.retain(|f| f.to_node != out);
+            model.sync_output_feed_binds(&[]);
+            assert_eq!(model.hubs[1].outputs[0].output_bind_count(), 1, "{proto:?} kept as manual");
+        }
+    }
+
+    #[test]
+    fn output_pickers_list_only_points_wired_into_that_node() {
+        let mut model = unwired_sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let out = model.hubs[1].outputs[0].id;
+        model.add_port(hub, false);
+        let other = model.hubs[1].outputs.last().unwrap().id;
+        model.hub_mut(hub).unwrap().sources[0].mqtt_inputs.push(MqttInputBind { point: "mqtt_1".into(), ..Default::default() });
+        assert!(model.connect_feed(hub, src, hub, out));
+        assert_eq!(model.output_pick_points(hub, out, &[]), ["mqtt_1"]);
+        assert!(model.output_pick_points(hub, other, &[]).is_empty(), "nothing wired into the other Output");
+        model.choices.show_all_points = true;
+        let host = [snap("x")];
+        assert_eq!(model.output_pick_points(hub, other, &host), ["x"]);
+    }
+
+    #[test]
+    fn wits_auto_bind_takes_free_item_codes_in_the_chosen_record() {
+        let mut model = unwired_sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let out = model.hubs[1].outputs[0].id;
+        for pt in ["mqtt_1", "mqtt_2", "mqtt_3"] {
+            model.hub_mut(hub).unwrap().sources[0].mqtt_inputs.push(MqttInputBind { point: pt.into(), ..Default::default() });
+        }
+        assert!(model.connect_feed(hub, src, hub, out));
+        let port = &mut model.hub_mut(hub).unwrap().outputs[0];
+        port.set_protocol_from_ui(HubProto::Wits, true);
+        // A manual bind already holds 9901.
+        let mut manual = serde_json::Map::new();
+        manual.insert("point".into(), "other".into());
+        manual.insert("item".into(), "9901".into());
+        port.ext_outputs.push(manual);
+        assert!(model.sync_output_feed_binds(&[]));
+        let items = |m: &HubModel| m.hubs[1].outputs[0].ext_outputs.iter().map(|b| format!("{}={}", crate::ext_proto::text_of(b, "point"), crate::ext_proto::text_of(b, "item"))).collect::<Vec<_>>();
+        assert_eq!(items(&model), ["other=9901", "mqtt_1=9902", "mqtt_2=9903", "mqtt_3=9904"]);
+        assert!(!model.sync_output_feed_binds(&[]), "stable: codes stick");
+        // A different record applies to points bound from then on.
+        model.hub_mut(hub).unwrap().outputs[0].wits_auto_record = 1;
+        model.hub_mut(hub).unwrap().sources[0].mqtt_inputs.push(MqttInputBind { point: "mqtt_4".into(), ..Default::default() });
+        assert!(model.sync_output_feed_binds(&[]));
+        assert_eq!(items(&model).last().unwrap(), "mqtt_4=0101");
+    }
+
+    #[test]
+    fn modbus_hub_auto_maps_wired_points_into_its_server_map() {
+        use crate::modbus_panel::ModbusConn;
+        let mut model = unwired_sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        model.hub_mut(hub).unwrap().protocol = HubProto::Modbus;
+        model.hub_mut(hub).unwrap().modbus_server = "srv".into();
+        model.hub_mut(hub).unwrap().modbus_auto.on = true;
+        for pt in ["mqtt_1", "mqtt_2"] {
+            model.hub_mut(hub).unwrap().sources[0].mqtt_inputs.push(MqttInputBind { point: pt.into(), ..Default::default() });
+        }
+        assert!(model.connect_feed(hub, src, hub, hub), "Input wired into the hub");
+        let mut srv = ModbusConn { id: "srv".into(), ..ModbusConn::default_server() };
+        // A hand-made row already holds 0–1.
+        srv.map.push(ModbusBind { area: "holding".into(), address: 0, dtype: "f32".into(), point: "manual".into(), ..ModbusBind::default() });
+        let mut conns = vec![srv];
+        assert!(sync_modbus_server_maps(&mut model, &mut conns, &[]));
+        let rows = |c: &[ModbusConn]| c[0].map.iter().map(|b| format!("{}@{}", b.point, b.address)).collect::<Vec<_>>();
+        assert_eq!(rows(&conns), ["manual@0", "mqtt_1@2", "mqtt_2@4"]);
+        assert!(!sync_modbus_server_maps(&mut model, &mut conns, &[]), "stable");
+        // Deleting an auto row in the register map keeps it out.
+        conns[0].map.retain(|b| b.point != "mqtt_1");
+        sync_modbus_server_maps(&mut model, &mut conns, &[]);
+        assert_eq!(rows(&conns), ["manual@0", "mqtt_2@4"]);
+        // Cutting the wire removes the auto row, never the hand-made one.
+        model.feeds.clear();
+        assert!(sync_modbus_server_maps(&mut model, &mut conns, &[]));
+        assert_eq!(rows(&conns), ["manual@0"]);
+    }
+
+    #[test]
+    fn mqtt_auto_bind_can_be_turned_off() {
+        let mut model = unwired_sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let out = model.hubs[1].outputs[0].id;
+        model.hub_mut(hub).unwrap().outputs[0].protocol = HubProto::Mqtt;
+        model.hub_mut(hub).unwrap().sources[0].mqtt_inputs.push(MqttInputBind { point: "mqtt_1".into(), ..Default::default() });
+        assert!(model.connect_feed(hub, src, hub, out));
+        model.sync_output_feed_binds(&[]);
+        assert_eq!(model.hubs[1].outputs[0].mqtt_outputs.len(), 1, "on by default for MQTT, as before");
+        model.hub_mut(hub).unwrap().outputs[0].set_auto_bind(false);
+        model.hub_mut(hub).unwrap().sources[0].mqtt_inputs.push(MqttInputBind { point: "mqtt_2".into(), ..Default::default() });
+        model.sync_output_feed_binds(&[]);
+        let o = &model.hubs[1].outputs[0];
+        assert_eq!(o.mqtt_outputs.len(), 1, "no new auto binds when off");
+        assert!(!o.mqtt_outputs[0].auto, "kept as a manual bind");
     }
 
     #[test]

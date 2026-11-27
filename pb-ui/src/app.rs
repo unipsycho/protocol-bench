@@ -1239,7 +1239,10 @@ impl eframe::App for ProtocolBenchApp {
 
         self.handle_drop(ctx, &p);
         // Dashboard nodes own their connections: keep them in step even when the Hubs pane is hidden.
-        if crate::ext_proto::sync_dashboard_conns(&mut self.ui_state.hubs, &mut self.ext.get_mut(crate::ext_proto::ExtProto::Dashboard).conns) {
+        // WebSocket Output nodes serve by default and own that connection too.
+        let ws = crate::ext_proto::sync_websocket_out_conns(&mut self.ui_state.hubs, &mut self.ext.get_mut(crate::ext_proto::ExtProto::WebSocket).conns)
+            | crate::hubs::sync_modbus_server_maps(&mut self.ui_state.hubs, &mut self.modbus.conns, &host_for_panes.points);
+        if crate::ext_proto::sync_dashboard_conns(&mut self.ui_state.hubs, &mut self.ext.get_mut(crate::ext_proto::ExtProto::Dashboard).conns) | ws {
             self.mark_dirty();
         }
         self.autosave();
