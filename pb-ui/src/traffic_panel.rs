@@ -2,8 +2,8 @@
 //!
 //! Not a frame/trace pane. Stats only (PB-107 lean plan).
 
-use std::collections::BTreeMap;
-use std::time::Instant;
+use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use egui::{Align2, Layout, RichText, Sense};
 use pb_engine::{EngineId, HostSnapshot};
@@ -19,7 +19,12 @@ pub struct TrafficPanelState {
     last_sample: Instant,
     prev_updated: BTreeMap<String, u64>,
     updates_per_sec: f32,
+    /// (sample time, changes since previous sample) within the averaging window.
+    window: VecDeque<(Instant, u32)>,
 }
+
+/// Averaging window for the updates/s readout.
+const RATE_WINDOW: Duration = Duration::from_secs(5);
 
 impl Default for TrafficPanelState {
     fn default() -> Self {
@@ -27,12 +32,13 @@ impl Default for TrafficPanelState {
             last_sample: Instant::now(),
             prev_updated: BTreeMap::new(),
             updates_per_sec: 0.0,
+            window: VecDeque::new(),
         }
     }
 }
 
 impl TrafficPanelState {
-    /// Refresh updates/s from point `updated_ms` deltas (≈0.5–2 s window).
+    /// Refresh updates/s from point `updated_ms` deltas (averaged over a 5 s sliding window).
     fn sample_point_rate(&mut self, host: &HostSnapshot) {
         let elapsed = self.last_sample.elapsed().as_secs_f32();
         if elapsed < 0.45 {
@@ -54,7 +60,25 @@ impl TrafficPanelState {
             }
         }
         if !self.prev_updated.is_empty() || !host.points.is_empty() {
-            self.updates_per_sec = changes as f32 / elapsed.max(0.001);
+            let now = Instant::now();
+            self.window.push_back((now, changes));
+            while self
+                .window
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t) > RATE_WINDOW)
+            {
+                self.window.pop_front();
+            }
+            // Each sample covers the interval before it; span = oldest sample's
+            // interval start (approximated) to now, capped at the window.
+            let total: u32 = self.window.iter().map(|(_, c)| *c).sum();
+            let span = self
+                .window
+                .front()
+                .map(|(t, _)| now.duration_since(*t).as_secs_f32() + elapsed)
+                .unwrap_or(elapsed)
+                .clamp(elapsed, RATE_WINDOW.as_secs_f32() + elapsed);
+            self.updates_per_sec = total as f32 / span.max(0.001);
         }
         self.prev_updated = next;
         self.last_sample = Instant::now();

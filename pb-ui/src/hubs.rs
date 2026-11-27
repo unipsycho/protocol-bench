@@ -446,6 +446,10 @@ pub struct HubPort {
     pub draft_modbus: Option<ModbusBind>,
     #[serde(skip)]
     pub draft_file_column: String,
+    /// Auto-bound points the user removed from this Output; sync must not re-add them
+    /// while the wire still delivers them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mqtt_out_dismissed: Vec<String>,
     /// Ephemeral inspector drafts — not persisted.
     #[serde(skip)]
     pub draft_mqtt_topic: String,
@@ -558,6 +562,7 @@ impl HubPort {
             snmp_target: String::new(),
             snmp_interval_secs: default_snmp_interval(),
             snmp_inputs: Vec::new(),
+            mqtt_out_dismissed: Vec::new(),
             draft_mqtt_topic: String::new(),
             draft_mqtt_path: String::new(),
             draft_mqtt_out_point: String::new(),
@@ -1991,8 +1996,12 @@ impl HubModel {
                         next.push(b.clone());
                     }
                 }
+                // Forget dismissals once the wire no longer delivers the point.
+                port.mqtt_out_dismissed.retain(|d| auto_points.contains(d));
                 for point in auto_points {
-                    if next.iter().any(|b| b.point == point) {
+                    if next.iter().any(|b| b.point == point)
+                        || port.mqtt_out_dismissed.contains(&point)
+                    {
                         continue;
                     }
                     if let Some(prev) = old.iter().find(|b| b.point == point) {
@@ -7814,7 +7823,11 @@ fn edit_mqtt_port_binds(
         }
         model.choices.show_all_points = model_show_all;
         if let Some(i) = remove {
-            port_field(model, hub_id, port_id).mqtt_outputs.remove(i);
+            let port = port_field(model, hub_id, port_id);
+            let gone = port.mqtt_outputs.remove(i);
+            if gone.auto && !port.mqtt_out_dismissed.contains(&gone.point) {
+                port.mqtt_out_dismissed.push(gone.point);
+            }
             change.dirty = true;
         }
         if add {
@@ -8741,6 +8754,28 @@ mod tests {
             binds.iter().any(|b| b.point == "mqtt_1" && b.auto),
             "calc point should auto-bind: {binds:?}"
         );
+    }
+
+    #[test]
+    fn removed_auto_binds_stay_removed() {
+        let mut model = unwired_sample();
+        let hub = model.hubs[1].id;
+        let src = model.hubs[1].sources[0].id;
+        let out = model.hubs[1].outputs[0].id;
+        model.hub_mut(hub).unwrap().outputs[0].protocol = HubProto::Mqtt;
+        model.hub_mut(hub).unwrap().sources[0].mqtt_inputs.push(MqttInputBind {
+            point: "mqtt_1".into(),
+            ..Default::default()
+        });
+        assert!(model.connect_feed(hub, src, hub, out));
+        model.sync_output_feed_binds(&[]);
+        assert!(model.hubs[1].outputs[0].mqtt_outputs.iter().any(|b| b.point == "mqtt_1"));
+        // Simulate the × click.
+        let port = &mut model.hub_mut(hub).unwrap().outputs[0];
+        let gone = port.mqtt_outputs.remove(0);
+        port.mqtt_out_dismissed.push(gone.point);
+        model.sync_output_feed_binds(&[]);
+        assert!(model.hubs[1].outputs[0].mqtt_outputs.is_empty());
     }
 
     #[test]
