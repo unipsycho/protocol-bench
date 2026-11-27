@@ -2001,7 +2001,11 @@ impl HubModel {
                         next.push(b);
                     } else {
                         let topic = if port.draft_mqtt_out_topic.trim().is_empty() {
-                            format!("out/{point}")
+                            let mut t = descriptive_topic(&point, host_points);
+                            if next.iter().any(|b| b.topic == t) {
+                                t = format!("out/{point}");
+                            }
+                            t
                         } else {
                             port.draft_mqtt_out_topic.trim().to_string()
                         };
@@ -8287,6 +8291,24 @@ pub fn port_input_points(port: &HubPort) -> Vec<String> {
     out
 }
 
+/// Default publish topic for an auto-filled Output bind. Generator points are named
+/// `gen_212`, but their source (`gen/plant::battery_voltage`) carries the signal name, so
+/// the topic uses that: `out/battery_voltage`.
+fn descriptive_topic(point: &str, host_points: &[PointSnapshot]) -> String {
+    let leaf = host_points
+        .iter()
+        .find(|p| p.name == point)
+        .and_then(|p| p.source.strip_prefix("gen/"))
+        .and_then(|s| s.rsplit("::").next())
+        .map(|s| {
+            s.chars()
+                .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty());
+    format!("out/{}", leaf.as_deref().unwrap_or(point))
+}
+
 #[cfg(test)]
 mod tests {
     fn unwired_sample() -> HubModel {
@@ -8719,6 +8741,16 @@ mod tests {
             binds.iter().any(|b| b.point == "mqtt_1" && b.auto),
             "calc point should auto-bind: {binds:?}"
         );
+    }
+
+    #[test]
+    fn generator_topics_use_the_signal_name() {
+        let mut g = snap("gen_212");
+        g.source = "gen/plant::battery voltage".into();
+        let host = vec![g, snap("mqtt_1")];
+        assert_eq!(descriptive_topic("gen_212", &host), "out/battery_voltage");
+        assert_eq!(descriptive_topic("mqtt_1", &host), "out/mqtt_1");
+        assert_eq!(descriptive_topic("unknown", &host), "out/unknown");
     }
 
     #[test]
