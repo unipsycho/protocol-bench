@@ -6,6 +6,19 @@
 //!
 //! Frame ids are written as `0x123` (11-bit), `0x18FEF100` (29-bit, any id above 0x7FF is
 //! extended), or `pgn:65262` — a J1939 parameter group matched on any priority / source address.
+//!
+//! Buses ([`CanBus`]): SocketCAN on Linux ([`CanSocket`]), the built-in in-process
+//! [`virt::VirtualPort`], and the PEAK PCAN Ethernet gateway over UDP / TCP ([`pcan`]).
+
+pub mod pcan;
+pub mod virt;
+
+/// A place classic CAN frames come from and go to.
+pub trait CanBus: Send {
+    /// Next data frame, or `None` after a short wait (~50 ms) with nothing to read.
+    fn read(&mut self) -> std::io::Result<Option<Frame>>;
+    fn write(&mut self, f: &Frame) -> std::io::Result<()>;
+}
 
 /// How a bind selects frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +300,15 @@ mod socket {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    impl super::CanBus for CanSocket {
+        fn read(&mut self) -> io::Result<Option<Frame>> {
+            CanSocket::read(self)
+        }
+        fn write(&mut self, f: &Frame) -> io::Result<()> {
+            CanSocket::write(self, f)
         }
     }
 

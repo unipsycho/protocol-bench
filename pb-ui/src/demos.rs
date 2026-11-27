@@ -628,12 +628,175 @@ pub fn generator_plant() -> ProjectFile {
     f
 }
 
+// ---------------------------------------------------------------------------
+// CAN loopback (no devices: generators → CAN out → vcan0 → CAN in)
+// ---------------------------------------------------------------------------
+
+/// One loopback signal: the generator point `name`, sent in frame `tx_id` and read back from
+/// `rx_id` (the same frame, or its J1939 PGN) into `rx_<name>`.
+struct CanSig {
+    name: &'static str,
+    tx_id: &'static str,
+    rx_id: &'static str,
+    start: u32,
+    len: u32,
+    order: &'static str,
+    kind: &'static str,
+    scale: f64,
+    offset: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn cs(name: &'static str, tx_id: &'static str, rx_id: &'static str, start: u32, len: u32, order: &'static str, kind: &'static str, scale: f64, offset: f64) -> CanSig {
+    CanSig { name, tx_id, rx_id, start, len, order, kind, scale, offset }
+}
+
+/// The frame map. Six frames: standard (11-bit) Intel and Motorola, extended (29-bit) with
+/// float32, and two J1939 parameter groups read back by PGN.
+const CAN_SIGNALS: [CanSig; 20] = [
+    // 0x100 pump skid — 11-bit, Intel.
+    cs("tank_level", "0x100", "0x100", 0, 16, "intel", "unsigned", 0.1, 0.0),
+    cs("pump_run", "0x100", "0x100", 16, 1, "intel", "unsigned", 1.0, 0.0),
+    cs("motor_amps", "0x100", "0x100", 24, 16, "intel", "unsigned", 0.01, 0.0),
+    cs("vibration", "0x100", "0x100", 40, 16, "intel", "unsigned", 0.01, 0.0),
+    cs("alarm", "0x100", "0x100", 56, 1, "intel", "unsigned", 1.0, 0.0),
+    // 0x101 process — 11-bit, Motorola (DBC start = MSB).
+    cs("temperature", "0x101", "0x101", 7, 16, "motorola", "signed", 0.1, 0.0),
+    cs("humidity", "0x101", "0x101", 23, 16, "motorola", "unsigned", 0.1, 0.0),
+    cs("pressure", "0x101", "0x101", 39, 16, "motorola", "unsigned", 0.1, 0.0),
+    cs("valve_pos", "0x101", "0x101", 55, 8, "motorola", "unsigned", 1.0, 0.0),
+    // 0x18FF1000 flow & energy — 29-bit, two float32.
+    cs("flow", "0x18FF1000", "0x18FF1000", 0, 32, "intel", "float", 1.0, 0.0),
+    cs("energy_kwh", "0x18FF1000", "0x18FF1000", 32, 32, "intel", "float", 1.0, 0.0),
+    // 0x18FF1100 power & weather — 29-bit, mixed widths, a signed field.
+    cs("load_kw", "0x18FF1100", "0x18FF1100", 0, 16, "intel", "unsigned", 1.0, 0.0),
+    cs("battery_v", "0x18FF1100", "0x18FF1100", 16, 16, "intel", "unsigned", 0.01, 0.0),
+    cs("wind", "0x18FF1100", "0x18FF1100", 32, 8, "intel", "unsigned", 0.1, 0.0),
+    cs("outdoor_temp", "0x18FF1100", "0x18FF1100", 40, 16, "intel", "signed", 0.1, 0.0),
+    // J1939 EEC1 (PGN 61444) and ET1 (PGN 65262), J1939 scaling, read back by PGN.
+    cs("engine_load", "0x0CF00400", "pgn:61444", 16, 8, "intel", "unsigned", 1.0, -125.0),
+    cs("engine_rpm", "0x0CF00400", "pgn:61444", 24, 16, "intel", "unsigned", 0.125, 0.0),
+    cs("coolant_c", "0x18FEEE00", "pgn:65262", 0, 8, "intel", "unsigned", 1.0, -40.0),
+    cs("oil_temp_c", "0x18FEEE00", "pgn:65262", 16, 16, "intel", "unsigned", 0.03125, -273.0),
+    // 0x200 counters — 11-bit, DLC 2.
+    cs("heartbeat", "0x200", "0x200", 0, 16, "intel", "unsigned", 1.0, 0.0),
+];
+
+fn can_bind(s: &CanSig, id: &str, point: &str) -> Map<String, Value> {
+    obj(json!({"id":id,"start":s.start,"len":s.len,"order":s.order,"type":s.kind,"scale":s.scale,"offset":s.offset,"point":point}))
+}
+
+pub fn can_loopback() -> ProjectFile {
+    let mut f = blank_project();
+    f.settings.name = "CAN loopback".into();
+    f.settings.description = "CAN bus test with no hardware or setup. Twenty generator signals go out as six CAN frames on \
+        the built-in virtual bus \"loop\" (connection bus_tx, every 100 ms) and come straight back in on a second \
+        connection on the same bus (bus_rx) as rx_<signal>. Frames cover 11-bit and 29-bit ids, Intel and Motorola order, \
+        signed / unsigned / float32, scale + offset, single bits, and two J1939 groups read back by PGN. \
+        The read-back points are published to the hub's embedded broker (:1888) as can/rx/<signal>. \
+        To test real hardware, switch both connections to SocketCAN or a PCAN Ethernet gateway."
+        .into();
+    f.next_point_seq = 200;
+    f.mqtt.embedded.enabled = true;
+    f.mqtt.embedded.port = 1888;
+    f.mqtt.clients = vec![loopback(1888, "pb-can-loop", &["can/#"])];
+    f.mqtt.selected_id = "local".into();
+    f.modbus.connections.clear();
+    f.modbus.selected_id.clear();
+    f.ext.gen.connections = vec![ext_conn(json!({"id":"loop","label":"Loopback generators","seed":42,"speed":1}))];
+    f.ext.gen.selected_id = "loop".into();
+    // Two connections on one built-in virtual bus. Like SocketCAN, a frame reaches every *other*
+    // connection, never the one that sent it, so send and receive are separate connections.
+    // Point both at a real bus instead (SocketCAN can0 or a PCAN gateway) by changing transport.
+    f.ext.can.connections = vec![
+        ext_conn(json!({"id":"bus_tx","label":"Loopback transmit","transport":"virtual","bus":"loop","stale_secs":5})),
+        ext_conn(json!({"id":"bus_rx","label":"Loopback receive","transport":"virtual","bus":"loop","stale_secs":5})),
+    ];
+    f.ext.can.selected_id = "bus_rx".into();
+
+    let n = |v: f64| json!(v);
+    let custom = |m: &str, name: &str, kv: &[(&str, Value)]| gen_signal(m, name, kv);
+    let node = |id: u64, label: &str, signals: Vec<Map<String, Value>>| {
+        let mut p = gen_node(id, label, signals);
+        p.ext_connection = "loop".into();
+        p
+    };
+    let sources_gen = vec![
+        node(
+            2,
+            "Pump skid",
+            vec![
+                gen_signal("Tank level", "tank_level", &[]),
+                gen_signal("Pump running", "pump_run", &[]),
+                gen_signal("Motor current", "motor_amps", &[]),
+                gen_signal("Vibration", "vibration", &[]),
+                gen_signal("Random alarm", "alarm", &[]),
+            ],
+        ),
+        node(
+            3,
+            "Process",
+            vec![
+                // Swings below zero so the signed Motorola field is exercised.
+                custom("sine", "temperature", &[("low", n(-15.0)), ("high", n(45.0)), ("period", n(60.0)), ("noise", n(0.2)), ("decimals", n(1.0))]),
+                gen_signal("Humidity", "humidity", &[]),
+                gen_signal("Discharge pressure", "pressure", &[]),
+                gen_signal("Valve position", "valve_pos", &[]),
+            ],
+        ),
+        node(4, "Flow & energy", vec![gen_signal("Flow rate", "flow", &[]), gen_signal("Energy", "energy_kwh", &[])]),
+        node(
+            5,
+            "Power & weather",
+            vec![
+                gen_signal("Daily load", "load_kw", &[]),
+                gen_signal("Battery voltage", "battery_v", &[]),
+                gen_signal("Wind speed", "wind", &[]),
+                custom("walk", "outdoor_temp", &[("start", n(-5.0)), ("step", n(0.5)), ("low", n(-30.0)), ("high", n(35.0)), ("decimals", n(1.0))]),
+            ],
+        ),
+        node(
+            6,
+            "Engine (J1939)",
+            vec![
+                custom("drift", "engine_load", &[("mean", n(55.0)), ("sigma", n(3.0)), ("reversion", n(0.1)), ("decimals", n(0.0))]),
+                custom("sine", "engine_rpm", &[("low", n(800.0)), ("high", n(1800.0)), ("period", n(40.0)), ("noise", n(5.0)), ("decimals", n(0.0))]),
+                custom("drift", "coolant_c", &[("mean", n(85.0)), ("sigma", n(0.8)), ("reversion", n(0.05)), ("decimals", n(0.0))]),
+                custom("drift", "oil_temp_c", &[("mean", n(98.0)), ("sigma", n(0.5)), ("reversion", n(0.05)), ("decimals", n(1.0))]),
+            ],
+        ),
+        node(7, "Counters", vec![gen_signal("Heartbeat", "heartbeat", &[])]),
+    ];
+    let mut sources = sources_gen;
+    let mut rx = port(8, HubProto::Can, "CAN receive (loopback)");
+    rx.ext_connection = "bus_rx".into();
+    rx.ext_inputs = CAN_SIGNALS.iter().map(|s| can_bind(s, s.rx_id, &format!("rx_{}", s.name))).collect();
+    sources.push(rx);
+
+    let mut tx = port(9, HubProto::Can, "CAN transmit");
+    tx.ext_connection = "bus_tx".into();
+    tx.ext_interval_secs = 0.1;
+    tx.ext_outputs = CAN_SIGNALS
+        .iter()
+        .map(|s| {
+            let mut b = can_bind(s, s.tx_id, s.name);
+            b.insert("dlc".into(), json!(if s.tx_id == "0x200" { 2 } else { 8 }));
+            b
+        })
+        .collect();
+    let mut up = port(10, HubProto::Mqtt, "Read-back topics");
+    up.mqtt_connection = "local".into();
+    up.mqtt_outputs = CAN_SIGNALS.iter().map(|s| mqtt_out(&format!("rx_{}", s.name), &format!("can/rx/{}", s.name))).collect();
+    f.hubs = Some(model(hub("CAN loopback", HubProto::Mqtt, sources, vec![tx, up])));
+    f
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn all() -> Vec<(&'static str, ProjectFile)> {
-        vec![("frac-spread.json", frac_spread("/tmp/pb-data")), ("bottling-line.json", bottling_line()), ("water-lift-station.json", water_lift_station()), ("generator-plant.json", generator_plant())]
+        vec![("frac-spread.json", frac_spread("/tmp/pb-data")), ("bottling-line.json", bottling_line()), ("water-lift-station.json", water_lift_station()), ("generator-plant.json", generator_plant()), ("can-loopback.json", can_loopback())]
     }
 
     /// Every demo serializes, reloads unchanged, and every Output point is produced by an Input.
@@ -740,6 +903,30 @@ mod tests {
         }
     }
 
+    /// CAN loopback: twenty generator signals, each sent on bus_tx and read back on bus_rx (two
+    /// connections — a CAN connection never hears its own frames), both on virtual bus "loop".
+    #[test]
+    fn can_loopback_is_consistent() {
+        let f = can_loopback();
+        let hub = &f.hubs.as_ref().unwrap().hubs[0];
+        let gen: std::collections::HashSet<String> =
+            hub.sources.iter().filter(|s| s.protocol == HubProto::Gen).flat_map(|s| s.ext_inputs.iter().map(|b| crate::ext_proto::text_of(b, "point"))).collect();
+        assert_eq!(gen.len(), 20);
+        let rx = hub.sources.iter().find(|s| s.protocol == HubProto::Can).unwrap();
+        let tx = hub.outputs.iter().find(|s| s.protocol == HubProto::Can).unwrap();
+        assert_ne!(rx.ext_connection, tx.ext_connection, "send and receive need separate sockets");
+        let buses: Vec<(String, String)> = f.ext.can.connections.iter().map(|c| (crate::ext_proto::text_of(c, "transport"), crate::ext_proto::text_of(c, "bus"))).collect();
+        assert_eq!(buses, [("virtual".to_string(), "loop".to_string()), ("virtual".to_string(), "loop".to_string())]);
+        let sent: std::collections::HashSet<String> = tx.ext_outputs.iter().map(|b| crate::ext_proto::text_of(b, "point")).collect();
+        assert_eq!(sent, gen, "every generator signal is transmitted");
+        for b in &rx.ext_inputs {
+            let p = crate::ext_proto::text_of(b, "point");
+            assert!(gen.contains(p.trim_start_matches("rx_")), "{p}");
+            assert!(crate::ext_proto::bind_source(crate::ext_proto::ExtProto::Can, "bus_rx", b).is_some(), "{p}");
+        }
+        assert_eq!(rx.ext_inputs.len(), 20);
+    }
+
     /// Writes the demo projects into `PB_EXPORT_DEMOS` (data files under `<dir>/data`).
     #[test]
     #[ignore]
@@ -749,7 +936,7 @@ mod tests {
         let data = dir.join("data");
         std::fs::create_dir_all(&data).unwrap();
         let data_s = data.to_string_lossy().into_owned();
-        for (name, f) in [("frac-spread.json", frac_spread(&data_s)), ("bottling-line.json", bottling_line()), ("water-lift-station.json", water_lift_station()), ("generator-plant.json", generator_plant())] {
+        for (name, f) in [("frac-spread.json", frac_spread(&data_s)), ("bottling-line.json", bottling_line()), ("water-lift-station.json", water_lift_station()), ("generator-plant.json", generator_plant()), ("can-loopback.json", can_loopback())] {
             std::fs::write(dir.join(name), serde_json::to_string_pretty(&f).unwrap() + "\n").unwrap();
         }
     }

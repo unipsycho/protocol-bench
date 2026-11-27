@@ -204,12 +204,20 @@ const DNP3: UiSpec = UiSpec {
 };
 
 const CAN_ORDER: &[(&str, &str)] = &[("intel", "Intel (little)"), ("motorola", "Motorola (big)")];
+const CAN_TRANSPORTS: &[(&str, &str)] = &[("socketcan", "SocketCAN (Linux)"), ("virtual", "Virtual bus (built-in)"), ("pcan_gw", "PCAN Ethernet gateway")];
+const CAN_GW_PROTOCOLS: &[(&str, &str)] = &[("udp", "UDP"), ("tcp", "TCP")];
 const CAN_TYPE: &[(&str, &str)] = &[("unsigned", "Unsigned"), ("signed", "Signed"), ("float", "Float32")];
 
 const CAN: UiSpec = UiSpec {
-    blurb: "CAN bus over SocketCAN (Linux): decode signals from frames — including J1939 parameter groups — and transmit points as frames.",
+    blurb: "CAN bus: decode signals from frames — including J1939 parameter groups — and transmit points as frames. Over SocketCAN (Linux), the built-in virtual bus (any OS, no setup) or a PEAK PCAN Ethernet gateway.",
     conn_fields: &[
-        f("interface", "Interface", Kind::Text, Def::S("vcan0"), 100.0, "can0, vcan0"),
+        f("transport", "Transport", Kind::Choice(CAN_TRANSPORTS), Def::S("socketcan"), 190.0, ""),
+        fs("interface", "Interface", Kind::Text, Def::S("vcan0"), 100.0, "can0, vcan0", ("transport", &["socketcan"])),
+        fs("bus", "Bus name", Kind::Text, Def::S("loop"), 100.0, "connections with the same name share frames", ("transport", &["virtual"])),
+        fs("host", "Gateway host", Kind::Text, Def::S("192.168.1.10"), 140.0, "PCAN gateway IP address", ("transport", &["pcan_gw"])),
+        fs("protocol", "Protocol", Kind::Choice(CAN_GW_PROTOCOLS), Def::S("udp"), 80.0, "as set on the gateway's routes", ("transport", &["pcan_gw"])),
+        fs("port", "Gateway port", INT(1.0, 65535.0), Def::N(55002.0), 70.0, "UDP: the LAN → CAN route's port · TCP: the route's port", ("transport", &["pcan_gw"])),
+        fs("local_port", "Listen port", INT(0.0, 65535.0), Def::N(55001.0), 70.0, "UDP only: the CAN → LAN route sends here", ("transport", &["pcan_gw"])),
         f("stale_secs", "Stale after (s)", num(0.2, 3600.0, 1), Def::N(5.0), 64.0, "no frame this long → point bad"),
     ],
     in_fields: &[
@@ -235,7 +243,7 @@ const CAN: UiSpec = UiSpec {
     out_heading: "POINTS → FRAMES",
     interval_in: None,
     interval_out: Some(("Transmit every (s)", 0.1)),
-    note: "Test without hardware: sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0.",
+    note: "Test without hardware: pick the virtual bus and give two connections the same bus name — one sends, the other receives (a connection never hears its own frames). PCAN gateway: set up a CAN → LAN route to this PC's listen port and a LAN → CAN route on the gateway port.",
 };
 
 /// Every model, in the order the catalog shows them (`gen_ui::MODELS` adds the words).
@@ -810,7 +818,12 @@ fn conn_summary(proto: ExtProto, c: &Obj) -> String {
         }
         ExtProto::Sparkplug => format!("{} · {}:{} · {}{}", s("role"), s("host"), s("port"), s("group_id"), if s("edge_node_id").is_empty() { String::new() } else { format!("/{}", s("edge_node_id")) }),
         ExtProto::Dnp3 => format!("{}:{} · {} → {}", s("host"), s("port"), s("master_address"), s("outstation_address")),
-        ExtProto::Can => format!("SocketCAN {}", s("interface")),
+        ExtProto::Can => match s("transport").as_str() {
+            "virtual" => format!("Virtual bus \"{}\"", s("bus")),
+            "pcan_gw" if s("protocol") == "tcp" => format!("PCAN gateway tcp://{}:{}", s("host"), s("port")),
+            "pcan_gw" => format!("PCAN gateway udp://{}:{} · listen {}", s("host"), s("port"), s("local_port")),
+            _ => format!("SocketCAN {}", s("interface")),
+        },
         ExtProto::Dashboard => format!("http://{}:{}/", s("host"), s("port")),
         ExtProto::Gen => {
             let seed = s("seed");

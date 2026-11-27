@@ -125,7 +125,7 @@ One schema-driven path for the five newer protocols: a protocol panel (connectio
 | **WebSocket** (client / server) | JSON path → `ws_N` | JSON object of keys, or one message per change; servers feed browsers |
 | **Sparkplug B** (host / edge node) | device + metric → `spb_N` (aliases from BIRTH, DEATH → bad) | host: NCMD / DCMD · edge: NBIRTH / DBIRTH + NDATA / DDATA, NDEATH will |
 | **DNP3** TCP master | type + index → `dnp3_N` (class 0 + events, ONLINE flag → quality) | CROB latch on / off, analog output g41v1 / v3 |
-| **CAN** (SocketCAN, Linux) | frame id / J1939 `pgn:N` + DBC-style signal → `can_N` | signals packed into frames sent each interval |
+| **CAN** (SocketCAN on Linux, built-in virtual bus, PCAN Ethernet gateway — [can-bus.md](can-bus.md)) | frame id / J1939 `pgn:N` + DBC-style signal → `can_N` | signals packed into frames sent each interval |
 
 ## Demo plants
 
@@ -133,7 +133,7 @@ One schema-driven path for the five newer protocols: a protocol panel (connectio
 
 ## What runs today, and what does not
 
-Today: the window, layout, themes, the hub diagram with Input/Output binds for every protocol, the engine thread boundary, host point store (`pb-points`), pack loader, headless `pb-service` with localhost IPC and an MCP server, and live packs for **MQTT** (client + embedded broker; TCP / TLS / WS / WSS), **OPC UA** (client + server), **Streams** (serial / TCP), **HTTP / REST**, **Modbus** (TCP / RTU, client + server, register maps with scaling), **File follow** (CSV / JSON lines), **SNMP** (v1 / v2c GET), **LAS** (2.0 follow + write), **WITS** (level 0 in / out), **WebSocket** (client + server), **Sparkplug B** (host + edge), **DNP3** (TCP master) and **CAN** (SocketCAN).
+Today: the window, layout, themes, the hub diagram with Input/Output binds for every protocol, the engine thread boundary, host point store (`pb-points`), pack loader, headless `pb-service` with localhost IPC and an MCP server, and live packs for **MQTT** (client + embedded broker; TCP / TLS / WS / WSS), **OPC UA** (client + server), **Streams** (serial / TCP), **HTTP / REST**, **Modbus** (TCP / RTU, client + server, register maps with scaling), **File follow** (CSV / JSON lines), **SNMP** (v1 / v2c GET), **LAS** (2.0 follow + write), **WITS** (level 0 in / out), **WebSocket** (client + server), **Sparkplug B** (host + edge), **DNP3** (TCP master) and **CAN** (SocketCAN, virtual bus, PCAN Ethernet gateway).
 
 Hub Outputs exist for MQTT, Modbus, Streams, HTTP, LAS and the five ext protocols; OPC UA (client writes), File follow and SNMP are input-only.
 

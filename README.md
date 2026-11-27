@@ -123,5 +123,6 @@ A project is one JSON file (current version 11). File → New project creates an
 - [docs/free-vs-paid-isolation.md](docs/free-vs-paid-isolation.md) — licensing / entitlement split
 - [docs/protocol-pack-loading.md](docs/protocol-pack-loading.md) — pack ABI and loading
 - [docs/performance.md](docs/performance.md) — CPU / RAM measurements and how to re-run them
+- [docs/can-bus.md](docs/can-bus.md) — CAN bus: SocketCAN, virtual bus and PCAN Ethernet gateway transports, signal fields, what is and isn't supported
 - [docs/pack-development.md](docs/pack-development.md) — writing a pack (`pb_abi::Pack`), contracts that are not obvious from the code, known quirks
 - [pb-service/README.md](pb-service/README.md) — service details and IPC methods
